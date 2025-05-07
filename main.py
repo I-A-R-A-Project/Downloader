@@ -40,7 +40,7 @@ class UniversalDownloader(QWebEngineView):
         if "mediafire.com" in url:
             self.handle_mediafire(url, path)
         elif "4shared.com" in url:
-            self.handle_4shared(url, path)
+            self.page().toHtml(lambda html: self.handle_4shared(html, path))
         elif "drive.google.com" in url:
             self.handle_gdrive(url, path)
         else:
@@ -48,9 +48,23 @@ class UniversalDownloader(QWebEngineView):
             self.results.append(None)
             self.proceed_to_next()
 
-    def handle_4shared(self, url, path):
-        print("📦 Soporte para 4shared aún no implementado.")
-        self.results.append(None)
+    def handle_4shared(self, html, current_path):
+        soup = BeautifulSoup(html, "html.parser")
+        download_button = soup.find("a", {"id": "freeDlButton"})
+
+        #No funciona por ahora, ver despues
+        #link d prueba https://www.4shared.com/file/uCcrCZLG/DAEMON_Tools_Lite_44540315.html
+        if download_button and download_button.has_attr("href"):
+            direct_link = download_button["href"]
+            title_tag = soup.find("title")
+            filename = title_tag.text.strip().split(" - ")[0] if title_tag else os.path.basename(direct_link)
+            full_path = os.path.join(current_path, filename)
+            print(f"✅ Enlace directo (4shared): {direct_link}")
+            print(f"💾 Guardar como: {full_path}")
+            self.results.append((full_path, direct_link))
+        else:
+            print("❌ No se encontró el enlace de descarga en 4shared.")
+            self.results.append((None, None))
         self.proceed_to_next()
 
     def handle_gdrive(self, url, path):
@@ -68,8 +82,6 @@ class UniversalDownloader(QWebEngineView):
             self.results.append(None)
             self.proceed_to_next()
 
-    def handle_mediafire_folder(self, url, base_path):
-        soup = BeautifulSoup(url, "html.parser")
     def handle_mediafire_folder(self, html, base_path):
         soup = BeautifulSoup(html, "html.parser")
         aux = []
@@ -154,7 +166,6 @@ class DownloadWindow(QWidget):
         self.downloader.direct_links_ready.connect(self.start_downloads)
         self.downloader.start()
 
-    
     def open_settings_dialog(self):
         dialog = SettingsDialog(self)
         if dialog.exec_() == QDialog.Accepted:
