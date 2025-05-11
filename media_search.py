@@ -10,6 +10,7 @@ from PyQt5.QtCore import (
     Qt, QSize, QObject, pyqtSignal, QRunnable, QThreadPool, QTimer,QPropertyAnimation
 )
 import requests
+from aniteca import search_aniteca_api,get_chapter_links,extract_direct_link
 from bs4 import BeautifulSoup
 from io import BytesIO
 
@@ -135,14 +136,21 @@ class SearchWorker(QRunnable):
 def search_aniteca(query):
     results = []
     try:
-        url = f"https://aniteca.net/search/animename={query.replace(' ', '%20')}"
-        r = requests.get(url, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
-        entries = soup.select("h2.entry-title > a")
-        for link in entries:
-            title = link.text.strip()
-            href = link["href"]
-            results.append((title, href))
+        for anime in search_aniteca_api(query):
+            #print(f"\nAnime: {anime['nombre']} (ID: {anime['id']})")
+            episodios = get_chapter_links(anime["id"], anime["numepisodios"])
+            for ep in episodios:
+                #print(f"Cap {ep['capitulo']} - {ep['servername']} (ID: {ep['online_id']})")
+                link_directo = extract_direct_link(ep['servername'], ep['online_id'])
+                if link_directo:
+                    #print(" ➤ Enlace directo:", link_directo)
+                    results.append({
+                        "title": anime['nombre'],
+                        "chapter": ep['capitulo'],
+                        "chapters": episodios,
+                        "url_type":ep['servername'],
+                        "url": link_directo
+                    })
     except Exception as e:
         print(f"[Aniteca] Error: {e}")
     return results
@@ -159,7 +167,10 @@ def search_nyaa(query):
             if title_tag:
                 title = title_tag.text.strip()
                 href = "https://nyaa.si" + title_tag["href"]
-                results.append((title, href))
+                results.append({
+                        "title": title,
+                        "url": href
+                    })
     except Exception as e:
         print(f"[Nyaa] Error: {e}")
     return results
@@ -177,7 +188,10 @@ def search_1337x(query):
             if link:
                 title = link.text.strip()
                 href = "https://1337x.to" + link["href"]
-                results.append((title, href))
+                results.append({
+                        "title": title,
+                        "url": href
+                    })
     except Exception as e:
         print(f"[1337x] Error: {e}")
     return results
@@ -195,11 +209,12 @@ class MultiChoiceDownloader(QWidget):
 
         # Llenar la lista
         for source, results in results_dict.items():
-            for title, link in results:
+            for result in results:
+                title = result["title"]
                 item = QListWidgetItem(f"[{source}] {title}")
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
                 item.setCheckState(Qt.Unchecked)
-                item.setData(Qt.UserRole, link)
+                item.setData(Qt.UserRole, result["url"])  # Guardamos el dict entero
                 self.list_widget.addItem(item)
 
         self.layout.addWidget(self.list_widget)
@@ -222,7 +237,6 @@ class MultiChoiceDownloader(QWidget):
             QMessageBox.information(self, "Links seleccionados", links_str)
         else:
             QMessageBox.warning(self, "Nada seleccionado", "Por favor selecciona al menos un enlace.")
-
 
 # --- UI principal ---
 class MediaSearchUI(QWidget):
@@ -342,7 +356,6 @@ class MediaSearchUI(QWidget):
 
         self.animation_index += 1
 
-
     def show_details(self, item):
         data = item.data(Qt.UserRole)
         self.current_item = data
@@ -384,8 +397,10 @@ class MediaSearchUI(QWidget):
                 self.selector_window.show()
 
                 def handle_selection():
-                    for _, link in self.selector_window.selected_links:
-                        webbrowser.open(link)
+                    array=self.selector_window.selected_links
+                    print(array)
+                    #for _, link in array:
+                    #    webbrowser.open(link)
 
                 self.selector_window.btn_confirm.clicked.connect(handle_selection)
             else:

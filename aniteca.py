@@ -112,14 +112,13 @@ def extract_direct_link(server, online_id):
 # Ejemplo de uso
 if __name__ == "__main__":
     animes = search_aniteca_api("kodomo no jikan")
-
-for anime in animes:
-    print(f"\nAnime: {anime['nombre']} (ID: {anime['id']})")
-    episodios = get_chapter_links(anime["id"], anime["numepisodios"])
-    for ep in episodios:
-        print(f"Cap {ep['capitulo']} - {ep['servername']} (ID: {ep['online_id']})")
-        link_directo = extract_direct_link(ep['servername'], ep['online_id'])
-        if link_directo:
-            print(" ➤ Enlace directo:", link_directo)
+    for anime in animes:
+        print(f"\nAnime: {anime['nombre']} (ID: {anime['id']})")
+        episodios = get_chapter_links(anime["id"], anime["numepisodios"])
+        for ep in episodios:
+            print(f"Cap {ep['capitulo']} - {ep['servername']} (ID: {ep['online_id']})")
+            link_directo = extract_direct_link(ep['servername'], ep['online_id'])
+            if link_directo:
+                print(" ➤ Enlace directo:", link_directo)
 
 
