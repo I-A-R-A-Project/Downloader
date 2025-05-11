@@ -3,12 +3,11 @@ import time
 import threading
 import requests
 from PyQt5.QtCore import pyqtSignal, QObject
+from settings_dialog import load_config,DEFAULT_CONFIG
 
 MAX_RETRIES = 100
 RETRY_DELAY = 3
 CHUNK_SIZE = 8192
-
-download_semaphore = None
 
 # Helper para emitir señales desde hilos
 class DownloadSignals(QObject):
@@ -23,8 +22,12 @@ class FileDownloader(threading.Thread):
         self.index = index
         self.signals = signals
 
+        self.download_semaphore = threading.Semaphore(
+            load_config().get("max_parallel_downloads",DEFAULT_CONFIG["max_parallel_downloads"])
+        )
+
     def run(self):
-        with download_semaphore:  # Limita descargas simultáneas
+        with self.download_semaphore:  # Limita descargas simultáneas
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
                     downloaded = 0
@@ -64,7 +67,3 @@ class FileDownloader(threading.Thread):
                         time.sleep(RETRY_DELAY * attempt)
                     else:
                         self.signals.finished.emit(self.index)
-
-def set_max_parallel_downloads(n):
-    global download_semaphore
-    download_semaphore = threading.Semaphore(n)

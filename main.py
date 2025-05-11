@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import QApplication, QWidget,QHBoxLayout, QVBoxLayout, QLab
 from PyQt5.QtWebEngineWidgets import QWebEngineView,QWebEnginePage
 from PyQt5.QtCore import QUrl, QTimer, pyqtSignal
 from bs4 import BeautifulSoup
-import file_downloader
+from file_downloader import DownloadSignals,FileDownloader
 from settings_dialog import SettingsDialog, load_config,DEFAULT_CONFIG
 
 #Mucho ruido en consola, shhhh
@@ -23,7 +23,7 @@ class UniversalDownloader(QWebEngineView):
         self.urls = [(url, "") for url in urls]  # Url,path
         self.current_index = 0
         self.results = []
-        self.setWindowTitle("Mediafire Downloader")
+        self.setWindowTitle("Universal Downloader")
         self.loadFinished.connect(self.on_load_finished)
         self.load(QUrl(self.urls[self.current_index][0]))
 
@@ -31,6 +31,7 @@ class UniversalDownloader(QWebEngineView):
         self.show()
 
     def on_load_finished(self):
+        print(self.urls[self.current_index])
         print(f"[{self.current_index+1}/{len(self.urls)}] Páginas cargadas...")
         QTimer.singleShot(1000, self.route_url_handling)
 
@@ -67,9 +68,19 @@ class UniversalDownloader(QWebEngineView):
             self.results.append((None, None))
         self.proceed_to_next()
 
-    def handle_gdrive(self, url, path):
-        print("📦 Soporte para Google Drive aún no implementado.")
-        self.results.append(None)
+    def handle_gdrive(self, url, current_path):
+        match = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
+        if match:
+            file_id = match.group(1)
+            direct_link = f"https://drive.usercontent.google.com/download?id={file_id}&export=download"
+            filename = f"{file_id}.bin"  # Nombre provisional si no podemos obtener el real
+            full_path = os.path.join(current_path, filename)
+            print(f"✅ Enlace directo (Google Drive): {direct_link}")
+            print(f"💾 Guardar como: {full_path}")
+            self.results.append((full_path, direct_link))
+        else:
+            print("❌ No se pudo extraer el ID del archivo de Google Drive.")
+            self.results.append((None, None))
         self.proceed_to_next()
 
     def handle_mediafire(self, url, path):
@@ -126,7 +137,7 @@ class UniversalDownloader(QWebEngineView):
             self.results.append((full_path, direct_link))
         else:
             print("❌ No se encontró el enlace de descarga.")
-            self.results.append((None,None))
+            self.results.append((None, None))
         self.proceed_to_next()
 
     def proceed_to_next(self):
@@ -191,11 +202,11 @@ class DownloadWindow(QWidget):
             self.labels.append(label)
             self.progress_bars.append(bar)
 
-            signals = file_downloader.DownloadSignals()
+            signals = DownloadSignals()
             signals.progress.connect(self.update_progress)
             signals.finished.connect(self.mark_finished)
 
-            thread = file_downloader.FileDownloader(link, relative_path, index, signals)
+            thread = FileDownloader(link, relative_path, index, signals)
             thread.start()
         self.total_downloads = len(self.progress_bars)
         self.show()
@@ -256,7 +267,6 @@ def apply_settings(self):
     self.folder_path = self.config.get("folder_path")
     self.open_on_finish = self.config.get("open_on_finish")
     self.max_parallel_downloads = self.config.get("max_parallel_downloads")
-    file_downloader.set_max_parallel_downloads(self.max_parallel_downloads)
     print(f"✅ Configuración actualizada: {self.config}")
 
 if __name__ == '__main__':
