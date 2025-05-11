@@ -1,15 +1,63 @@
 import sys
+import webbrowser
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLineEdit, QListWidget,
     QLabel, QListWidgetItem, QTextEdit, QPushButton, QHBoxLayout,
-    QGraphicsOpacityEffect
+    QGraphicsOpacityEffect,QMessageBox
 )
 from PyQt5.QtGui import QPixmap, QImage,QMovie
 from PyQt5.QtCore import (
     Qt, QSize, QObject, pyqtSignal, QRunnable, QThreadPool, QTimer,QPropertyAnimation
 )
 import requests
+from bs4 import BeautifulSoup
 from io import BytesIO
+
+def search_mal(query):
+    url = f"https://myanimelist.net/anime.php?cat=anime&q={query}&type=0&score=0&status=0&p=0&r=0&sm=0&sd=0&sy=0&em=0&ed=0&ey=0&c[]=a&c[]=b&c[]=c&c[]=g"
+    try:
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+    except Exception as e:
+        print("[MyAnimeList] Error:", e)
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    results = []
+
+    for row in soup.select("tr:has(img)"):
+        try:
+            img_tag = row.select_one("img")
+            title_tag = row.select_one("td:nth-of-type(2) a strong")
+            description_tag = row.select_one(".pt4")
+            info_cells = row.find_all("td", class_="ac")
+
+            title = title_tag.text.strip()
+            link = title_tag.find_parent("a")["href"]
+
+            # Extraer y mejorar la imagen
+            raw_img = img_tag.get("data-src", img_tag.get("src", ""))
+            full_img = raw_img.replace("/r/50x70", "").split("?")[0]  # remueve resize y parámetros
+
+            description = description_tag.get_text(strip=True) if description_tag else ""
+            tipo = info_cells[0].text.strip() if len(info_cells) > 0 else ""
+            episodios = info_cells[1].text.strip() if len(info_cells) > 1 else ""
+            score = info_cells[2].text.strip() if len(info_cells) > 2 else ""
+            rating = info_cells[3].text.strip() if len(info_cells) > 3 else ""
+
+            results.append({
+                "title": title,
+                "url": link,
+                "image": full_img,
+                "description": f"{description} | Tipo: {tipo} | Episodios: {episodios} | Score: {score} | Rating: {rating}",
+                "source": "MyAnimeList",
+                "rating": rating
+            })
+        except Exception as e:
+            print("Error procesando un resultado:", e)
+            continue
+
+    return results
 
 # --- AniList con resultados ---
 def search_anilist(query):
@@ -75,14 +123,106 @@ class SearchWorker(QRunnable):
         self.signals = SearchWorkerSignals()
 
     def run(self):
-        try:
-            anilist_results = search_anilist(self.term)
-            tmdb_results = search_tmdb(self.term)
-            combined = anilist_results + tmdb_results
-        except Exception as e:
-            combined = []
-            print(f"Error en la búsqueda: {e}")
-        self.signals.finished.emit(combined)
+        #try:
+        #    anilist_results = search_anilist(self.term)
+        #except Exception as e:
+        #    print(f"Error en la búsqueda: {e}")
+        results = search_mal(self.term)
+        #tmdb_results = search_tmdb(self.term)
+        #combined = anilist_results + tmdb_results
+        self.signals.finished.emit(results)
+
+def search_aniteca(query):
+    results = []
+    try:
+        url = f"https://aniteca.net/search/animename={query.replace(' ', '%20')}"
+        r = requests.get(url, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+        entries = soup.select("h2.entry-title > a")
+        for link in entries:
+            title = link.text.strip()
+            href = link["href"]
+            results.append((title, href))
+    except Exception as e:
+        print(f"[Aniteca] Error: {e}")
+    return results
+
+def search_nyaa(query):
+    results = []
+    try:
+        url = f"https://nyaa.si/?f=0&c=0_0&q={query.replace(' ', '+')}&s=seeders&o=desc"
+        r = requests.get(url, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+        rows = soup.select("tr.default")
+        for row in rows[:10]:  # podés cambiar el límite
+            title_tag = row.select_one("td:nth-child(2) a[href*='view']")
+            if title_tag:
+                title = title_tag.text.strip()
+                href = "https://nyaa.si" + title_tag["href"]
+                results.append((title, href))
+    except Exception as e:
+        print(f"[Nyaa] Error: {e}")
+    return results
+
+def search_1337x(query):
+    results = []
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    try:
+        url = f"https://1337x.to/search/{query.replace(' ', '%20')}/1/"
+        r = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+        entries = soup.select("td.coll-1.name")
+        for entry in entries[:10]:
+            link = entry.select_one("a:nth-of-type(2)")
+            if link:
+                title = link.text.strip()
+                href = "https://1337x.to" + link["href"]
+                results.append((title, href))
+    except Exception as e:
+        print(f"[1337x] Error: {e}")
+    return results
+
+class MultiChoiceDownloader(QWidget):
+    def __init__(self, results_dict):
+        super().__init__()
+        self.setWindowTitle("Selecciona los enlaces para descargar")
+        self.setGeometry(300, 300, 600, 400)
+        self.results_dict = results_dict  # dict: {sitio: [(title, link), ...]}
+        self.selected_links = []
+
+        self.layout = QVBoxLayout()
+        self.list_widget = QListWidget()
+
+        # Llenar la lista
+        for source, results in results_dict.items():
+            for title, link in results:
+                item = QListWidgetItem(f"[{source}] {title}")
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Unchecked)
+                item.setData(Qt.UserRole, link)
+                self.list_widget.addItem(item)
+
+        self.layout.addWidget(self.list_widget)
+
+        # Botón confirmar
+        self.btn_confirm = QPushButton("Descargar seleccionados")
+        self.btn_confirm.clicked.connect(self.confirm_selection)
+        self.layout.addWidget(self.btn_confirm)
+
+        self.setLayout(self.layout)
+
+    def confirm_selection(self):
+        self.selected_links = []
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() == Qt.Checked:
+                self.selected_links.append((item.text(), item.data(Qt.UserRole)))
+        if self.selected_links:
+            links_str = "\n".join(f"{title}\n{link}" for title, link in self.selected_links)
+            QMessageBox.information(self, "Links seleccionados", links_str)
+        else:
+            QMessageBox.warning(self, "Nada seleccionado", "Por favor selecciona al menos un enlace.")
+
 
 # --- UI principal ---
 class MediaSearchUI(QWidget):
@@ -153,7 +293,6 @@ class MediaSearchUI(QWidget):
         worker.signals.finished.connect(self.populate_results)
         QThreadPool.globalInstance().start(worker)
 
-
     def populate_results(self, results):
         self.search_bar.setDisabled(False)
         self.search_bar.setPlaceholderText("Buscar anime, película o serie...")
@@ -173,7 +312,9 @@ class MediaSearchUI(QWidget):
             return
 
         item = self.animated_results[self.animation_index]
-        lw_item = QListWidgetItem(f"{item['title']} ({item['year']}) - {item['type']} [{item['source']}]")
+        #lw_item = QListWidgetItem(f"{item['title']} ({item['year']}) - {item['type']} [{item['source']}]")
+        if item['source']=="MyAnimeList":
+            lw_item = QListWidgetItem(f"{item['title']} [{item['source']}]")
 
         if item.get("image"):
             try:
@@ -221,7 +362,35 @@ class MediaSearchUI(QWidget):
 
     def download_item(self):
         if self.current_item:
-            print(f"📥 Descargar: {self.current_item['title']} ({self.current_item['source']})")
+            title = self.current_item['title']
+            print(f"📥 Buscar para descarga: {title}")
+
+            # 1. Buscar en los sitios (múltiples resultados)
+            aniteca_links = search_aniteca(title)
+            nyaa_links = search_nyaa(title)
+            x1337_links = search_1337x(title)
+
+            # 2. Organizar en dict por sitio
+            results = {}
+            if aniteca_links:
+                results["Aniteca"] = aniteca_links
+            if nyaa_links:
+                results["Nyaa"] = nyaa_links
+            if x1337_links:
+                results["1337x"] = x1337_links
+
+            if results:
+                self.selector_window = MultiChoiceDownloader(results)
+                self.selector_window.show()
+
+                def handle_selection():
+                    for _, link in self.selector_window.selected_links:
+                        webbrowser.open(link)
+
+                self.selector_window.btn_confirm.clicked.connect(handle_selection)
+            else:
+                QMessageBox.information(self, "Sin resultados", f"No se encontraron descargas para: {title}")
+
             
 # --- Ejecutar aplicación ---
 if __name__ == '__main__':
