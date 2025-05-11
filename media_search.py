@@ -1,3 +1,4 @@
+import re
 import subprocess
 import sys
 import webbrowser
@@ -172,15 +173,27 @@ def search_nyaa(query):
         r = requests.get(url, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
         rows = soup.select("tr.default")
-        for row in rows[:100]:  # podés cambiar el límite
+        for row in rows[:100]:
             title_tag = row.select_one("td:nth-child(2) a[href*='view']")
-            if title_tag:
+            torrent_tag = row.select_one("td.text-center a[href$='.torrent']")
+
+            if title_tag and torrent_tag:
                 title = title_tag.text.strip()
-                href = "https://nyaa.si" + title_tag["href"]
+                torrent_url = "https://nyaa.si" + torrent_tag["href"]
+
+                # Heurística: buscar número de episodio
+                chapter = None
+                match = re.search(r'\b(?:ep?\.?|episode)?\s*(\d{1,4})\b', title, re.IGNORECASE)
+                if match:
+                    chapter = int(match.group(1))
+
                 results.append({
-                        "title": title,
-                        "url": href
-                    })
+                    "title": title,
+                    "chapter": chapter,
+                    "chapters": None,
+                    "url_type": "torrent",
+                    "url": torrent_url
+                })
     except Exception as e:
         print(f"[Nyaa] Error: {e}")
     return results
@@ -197,11 +210,31 @@ def search_1337x(query):
             link = entry.select_one("a:nth-of-type(2)")
             if link:
                 title = link.text.strip()
-                href = "https://1337x.to" + link["href"]
+                detail_url = "https://1337x.to" + link["href"]
+
+                # Scrapear enlace directo .torrent desde la página del torrent
+                detail_r = requests.get(detail_url, headers=headers, timeout=10)
+                detail_soup = BeautifulSoup(detail_r.text, "html.parser")
+                torrent_tag = detail_soup.select_one("a[href$='.torrent']")
+
+                if not torrent_tag:
+                    continue
+
+                torrent_url = torrent_tag["href"]
+
+                # Heurística: buscar número de episodio
+                chapter = None
+                match = re.search(r'\b(?:ep?\.?|episode)?\s*(\d{1,4})\b', title, re.IGNORECASE)
+                if match:
+                    chapter = int(match.group(1))
+
                 results.append({
-                        "title": title,
-                        "url": href
-                    })
+                    "title": title,
+                    "chapter": chapter,
+                    "chapters": None,
+                    "url_type": "torrent",
+                    "url": torrent_url
+                })
     except Exception as e:
         print(f"[1337x] Error: {e}")
     return results
@@ -218,7 +251,7 @@ class MultiChoiceDownloader(QWidget):
         for source, results in results_dict.items():
             for result in results:
                 title = result["title"]
-                item = QListWidgetItem(f"[{source}] {result['url_type']} - {title} {result['capitulo']}/{result['chapters']}")
+                item = QListWidgetItem(f"[{source}] {result['url_type']} - {title} {result['chapter']}/{result['chapters']}")
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
                 item.setCheckState(Qt.Unchecked)
                 item.setData(Qt.UserRole, result["url"])
@@ -377,6 +410,15 @@ class MediaSearchUI(QWidget):
             self.image_label.clear()
 
     def download_item(self):
+        def sort(array):
+            sorted_array= sorted(
+                array,
+                key=lambda x: (
+                    x.get("title", "").lower(),
+                    int(x.get("chapter") or 0)  # Usa 0 si es None o si no existe
+                )
+            )
+            return sorted_array
         if self.current_item:
             title = self.current_item['title']
             print(f"📥 Buscar para descarga: {title}")
@@ -389,19 +431,22 @@ class MediaSearchUI(QWidget):
             # 2. Organizar en dict por sitio
             results = {}
             if aniteca_links:
-                results["Aniteca"] = aniteca_links
-            #if nyaa_links:
-                #results["Nyaa"] = nyaa_links
-            #if x1337_links:
-                #results["1337x"] = x1337_links
+                results["Aniteca"] = sort(aniteca_links)
+            if nyaa_links:
+                results["Nyaa"] = sort(nyaa_links)
+            if x1337_links:
+                results["1337x"] = sort(x1337_links)
 
             if results:
                 self.selector_window = MultiChoiceDownloader(results)
                 self.selector_window.show()
 
                 def handle_selection():
-                    array=self.selector_window.selected_links
-                    print(array)
+                    aux=self.selector_window.selected_links
+                    print(aux)
+                    array=[]
+                    for _,url in aux:
+                        array.append(url)
                     subprocess.Popen(["python", "main.py"]+array)
 
                 self.selector_window.btn_confirm.clicked.connect(handle_selection)
