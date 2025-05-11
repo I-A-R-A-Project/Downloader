@@ -1,3 +1,4 @@
+import subprocess
 import sys
 import webbrowser
 from PyQt5.QtWidgets import (
@@ -13,6 +14,7 @@ import requests
 from aniteca import search_aniteca_api,get_chapter_links,extract_direct_link
 from bs4 import BeautifulSoup
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def search_mal(query):
     url = f"https://myanimelist.net/anime.php?cat=anime&q={query}&type=0&score=0&status=0&p=0&r=0&sm=0&sd=0&sy=0&em=0&ed=0&ey=0&c[]=a&c[]=b&c[]=c&c[]=g"
@@ -136,21 +138,29 @@ class SearchWorker(QRunnable):
 def search_aniteca(query):
     results = []
     try:
-        for anime in search_aniteca_api(query):
-            #print(f"\nAnime: {anime['nombre']} (ID: {anime['id']})")
+        animes = search_aniteca_api(query)
+        for anime in animes:
             episodios = get_chapter_links(anime["id"], anime["numepisodios"])
-            for ep in episodios:
-                #print(f"Cap {ep['capitulo']} - {ep['servername']} (ID: {ep['online_id']})")
-                link_directo = extract_direct_link(ep['servername'], ep['online_id'])
-                if link_directo:
-                    #print(" ➤ Enlace directo:", link_directo)
-                    results.append({
-                        "title": anime['nombre'],
-                        "chapter": ep['capitulo'],
-                        "chapters": episodios,
-                        "url_type":ep['servername'],
-                        "url": link_directo
-                    })
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                future_to_ep = {
+                    executor.submit(extract_direct_link, ep['servername'], ep['online_id']): ep
+                    for ep in episodios
+                }
+                for future in as_completed(future_to_ep):
+                    ep = future_to_ep[future]
+                    try:
+                        link_directo = future.result()
+                        if link_directo:
+                            results.append({
+                                "title": anime['nombre'],
+                                "chapter": ep['capitulo'],
+                                "chapters": anime["numepisodios"],
+                                "url_type": ep['servername'],
+                                "url": link_directo
+                            })
+                    except Exception as e:
+                        print(f"[Thread Error] {e}")
+
     except Exception as e:
         print(f"[Aniteca] Error: {e}")
     return results
@@ -162,7 +172,7 @@ def search_nyaa(query):
         r = requests.get(url, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
         rows = soup.select("tr.default")
-        for row in rows[:10]:  # podés cambiar el límite
+        for row in rows[:100]:  # podés cambiar el límite
             title_tag = row.select_one("td:nth-child(2) a[href*='view']")
             if title_tag:
                 title = title_tag.text.strip()
@@ -183,7 +193,7 @@ def search_1337x(query):
         r = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
         entries = soup.select("td.coll-1.name")
-        for entry in entries[:10]:
+        for entry in entries[:100]:
             link = entry.select_one("a:nth-of-type(2)")
             if link:
                 title = link.text.strip()
@@ -203,27 +213,20 @@ class MultiChoiceDownloader(QWidget):
         self.setGeometry(300, 300, 600, 400)
         self.results_dict = results_dict  # dict: {sitio: [(title, link), ...]}
         self.selected_links = []
-
         self.layout = QVBoxLayout()
         self.list_widget = QListWidget()
-
-        # Llenar la lista
         for source, results in results_dict.items():
             for result in results:
                 title = result["title"]
-                item = QListWidgetItem(f"[{source}] {title}")
+                item = QListWidgetItem(f"[{source}] {result['url_type']} - {title} {result['capitulo']}/{result['chapters']}")
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
                 item.setCheckState(Qt.Unchecked)
-                item.setData(Qt.UserRole, result["url"])  # Guardamos el dict entero
+                item.setData(Qt.UserRole, result["url"])
                 self.list_widget.addItem(item)
-
         self.layout.addWidget(self.list_widget)
-
-        # Botón confirmar
         self.btn_confirm = QPushButton("Descargar seleccionados")
         self.btn_confirm.clicked.connect(self.confirm_selection)
         self.layout.addWidget(self.btn_confirm)
-
         self.setLayout(self.layout)
 
     def confirm_selection(self):
@@ -387,10 +390,10 @@ class MediaSearchUI(QWidget):
             results = {}
             if aniteca_links:
                 results["Aniteca"] = aniteca_links
-            if nyaa_links:
-                results["Nyaa"] = nyaa_links
-            if x1337_links:
-                results["1337x"] = x1337_links
+            #if nyaa_links:
+                #results["Nyaa"] = nyaa_links
+            #if x1337_links:
+                #results["1337x"] = x1337_links
 
             if results:
                 self.selector_window = MultiChoiceDownloader(results)
@@ -399,8 +402,7 @@ class MediaSearchUI(QWidget):
                 def handle_selection():
                     array=self.selector_window.selected_links
                     print(array)
-                    #for _, link in array:
-                    #    webbrowser.open(link)
+                    subprocess.Popen(["python", "main.py"]+array)
 
                 self.selector_window.btn_confirm.clicked.connect(handle_selection)
             else:
