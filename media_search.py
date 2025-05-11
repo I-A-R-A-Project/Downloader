@@ -1,10 +1,13 @@
 import sys
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLineEdit, QListWidget,
-    QLabel, QListWidgetItem, QTextEdit, QPushButton, QHBoxLayout
+    QLabel, QListWidgetItem, QTextEdit, QPushButton, QHBoxLayout,
+    QGraphicsOpacityEffect
 )
-from PyQt5.QtGui import QPixmap, QImage
-from PyQt5.QtCore import Qt, QSize
+from PyQt5.QtGui import QPixmap, QImage,QMovie
+from PyQt5.QtCore import (
+    Qt, QSize, QObject, pyqtSignal, QRunnable, QThreadPool, QTimer,QPropertyAnimation
+)
 import requests
 from io import BytesIO
 
@@ -62,6 +65,25 @@ def search_tmdb(query):
         "image": f"https://image.tmdb.org/t/p/w185{i['poster_path']}" if i.get("poster_path") else None
     } for i in items]
 
+class SearchWorkerSignals(QObject):
+    finished = pyqtSignal(list)
+
+class SearchWorker(QRunnable):
+    def __init__(self, term):
+        super().__init__()
+        self.term = term
+        self.signals = SearchWorkerSignals()
+
+    def run(self):
+        try:
+            anilist_results = search_anilist(self.term)
+            tmdb_results = search_tmdb(self.term)
+            combined = anilist_results + tmdb_results
+        except Exception as e:
+            combined = []
+            print(f"Error en la búsqueda: {e}")
+        self.signals.finished.emit(combined)
+
 # --- UI principal ---
 class MediaSearchUI(QWidget):
     def __init__(self):
@@ -70,10 +92,20 @@ class MediaSearchUI(QWidget):
         self.resize(800, 500)
         layout = QVBoxLayout()
 
+        search_layout = QHBoxLayout()
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("Buscar anime, película o serie...")
         self.search_bar.returnPressed.connect(self.perform_search)
-        layout.addWidget(self.search_bar)
+        search_layout.addWidget(self.search_bar)
+        self.spinner = QLabel()
+        self.spinner_movie = QMovie("spinner.gif")
+        self.spinner_movie.setScaledSize(QSize(20, 20)) 
+        self.spinner.setMovie(self.spinner_movie)
+        self.spinner.setFixedSize(24, 24)
+        self.spinner.setAlignment(Qt.AlignCenter)
+        self.spinner.setVisible(False)
+        search_layout.addWidget(self.spinner)
+        layout.addLayout(search_layout)
 
         self.results_list = QListWidget()
         self.results_list.setIconSize(QSize(80, 120))
@@ -112,19 +144,63 @@ class MediaSearchUI(QWidget):
         if not term:
             return
 
-        results = search_anilist(term) + search_tmdb(term)
-        for item in results:
-            lw_item = QListWidgetItem(f"{item['title']} ({item['year']}) - {item['type']} [{item['source']}]")
-            if item.get("image"):
-                try:
-                    img_data = requests.get(item["image"]).content
-                    image = QImage()
-                    image.loadFromData(img_data)
-                    lw_item.setIcon(QPixmap.fromImage(image))
-                except:
-                    pass
-            lw_item.setData(Qt.UserRole, item)
-            self.results_list.addItem(lw_item)
+        self.spinner.show()
+        self.spinner_movie.start()
+        self.search_bar.setDisabled(True)
+        self.search_bar.setPlaceholderText("Buscando...")
+
+        worker = SearchWorker(term)
+        worker.signals.finished.connect(self.populate_results)
+        QThreadPool.globalInstance().start(worker)
+
+
+    def populate_results(self, results):
+        self.search_bar.setDisabled(False)
+        self.search_bar.setPlaceholderText("Buscar anime, película o serie...")
+        self.spinner_movie.stop()
+        self.spinner.setVisible(False)
+
+        self.results_list.clear()
+        self.animated_results = results
+        self.animation_index = 0
+        self.result_timer = QTimer()
+        self.result_timer.timeout.connect(self.add_next_result)
+        self.result_timer.start(100)  # 100 ms entre ítems
+
+    def add_next_result(self):
+        if self.animation_index >= len(self.animated_results):
+            self.result_timer.stop()
+            return
+
+        item = self.animated_results[self.animation_index]
+        lw_item = QListWidgetItem(f"{item['title']} ({item['year']}) - {item['type']} [{item['source']}]")
+
+        if item.get("image"):
+            try:
+                img_data = requests.get(item["image"]).content
+                image = QImage()
+                image.loadFromData(img_data)
+                lw_item.setIcon(QPixmap.fromImage(image))
+            except:
+                pass
+
+        lw_item.setData(Qt.UserRole, item)
+        self.results_list.addItem(lw_item)
+
+        row = self.results_list.count() - 1
+        item_widget = self.results_list.item(row)
+        item_effect = QGraphicsOpacityEffect()
+        self.results_list.itemWidget(item_widget)  # None, fallback a animar global
+        self.results_list.setGraphicsEffect(item_effect)
+
+        anim = QPropertyAnimation(item_effect, b"opacity")
+        anim.setDuration(300)
+        anim.setStartValue(0)
+        anim.setEndValue(1)
+        anim.start()
+
+        self.animation_index += 1
+
 
     def show_details(self, item):
         data = item.data(Qt.UserRole)
