@@ -4,7 +4,7 @@ import sys
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLineEdit, QListWidget,
     QLabel, QListWidgetItem, QTextEdit, QPushButton, QHBoxLayout,
-    QMessageBox
+    QMessageBox, QDialog
 )
 from PyQt5.QtGui import QPixmap, QImage,QMovie,QIcon
 from PyQt5.QtCore import (
@@ -15,6 +15,7 @@ from aniteca import search_aniteca_api,get_chapter_links,extract_direct_link
 from bs4 import BeautifulSoup
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from PyQt5.QtWebEngineWidgets import QWebEngineView
 
 def search_mal(query):
     url = f"https://myanimelist.net/anime.php?cat=anime&q={query}&type=0&score=0&status=0&p=0&r=0&sm=0&sd=0&sy=0&em=0&ed=0&ey=0&c[]=a&c[]=b&c[]=c&c[]=g"
@@ -51,8 +52,10 @@ def search_mal(query):
             results.append({
                 "title": title,
                 "url": link,
+                "trailer": None,
                 "image": full_img,
                 "description": description,
+                "genres": None,
                 "type": tipo,
                 "episodes": episodios,
                 "score": score,
@@ -283,26 +286,33 @@ class ImageLoaderWorker(QRunnable):
         except:
             self.signals.finished.emit(None)
 
-class FullDescriptionWorkerSignals(QObject):
-    finished = pyqtSignal(str)
+class FullDetailsWorkerSignals(QObject):
+    finished = pyqtSignal(str, str)
 
-class FullDescriptionWorker(QRunnable):
+class FullDetailsWorker(QRunnable):
     def __init__(self, url):
         super().__init__()
         self.url = url
-        self.signals = FullDescriptionWorkerSignals()
+        self.signals = FullDetailsWorkerSignals()
 
     def run(self):
+        full_description = "Sin descripción."
+        trailer_url = None
         try:
             resp = requests.get(self.url, headers={"User-Agent": "Mozilla/5.0"})
             soup = BeautifulSoup(resp.text, "html.parser")
-            desc_tag = soup.select_one("p[itemprop='description']")
-            full_description = desc_tag.get_text(strip=True) if desc_tag else "Sin descripción."
-        except Exception as e:
-            print("[FullDescriptionWorker] Error:", e)
-            full_description = "Sin descripción."
 
-        self.signals.finished.emit(full_description)
+            desc_tag = soup.select_one("p[itemprop='description']")
+            if desc_tag:
+                full_description = desc_tag.get_text(strip=True)
+
+            trailer_tag = soup.select_one("div.video-promotion a.iframe")
+            if trailer_tag:
+                trailer_url = trailer_tag['href']
+        except Exception as e:
+            print("[FullDetailsWorker] Error:", e)
+
+        self.signals.finished.emit(full_description, trailer_url)
 
 class SiteSearchWorkerSignals(QObject):
     result_ready = pyqtSignal(str, list)
@@ -326,7 +336,6 @@ class MediaSearchUI(QWidget):
         self.setWindowTitle("Buscador de medios")
         self.resize(800, 500)
         layout = QVBoxLayout()
-        self.description_cache = {}
 
         search_layout = QHBoxLayout()
         self.search_bar = QLineEdit()
@@ -355,9 +364,16 @@ class MediaSearchUI(QWidget):
         self.details = QTextEdit()
         self.details.setReadOnly(True)
 
+        buttons = QHBoxLayout()
+        self.trailer_button = QPushButton("Ver Trailer")
+        self.trailer_button.setFixedWidth(75)
+        self.trailer_button.clicked.connect(self.show_trailer)
+        self.trailer_button.setEnabled(False)
         self.download_button = QPushButton("Descargar")
         self.download_button.clicked.connect(self.download_item)
         self.download_button.setEnabled(False)
+        buttons.addWidget(self.trailer_button)
+        buttons.addWidget(self.download_button)
 
         details_layout = QHBoxLayout()
         details_layout.addWidget(self.image_label)
@@ -375,10 +391,11 @@ class MediaSearchUI(QWidget):
         self.info_rating = QLabel("Rating: ")
         for label in [self.info_type, self.info_eps, self.info_score, self.info_rating]:
             label.setStyleSheet("font-weight: bold;")
+            label.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
             details_right.addWidget(label)
         details_inner_layout.addLayout(details_right)
         details_center.addLayout(details_inner_layout)
-        details_center.addWidget(self.download_button)
+        details_center.addLayout(buttons)
 
         details_layout.addLayout(details_center)
         layout.addLayout(details_layout)
@@ -468,23 +485,20 @@ class MediaSearchUI(QWidget):
             self.spinner_movie.stop()
             self.image_label.clear()
 
-        # Si la descripción es incompleta, cargar la completa en un hilo aparte
-        if "...read more" in desc and data.get("url"):
-            worker = FullDescriptionWorker(data["url"])
-            worker.signals.finished.connect(self.update_description_text)
-            QThreadPool.globalInstance().start(worker)
+        worker = FullDetailsWorker(data["url"])
+        worker.signals.finished.connect(self.update_details)
+        QThreadPool.globalInstance().start(worker)
 
-    def update_description_text(self, full_description):
-        self.details.setPlainText(full_description)
-
+    def update_details(self, full_description,trailer_url):
         if self.current_item:
             data = self.current_item.data(Qt.UserRole)
-            data["description"] = full_description
+            if "...read more" in data["description"]: 
+                self.details.setPlainText(full_description)
+                data["description"] = full_description
+            data["trailer"] = trailer_url
             self.current_item.setData(Qt.UserRole, data)
-
-            url = data.get("url")
-            if url:
-                self.description_cache[url] = full_description
+        if trailer_url:
+            self.trailer_button.setEnabled(True)
         
     def set_detail_image(self, pixmap):
         self.spinner_movie.stop()
@@ -492,6 +506,25 @@ class MediaSearchUI(QWidget):
             self.image_label.setPixmap(pixmap)
         else:
             self.image_label.clear()
+
+    def show_trailer(self):
+        yt_url = self.current_item.data(Qt.UserRole)["trailer"]
+        embed_url = yt_url.split('?')[0]
+        html = f"""<html><head><style>
+        body {{ margin: 0; background-color: #000; }}
+        iframe {{ width: 100%; height: 100%; border: none; }}
+        </style></head><body>
+        <iframe src="{embed_url}?autoplay=1" allow="autoplay; encrypted-media" allowfullscreen></iframe>        </body>
+        </html>"""
+        self.trailer_window = QDialog(self)
+        self.trailer_window.setWindowTitle("Tráiler")
+        self.trailer_window.resize(640, 360)
+        layout = QVBoxLayout()
+        web_view = QWebEngineView()
+        web_view.setHtml(html)
+        layout.addWidget(web_view)
+        self.trailer_window.setLayout(layout)
+        self.trailer_window.exec_()
 
     def download_item(self):
         if not self.current_item:
@@ -529,7 +562,7 @@ class MediaSearchUI(QWidget):
                     def handle_selection():
                         aux = self.selector_window.selected_links
                         links = [url for _, url in aux]
-                        subprocess.Popen(["python", "main.py"] + links)
+                        subprocess.Popen(["python", "download_manager.py"] + links)
 
                     self.selector_window.btn_confirm.clicked.connect(handle_selection)
                 else:
