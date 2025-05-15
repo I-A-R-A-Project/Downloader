@@ -1,12 +1,14 @@
 import re
 import os
 import sys
+import uuid
 from PyQt5.QtWidgets import QApplication, QWidget,QHBoxLayout, QVBoxLayout, QLabel, QProgressBar, QScrollArea,QPushButton,QDialog,QTextEdit
 from PyQt5.QtWebEngineWidgets import QWebEngineView,QWebEnginePage
 from PyQt5.QtCore import QUrl, QTimer, pyqtSignal
 from bs4 import BeautifulSoup
 from file_downloader import DownloadSignals,FileDownloader
 from settings_dialog import SettingsDialog, load_config,DEFAULT_CONFIG
+from torrent import add_magnet_link, add_torrent_file, get_client
 
 #Mucho ruido en consola, shhhh
 class SilentPage(QWebEnginePage):
@@ -20,15 +22,38 @@ class UniversalDownloader(QWebEngineView):
     def __init__(self, urls):
         super().__init__()
         self.setPage(SilentPage(self))
-        self.urls = [(url, "") for url in urls]  # Url,path
+        self.urls = []
+        self.offscreen_results = []
+        # Clasificamos las URLs: torrents/magnets se manejan sin navegador
+        for url in urls:
+            if url.startswith("magnet:?"):
+                print(f"🔗 Magnet detectado: {url}")
+                filename = f"{uuid.uuid4().hex[:8]}.magnet"
+                self.offscreen_results.append((filename, url))
+            elif url.endswith(".torrent") or "torrage" in url or "itorrents" in url:
+                print(f"🔗 Torrent detectado: {url}")
+                filename = url.split("/")[-1].split("?")[0]
+                self.offscreen_results.append((filename, url))
+            else:
+                self.urls.append((url, ""))  # Se maneja con QWebEngine
+
         self.current_index = 0
         self.results = []
+
+        # Si no quedan URLs para el navegador, emitir directamente
+        if not self.urls:
+            QTimer.singleShot(100, lambda: self.direct_links_ready.emit(self.offscreen_results))
+            return
+
         self.setWindowTitle("Universal Downloader")
         self.loadFinished.connect(self.on_load_finished)
         self.load(QUrl(self.urls[self.current_index][0]))
 
     def start(self):
-        self.show()
+        if self.urls:
+            self.show()
+        else:
+            self.close()
 
     def on_load_finished(self):
         print(self.urls[self.current_index])
@@ -152,7 +177,7 @@ class UniversalDownloader(QWebEngineView):
 class DownloadWindow(QWidget):
     def __init__(self, urls):
         super().__init__()
-        self.setWindowTitle("Descargas MediaFire")
+        self.setWindowTitle("Descargador Universal")
         self.setMinimumSize(400, 200)
         self.layout = QVBoxLayout(self)
 
@@ -171,6 +196,11 @@ class DownloadWindow(QWidget):
         self.settings_button.clicked.connect(self.open_settings_dialog)
         self.layout.addWidget(self.settings_button)
 
+        self.torrent_hashes = {}  # hash : (index, name)
+        self.torrent_timer = QTimer()
+        self.torrent_timer.timeout.connect(self.update_torrent_progress)
+        self.torrent_timer.start(3000)  # cada 3 segundos
+
         self.progress_bars = []
         self.labels = []
         self.downloader = UniversalDownloader(urls)
@@ -187,29 +217,82 @@ class DownloadWindow(QWidget):
         for index, (relative_path, link) in enumerate(direct_links):
             if not link:
                 continue
-            
-            dir_path = os.path.dirname(relative_path)
-            if dir_path:
-                os.makedirs(dir_path, exist_ok=True)
 
-            label = QLabel(f"Descargando: {relative_path}")
-            bar = QProgressBar()
-            bar.setValue(0)
+            if link.startswith("magnet:?"):
+                label = QLabel(f"Descargando torrent: {link[:50]}...")
+                bar = QProgressBar()
+                bar.setValue(0)
 
-            self.inner_layout.addWidget(label)
-            self.inner_layout.addWidget(bar)
+                self.inner_layout.addWidget(label)
+                self.inner_layout.addWidget(bar)
+                self.labels.append(label)
+                self.progress_bars.append(bar)
 
-            self.labels.append(label)
-            self.progress_bars.append(bar)
+                torrent_hash = add_magnet_link(link, self.folder_path)
+                if torrent_hash:
+                    self.torrent_hashes[torrent_hash] = (len(self.labels)-1, link[:50])
+                continue
 
-            signals = DownloadSignals()
-            signals.progress.connect(self.update_progress)
-            signals.finished.connect(self.mark_finished)
+            elif link.endswith(".torrent"):
+                # Igual que antes, pero en load_torrent_after_download:
+                def load_torrent_after_download(self, index, file_path):
+                    self.mark_finished(index)
+                    try:
+                        torrent_hash = add_torrent_file(file_path, self.folder_path)
+                        if torrent_hash:
+                            label = QLabel(f"Descargando torrent: {os.path.basename(file_path)}")
+                            bar = QProgressBar()
+                            bar.setValue(0)
+                            self.inner_layout.addWidget(label)
+                            self.inner_layout.addWidget(bar)
+                            self.labels.append(label)
+                            self.progress_bars.append(bar)
+                            self.torrent_hashes[torrent_hash] = (len(self.labels)-1, os.path.basename(file_path))
+                    except Exception as e:
+                        print(f"Error al agregar torrent: {e}")
+            else:
+                # Descarga directa normal
+                dir_path = os.path.dirname(relative_path)
+                if dir_path:
+                    os.makedirs(dir_path, exist_ok=True)
 
-            thread = FileDownloader(link, relative_path, index, signals)
-            thread.start()
+                label = QLabel(f"Descargando: {relative_path}")
+                bar = QProgressBar()
+                bar.setValue(0)
+
+                self.inner_layout.addWidget(label)
+                self.inner_layout.addWidget(bar)
+
+                self.labels.append(label)
+                self.progress_bars.append(bar)
+
+                signals = DownloadSignals()
+                signals.progress.connect(self.update_progress)
+                signals.finished.connect(self.mark_finished)
+
+                thread = FileDownloader(link, relative_path, index, signals)
+                thread.start()
+        
         self.total_downloads = len(self.progress_bars)
         self.show()
+
+    def update_torrent_progress(self):
+        if not self.torrent_hashes:
+            return
+        try:
+            client = get_client()
+            client.auth_log_in()
+            torrents = client.torrents_info()
+            for t in torrents:
+                if t.hash in self.torrent_hashes:
+                    index, name = self.torrent_hashes[t.hash]
+                    percent = int(t.progress * 100)
+                    self.progress_bars[index].setValue(percent)
+                    if percent >= 100:
+                        self.mark_finished(index)
+                        del self.torrent_hashes[t.hash]
+        except Exception as e:
+            print(f"Error al actualizar progreso de torrent: {e}")
 
     def update_progress(self, index, percent):
         self.progress_bars[index].setValue(percent)

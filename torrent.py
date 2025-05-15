@@ -1,41 +1,32 @@
-import libtorrent as lt
+from qbittorrentapi import Client
 import time
-import os
 
-# Ruta al archivo .torrent o magnet link
-torrent_path = 'ruta/del/archivo.torrent'  # o usa un magnet link
-save_path = './descargas'
+def get_client():
+    return Client(
+        host='localhost:8080',
+        username='admin',
+        password='adminadmin'
+    )
 
-# Sesión
-ses = lt.session()
-ses.listen_on(6881, 6891)
-
-# Agrega el torrent
-if torrent_path.startswith("magnet:"):
-    params = {
-        'save_path': save_path,
-        'storage_mode': lt.storage_mode_t(2),
-    }
-    handle = lt.add_magnet_uri(ses, torrent_path, params)
-else:
-    info = lt.torrent_info(torrent_path)
-    params = {
-        'save_path': save_path,
-        'storage_mode': lt.storage_mode_t(2),
-        'ti': info
-    }
-    handle = ses.add_torrent(params)
-
-print("Iniciando descarga...")
-
-# Esperar metadata si es magnet
-while not handle.has_metadata():
+def add_torrent_file(file_path, save_path):
+    client = get_client()
+    client.auth_log_in()
+    res = client.torrents_add(torrent_files=file_path, save_path=save_path)
     time.sleep(1)
+    # Buscamos el torrent recién agregado
+    torrents = client.torrents_info()
+    for t in torrents:
+        if t.save_path == save_path and t.name in file_path:
+            return t.hash
+    return None
 
-# Monitorear progreso
-while handle.status().state != lt.torrent_status.seeding:
-    s = handle.status()
-    print(f"{s.progress * 100:.2f}% completado - {s.download_rate / 1000:.2f} kB/s")
+def add_magnet_link(magnet_url, save_path):
+    client = get_client()
+    client.auth_log_in()
+    res = client.torrents_add(urls=magnet_url, save_path=save_path)
     time.sleep(1)
-
-print("Descarga completa.")
+    torrents = client.torrents_info()
+    for t in torrents:
+        if t.magnet_uri == magnet_url:
+            return t.hash
+    return None
