@@ -1,15 +1,14 @@
 import re
 import subprocess
 import sys
-import webbrowser
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLineEdit, QListWidget,
     QLabel, QListWidgetItem, QTextEdit, QPushButton, QHBoxLayout,
-    QGraphicsOpacityEffect,QMessageBox
+    QMessageBox
 )
-from PyQt5.QtGui import QPixmap, QImage,QMovie
+from PyQt5.QtGui import QPixmap, QImage,QMovie,QIcon
 from PyQt5.QtCore import (
-    Qt, QSize, QObject, pyqtSignal, QRunnable, QThreadPool, QTimer,QPropertyAnimation
+    Qt, QSize, QObject, pyqtSignal, QRunnable, QThreadPool, 
 )
 import requests
 from aniteca import search_aniteca_api,get_chapter_links,extract_direct_link
@@ -53,10 +52,14 @@ def search_mal(query):
                 "title": title,
                 "url": link,
                 "image": full_img,
-                "description": f"{description} | Tipo: {tipo} | Episodios: {episodios} | Score: {score} | Rating: {rating}",
-                "source": "MyAnimeList",
-                "rating": rating
+                "description": description,
+                "type": tipo,
+                "episodes": episodios,
+                "score": score,
+                "rating": rating,
+                "source": "MyAnimeList"
             })
+
         except Exception as e:
             print("Error procesando un resultado:", e)
             continue
@@ -127,13 +130,7 @@ class SearchWorker(QRunnable):
         self.signals = SearchWorkerSignals()
 
     def run(self):
-        #try:
-        #    anilist_results = search_anilist(self.term)
-        #except Exception as e:
-        #    print(f"Error en la búsqueda: {e}")
         results = search_mal(self.term)
-        #tmdb_results = search_tmdb(self.term)
-        #combined = anilist_results + tmdb_results
         self.signals.finished.emit(results)
 
 def search_aniteca(query):
@@ -142,26 +139,19 @@ def search_aniteca(query):
         animes = search_aniteca_api(query)
         for anime in animes:
             episodios = get_chapter_links(anime["id"], anime["numepisodios"])
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                future_to_ep = {
-                    executor.submit(extract_direct_link, ep['servername'], ep['online_id']): ep
-                    for ep in episodios
-                }
-                for future in as_completed(future_to_ep):
-                    ep = future_to_ep[future]
-                    try:
-                        link_directo = future.result()
-                        if link_directo:
-                            results.append({
-                                "title": anime['nombre'],
-                                "chapter": ep['capitulo'],
-                                "chapters": anime["numepisodios"],
-                                "url_type": ep['servername'],
-                                "url": link_directo
-                            })
-                    except Exception as e:
-                        print(f"[Thread Error] {e}")
-
+            for ep in episodios:
+                try:
+                    link_directo = extract_direct_link(ep['servername'], ep['online_id'])
+                    if link_directo:
+                        results.append({
+                            "title": anime['nombre'],
+                            "chapter": ep['capitulo'],
+                            "chapters": anime["numepisodios"],
+                            "url_type": ep['servername'],
+                            "url": link_directo
+                        })
+                except Exception as e:
+                    print(f"[LinkError] {e}")
     except Exception as e:
         print(f"[Aniteca] Error: {e}")
     return results
@@ -244,7 +234,7 @@ class MultiChoiceDownloader(QWidget):
         super().__init__()
         self.setWindowTitle("Selecciona los enlaces para descargar")
         self.setGeometry(300, 300, 600, 400)
-        self.results_dict = results_dict  # dict: {sitio: [(title, link), ...]}
+        self.results_dict = results_dict
         self.selected_links = []
         self.layout = QVBoxLayout()
         self.list_widget = QListWidget()
@@ -274,6 +264,61 @@ class MultiChoiceDownloader(QWidget):
         else:
             QMessageBox.warning(self, "Nada seleccionado", "Por favor selecciona al menos un enlace.")
 
+class ImageLoadedSignal(QObject):
+    finished = pyqtSignal(QPixmap)
+
+class ImageLoaderWorker(QRunnable):
+    def __init__(self, image_url):
+        super().__init__()
+        self.image_url = image_url
+        self.signals = ImageLoadedSignal()
+
+    def run(self):
+        try:
+            img_data = requests.get(self.image_url, timeout=10).content
+            image = QImage()
+            image.loadFromData(img_data)
+            pixmap = QPixmap.fromImage(image)
+            self.signals.finished.emit(pixmap)
+        except:
+            self.signals.finished.emit(None)
+
+class FullDescriptionWorkerSignals(QObject):
+    finished = pyqtSignal(str)
+
+class FullDescriptionWorker(QRunnable):
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+        self.signals = FullDescriptionWorkerSignals()
+
+    def run(self):
+        try:
+            resp = requests.get(self.url, headers={"User-Agent": "Mozilla/5.0"})
+            soup = BeautifulSoup(resp.text, "html.parser")
+            desc_tag = soup.select_one("p[itemprop='description']")
+            full_description = desc_tag.get_text(strip=True) if desc_tag else "Sin descripción."
+        except Exception as e:
+            print("[FullDescriptionWorker] Error:", e)
+            full_description = "Sin descripción."
+
+        self.signals.finished.emit(full_description)
+
+class SiteSearchWorkerSignals(QObject):
+    result_ready = pyqtSignal(str, list)
+
+class SiteSearchWorker(QRunnable):
+    def __init__(self, site_name, search_func, query):
+        super().__init__()
+        self.site_name = site_name
+        self.search_func = search_func
+        self.query = query
+        self.signals = SiteSearchWorkerSignals()
+
+    def run(self):
+        results = self.search_func(self.query)
+        self.signals.result_ready.emit(self.site_name, results)
+
 # --- UI principal ---
 class MediaSearchUI(QWidget):
     def __init__(self):
@@ -281,6 +326,7 @@ class MediaSearchUI(QWidget):
         self.setWindowTitle("Buscador de medios")
         self.resize(800, 500)
         layout = QVBoxLayout()
+        self.description_cache = {}
 
         search_layout = QHBoxLayout()
         self.search_bar = QLineEdit()
@@ -303,7 +349,7 @@ class MediaSearchUI(QWidget):
         layout.addWidget(self.results_list)
 
         self.image_label = QLabel()
-        self.image_label.setFixedSize(120, 180)
+        self.image_label.setFixedSize(150, 212)
         self.image_label.setScaledContents(True)
 
         self.details = QTextEdit()
@@ -315,10 +361,26 @@ class MediaSearchUI(QWidget):
 
         details_layout = QHBoxLayout()
         details_layout.addWidget(self.image_label)
+        details_center = QVBoxLayout()
+        # Descripción
+        details_inner_layout = QHBoxLayout()
+        self.details = QTextEdit()
+        self.details.setReadOnly(True)
+        details_inner_layout.addWidget(self.details)
+        # Campos adicionales
         details_right = QVBoxLayout()
-        details_right.addWidget(self.details)
-        details_right.addWidget(self.download_button)
-        details_layout.addLayout(details_right)
+        self.info_type = QLabel("Tipo: ")
+        self.info_eps = QLabel("Episodios: ")
+        self.info_score = QLabel("Score: ")
+        self.info_rating = QLabel("Rating: ")
+        for label in [self.info_type, self.info_eps, self.info_score, self.info_rating]:
+            label.setStyleSheet("font-weight: bold;")
+            details_right.addWidget(label)
+        details_inner_layout.addLayout(details_right)
+        details_center.addLayout(details_inner_layout)
+        details_center.addWidget(self.download_button)
+
+        details_layout.addLayout(details_center)
         layout.addLayout(details_layout)
 
         self.setLayout(layout)
@@ -350,110 +412,137 @@ class MediaSearchUI(QWidget):
         self.spinner.setVisible(False)
 
         self.results_list.clear()
-        self.animated_results = results
-        self.animation_index = 0
-        self.result_timer = QTimer()
-        self.result_timer.timeout.connect(self.add_next_result)
-        self.result_timer.start(100)  # 100 ms entre ítems
 
-    def add_next_result(self):
-        if self.animation_index >= len(self.animated_results):
-            self.result_timer.stop()
-            return
+        for item in results:
+            if item['source'] == "MyAnimeList":
+                lw_item = QListWidgetItem(f"[{item['source']}] - {item['title']}")
+            else:
+                lw_item = QListWidgetItem(item['title'])
 
-        item = self.animated_results[self.animation_index]
-        #lw_item = QListWidgetItem(f"{item['title']} ({item['year']}) - {item['type']} [{item['source']}]")
-        if item['source']=="MyAnimeList":
-            lw_item = QListWidgetItem(f"{item['title']} [{item['source']}]")
-
-        if item.get("image"):
-            try:
-                img_data = requests.get(item["image"]).content
-                image = QImage()
-                image.loadFromData(img_data)
-                lw_item.setIcon(QPixmap.fromImage(image))
-            except:
-                pass
-
-        lw_item.setData(Qt.UserRole, item)
-        self.results_list.addItem(lw_item)
-
-        row = self.results_list.count() - 1
-        item_widget = self.results_list.item(row)
-        item_effect = QGraphicsOpacityEffect()
-        self.results_list.itemWidget(item_widget)  # None, fallback a animar global
-        self.results_list.setGraphicsEffect(item_effect)
-
-        anim = QPropertyAnimation(item_effect, b"opacity")
-        anim.setDuration(300)
-        anim.setStartValue(0)
-        anim.setEndValue(1)
-        anim.start()
-
-        self.animation_index += 1
+            lw_item.setData(Qt.UserRole, item)
+            self.results_list.addItem(lw_item)
 
     def show_details(self, item):
-        data = item.data(Qt.UserRole)
-        self.current_item = data
-        self.details.setPlainText(data.get("description", "Sin descripción."))
-        self.download_button.setEnabled(True)
-        # Mostrar imagen grande
-        if data.get("image"):
+        def score_to_color(score):
             try:
-                img_data = requests.get(data["image"]).content
-                image = QImage()
-                image.loadFromData(img_data)
-                self.image_label.setPixmap(QPixmap.fromImage(image))
+                s = float(score)
             except:
-                self.image_label.clear()
+                return f"<span style='color:#000'>{score}</span>"
+            s = max(0.0, min(s, 10.0))
+            r = int(255 * (1 - s / 10))
+            g = int(255 * (s / 10))
+            return f"<span style='color:rgb({r},{g},0)'>{score}</span>"
+
+        RATING_TEXT = {
+            "G": " G<br>All Ages",
+            "PG": " PG<br>Children",
+            "PG-13": "<br>PG-13<br>Teens 13<br>or older",
+            "R": " R<br>17+ (violence<br>and profanity)",
+            "R+": " R+<br>Mild Nudity",
+            "Rx": "<br>Rx<br>Hentai"
+        }
+
+        data = item.data(Qt.UserRole)
+        self.current_item = item
+
+        desc = data.get("description", "Sin descripción.")
+        self.details.setPlainText(desc)
+
+        self.info_type.setText(f"<b>Tipo:<br>{data.get('type', '')}</b>")
+        self.info_eps.setText(f"<b>Episodios:<br>{data.get('episodes', '')}</b>")
+        self.info_score.setText(f"<b>Score:<br>{score_to_color(data.get('score', ''))}</b>")
+
+        rating_text = RATING_TEXT.get(data.get("rating", ""), "<br>No rating")
+        self.info_rating.setText(f"<b>Rating:{rating_text}</b>")
+
+        self.download_button.setEnabled(True)
+
+        self.spinner_movie.start()
+        self.image_label.setMovie(self.spinner_movie)
+
+        if data.get("image"):
+            worker = ImageLoaderWorker(data["image"])
+            worker.signals.finished.connect(self.set_detail_image)
+            QThreadPool.globalInstance().start(worker)
+        else:
+            self.spinner_movie.stop()
+            self.image_label.clear()
+
+        # Si la descripción es incompleta, cargar la completa en un hilo aparte
+        if "...read more" in desc and data.get("url"):
+            worker = FullDescriptionWorker(data["url"])
+            worker.signals.finished.connect(self.update_description_text)
+            QThreadPool.globalInstance().start(worker)
+
+    def update_description_text(self, full_description):
+        self.details.setPlainText(full_description)
+
+        if self.current_item:
+            data = self.current_item.data(Qt.UserRole)
+            data["description"] = full_description
+            self.current_item.setData(Qt.UserRole, data)
+
+            url = data.get("url")
+            if url:
+                self.description_cache[url] = full_description
+        
+    def set_detail_image(self, pixmap):
+        self.spinner_movie.stop()
+        if pixmap:
+            self.image_label.setPixmap(pixmap)
         else:
             self.image_label.clear()
 
     def download_item(self):
-        def sort(array):
-            sorted_array= sorted(
-                array,
-                key=lambda x: (
-                    x.get("title", "").lower(),
-                    int(x.get("chapter") or 0)  # Usa 0 si es None o si no existe
-                )
-            )
-            return sorted_array
-        if self.current_item:
-            title = self.current_item['title']
-            print(f"📥 Buscar para descarga: {title}")
+        if not self.current_item:
+            return
 
-            # 1. Buscar en los sitios (múltiples resultados)
-            aniteca_links = search_aniteca(title)
-            nyaa_links = search_nyaa(title)
-            x1337_links = search_1337x(title)
+        title = self.current_item.data(Qt.UserRole)['title']
+        print(f"📥 Buscar para descarga: {title}")
+        self.download_button.setText("Buscando...")
+        self.download_button.setEnabled(False)
 
-            # 2. Organizar en dict por sitio
-            results = {}
-            if aniteca_links:
-                results["Aniteca"] = sort(aniteca_links)
-            if nyaa_links:
-                results["Nyaa"] = sort(nyaa_links)
-            if x1337_links:
-                results["1337x"] = sort(x1337_links)
+        self.results_dict = {}
+        self.pending_sites = {"Aniteca", "Nyaa", "1337x"}
+        self.total_links_found = 0
 
+        def update_results(site_name, results):
             if results:
-                self.selector_window = MultiChoiceDownloader(results)
-                self.selector_window.show()
+                sorted_results = sorted(
+                    results,
+                    key=lambda x: (
+                        x.get("title", "").lower(),
+                        int(x.get("chapter") or 0)
+                    )
+                )
+                self.results_dict[site_name] = sorted_results
+                self.total_links_found += len(sorted_results)
 
-                def handle_selection():
-                    aux=self.selector_window.selected_links
-                    print(aux)
-                    array=[]
-                    for _,url in aux:
-                        array.append(url)
-                    subprocess.Popen(["python", "main.py"]+array)
+            self.download_button.setText(f"Cargando: {self.total_links_found} enlaces")
+            self.pending_sites.discard(site_name)
 
-                self.selector_window.btn_confirm.clicked.connect(handle_selection)
-            else:
-                QMessageBox.information(self, "Sin resultados", f"No se encontraron descargas para: {title}")
+            if not self.pending_sites:
+                if self.results_dict:
+                    self.selector_window = MultiChoiceDownloader(self.results_dict)
+                    self.selector_window.show()
 
-            
+                    def handle_selection():
+                        aux = self.selector_window.selected_links
+                        links = [url for _, url in aux]
+                        subprocess.Popen(["python", "main.py"] + links)
+
+                    self.selector_window.btn_confirm.clicked.connect(handle_selection)
+                else:
+                    QMessageBox.information(self, "Sin resultados", f"No se encontraron descargas para: {title}")
+                self.download_button.setText("Descargar")
+
+        # Encolar cada búsqueda
+        pool = QThreadPool.globalInstance()
+        for name, func in [("Aniteca", search_aniteca), ("Nyaa", search_nyaa), ("1337x", search_1337x)]:
+            worker = SiteSearchWorker(name, func, title)
+            worker.signals.result_ready.connect(update_results)
+            pool.start(worker)
+           
 # --- Ejecutar aplicación ---
 if __name__ == '__main__':
     app = QApplication(sys.argv)
