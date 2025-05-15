@@ -1,13 +1,10 @@
-import re
-import os
-import sys
-import uuid
-from PyQt5.QtWidgets import QApplication, QWidget,QHBoxLayout, QVBoxLayout, QLabel, QProgressBar, QScrollArea,QPushButton,QDialog,QTextEdit
-from PyQt5.QtWebEngineWidgets import QWebEngineView,QWebEnginePage
+import re, os, sys, uuid
+from PyQt5.QtWidgets import QApplication, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QProgressBar, QScrollArea, QPushButton, QDialog, QTextEdit
+from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
 from PyQt5.QtCore import QUrl, QTimer, pyqtSignal
 from bs4 import BeautifulSoup
-from file_downloader import DownloadSignals,FileDownloader
-from settings_dialog import SettingsDialog, load_config,DEFAULT_CONFIG
+from workers import DownloadSignals, FileDownloader
+from settings_dialog import SettingsDialog, load_config, DEFAULT_CONFIG
 from torrent import add_magnet_link, add_torrent_file, get_client
 
 #Mucho ruido en consola, shhhh

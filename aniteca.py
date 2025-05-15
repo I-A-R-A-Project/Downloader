@@ -1,4 +1,3 @@
-import sys
 import requests
 
 headers = {
@@ -11,11 +10,34 @@ headers = {
         "Referer": "https://aniteca.net/"
     }
 
+def search_aniteca(query):
+    results = []
+    try:
+        animes = search_aniteca_api(query)
+        for anime in animes:
+            episodios = get_chapter_links(anime["id"], anime["numepisodios"])
+            for ep in episodios:
+                try:
+                    link_directo = extract_direct_link(ep['servername'], ep['online_id'])
+                    if link_directo:
+                        results.append({
+                            "title": anime['nombre'],
+                            "chapter": ep['capitulo'],
+                            "chapters": anime["numepisodios"],
+                            "url_type": ep['servername'],
+                            "url": link_directo
+                        })
+                except Exception as e:
+                    print(f"[LinkError] {e}")
+    except Exception as e:
+        print(f"[Aniteca] Error: {e}")
+    return results
+
 # Paso 1: Obtener el animeid y número de capítulos
 def search_aniteca_api(query):
     url = "https://aniteca.net/aniapi/api/search"
     payload = {
-        "perpage": 24,
+        "perpage": 100,
         "page": 1,
         "orden": "ASC",
         "ordenby": "nombre",
@@ -107,7 +129,6 @@ def extract_direct_link(server, online_id):
         print(f"[ExtractKey] Error: {e}")
         print("Respuesta:", response.text[:200])
         return None
-
 
 # Ejemplo de uso
 if __name__ == "__main__":

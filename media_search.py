@@ -1,106 +1,18 @@
-import re
-import subprocess
-import sys
+import re, subprocess, sys, requests
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLineEdit, QListWidget,
     QLabel, QListWidgetItem, QTextEdit, QPushButton, QHBoxLayout,
     QMessageBox, QDialog
 )
-from PyQt5.QtGui import QPixmap, QImage,QMovie,QIcon
+from PyQt5.QtGui import QMovie
 from PyQt5.QtCore import (
-    Qt, QSize, QObject, pyqtSignal, QRunnable, QThreadPool, 
+    Qt, QSize, QThreadPool, 
 )
-import requests
-from aniteca import search_aniteca_api,get_chapter_links,extract_direct_link
+from aniteca import search_aniteca
 from bs4 import BeautifulSoup
-from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 
-def search_mal(query):
-    url = f"https://myanimelist.net/anime.php?cat=anime&q={query}&type=0&score=0&status=0&p=0&r=0&sm=0&sd=0&sy=0&em=0&ed=0&ey=0&c[]=a&c[]=b&c[]=c&c[]=g"
-    try:
-        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-        response.raise_for_status()
-    except Exception as e:
-        print("[MyAnimeList] Error:", e)
-        return []
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    results = []
-
-    for row in soup.select("tr:has(img)"):
-        try:
-            img_tag = row.select_one("img")
-            title_tag = row.select_one("td:nth-of-type(2) a strong")
-            description_tag = row.select_one(".pt4")
-            info_cells = row.find_all("td", class_="ac")
-
-            title = title_tag.text.strip()
-            link = title_tag.find_parent("a")["href"]
-
-            # Extraer y mejorar la imagen
-            raw_img = img_tag.get("data-src", img_tag.get("src", ""))
-            full_img = raw_img.replace("/r/50x70", "").split("?")[0]  # remueve resize y parámetros
-
-            description = description_tag.get_text(strip=True) if description_tag else ""
-            tipo = info_cells[0].text.strip() if len(info_cells) > 0 else ""
-            episodios = info_cells[1].text.strip() if len(info_cells) > 1 else ""
-            score = info_cells[2].text.strip() if len(info_cells) > 2 else ""
-            rating = info_cells[3].text.strip() if len(info_cells) > 3 else ""
-
-            results.append({
-                "title": title,
-                "url": link,
-                "trailer": None,
-                "image": full_img,
-                "description": description,
-                "genres": None,
-                "type": tipo,
-                "episodes": episodios,
-                "score": score,
-                "rating": rating,
-                "source": "MyAnimeList"
-            })
-
-        except Exception as e:
-            print("Error procesando un resultado:", e)
-            continue
-
-    return results
-
-# --- AniList con resultados ---
-def search_anilist(query):
-    url = "https://graphql.anilist.co"
-    query_str = '''
-    query ($search: String) {
-      Page(perPage: 15) {
-        media(search: $search, type: ANIME) {
-          title {
-            romaji
-            english
-          }
-          startDate { year }
-          description(asHtml: false)
-          format
-          coverImage {
-            medium
-          }
-        }
-      }
-    }
-    '''
-    variables = { "search": query }
-    res = requests.post(url, json={'query': query_str, 'variables': variables})
-    items = res.json().get("data", {}).get("Page", {}).get("media", [])
-    return [{
-        "source": "AniList",
-        "title": m["title"]["english"] or m["title"]["romaji"],
-        "year": m["startDate"]["year"],
-        "type": m["format"],
-        "description": m["description"],
-        "image": m["coverImage"]["medium"]
-    } for m in items]
+from workers import FullDetailsWorker, ImageLoaderWorker, SearchWorker, SiteSearchWorker
 
 # --- TMDb con imagen ---
 TMDB_API_KEY = 'TU_API_KEY_AQUI'
@@ -122,42 +34,6 @@ def search_tmdb(query):
         "description": i.get("overview", ""),
         "image": f"https://image.tmdb.org/t/p/w185{i['poster_path']}" if i.get("poster_path") else None
     } for i in items]
-
-class SearchWorkerSignals(QObject):
-    finished = pyqtSignal(list)
-
-class SearchWorker(QRunnable):
-    def __init__(self, term):
-        super().__init__()
-        self.term = term
-        self.signals = SearchWorkerSignals()
-
-    def run(self):
-        results = search_mal(self.term)
-        self.signals.finished.emit(results)
-
-def search_aniteca(query):
-    results = []
-    try:
-        animes = search_aniteca_api(query)
-        for anime in animes:
-            episodios = get_chapter_links(anime["id"], anime["numepisodios"])
-            for ep in episodios:
-                try:
-                    link_directo = extract_direct_link(ep['servername'], ep['online_id'])
-                    if link_directo:
-                        results.append({
-                            "title": anime['nombre'],
-                            "chapter": ep['capitulo'],
-                            "chapters": anime["numepisodios"],
-                            "url_type": ep['servername'],
-                            "url": link_directo
-                        })
-                except Exception as e:
-                    print(f"[LinkError] {e}")
-    except Exception as e:
-        print(f"[Aniteca] Error: {e}")
-    return results
 
 def search_nyaa(query):
     results = []
@@ -267,68 +143,6 @@ class MultiChoiceDownloader(QWidget):
         else:
             QMessageBox.warning(self, "Nada seleccionado", "Por favor selecciona al menos un enlace.")
 
-class ImageLoadedSignal(QObject):
-    finished = pyqtSignal(QPixmap)
-
-class ImageLoaderWorker(QRunnable):
-    def __init__(self, image_url):
-        super().__init__()
-        self.image_url = image_url
-        self.signals = ImageLoadedSignal()
-
-    def run(self):
-        try:
-            img_data = requests.get(self.image_url, timeout=10).content
-            image = QImage()
-            image.loadFromData(img_data)
-            pixmap = QPixmap.fromImage(image)
-            self.signals.finished.emit(pixmap)
-        except:
-            self.signals.finished.emit(None)
-
-class FullDetailsWorkerSignals(QObject):
-    finished = pyqtSignal(str, str)
-
-class FullDetailsWorker(QRunnable):
-    def __init__(self, url):
-        super().__init__()
-        self.url = url
-        self.signals = FullDetailsWorkerSignals()
-
-    def run(self):
-        full_description = "Sin descripción."
-        trailer_url = None
-        try:
-            resp = requests.get(self.url, headers={"User-Agent": "Mozilla/5.0"})
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            desc_tag = soup.select_one("p[itemprop='description']")
-            if desc_tag:
-                full_description = desc_tag.get_text(strip=True)
-
-            trailer_tag = soup.select_one("div.video-promotion a.iframe")
-            if trailer_tag:
-                trailer_url = trailer_tag['href']
-        except Exception as e:
-            print("[FullDetailsWorker] Error:", e)
-
-        self.signals.finished.emit(full_description, trailer_url)
-
-class SiteSearchWorkerSignals(QObject):
-    result_ready = pyqtSignal(str, list)
-
-class SiteSearchWorker(QRunnable):
-    def __init__(self, site_name, search_func, query):
-        super().__init__()
-        self.site_name = site_name
-        self.search_func = search_func
-        self.query = query
-        self.signals = SiteSearchWorkerSignals()
-
-    def run(self):
-        results = self.search_func(self.query)
-        self.signals.result_ready.emit(self.site_name, results)
-
 # --- UI principal ---
 class MediaSearchUI(QWidget):
     def __init__(self):
@@ -357,9 +171,11 @@ class MediaSearchUI(QWidget):
         self.results_list.itemClicked.connect(self.show_details)
         layout.addWidget(self.results_list)
 
+        details_layout = QHBoxLayout()
         self.image_label = QLabel()
         self.image_label.setFixedSize(150, 212)
         self.image_label.setScaledContents(True)
+        details_layout.addWidget(self.image_label)
 
         self.details = QTextEdit()
         self.details.setReadOnly(True)
@@ -375,8 +191,6 @@ class MediaSearchUI(QWidget):
         buttons.addWidget(self.trailer_button)
         buttons.addWidget(self.download_button)
 
-        details_layout = QHBoxLayout()
-        details_layout.addWidget(self.image_label)
         details_center = QVBoxLayout()
         # Descripción
         details_inner_layout = QHBoxLayout()
