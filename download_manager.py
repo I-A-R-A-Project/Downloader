@@ -1,7 +1,8 @@
 import re, os, sys, uuid
+from urllib.parse import unquote
 from PyQt5.QtWidgets import QApplication, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QProgressBar, QScrollArea, QPushButton, QDialog, QTextEdit
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
-from PyQt5.QtCore import QUrl, QTimer, pyqtSignal
+from PyQt5.QtCore import QUrl, QTimer, pyqtSignal, QThreadPool
 from bs4 import BeautifulSoup
 from workers import DownloadSignals, FileDownloader
 from settings_dialog import SettingsDialog, load_config, DEFAULT_CONFIG
@@ -204,11 +205,6 @@ class DownloadWindow(QWidget):
         self.downloader.direct_links_ready.connect(self.start_downloads)
         self.downloader.start()
 
-    def open_settings_dialog(self):
-        dialog = SettingsDialog(self)
-        if dialog.exec_() == QDialog.Accepted:
-            self.apply_settings()
-
     def start_downloads(self, direct_links):
         self.completed_downloads = 0
         for index, (relative_path, link) in enumerate(direct_links):
@@ -216,10 +212,11 @@ class DownloadWindow(QWidget):
                 continue
 
             if link.startswith("magnet:?"):
-                label = QLabel(f"Descargando torrent: {link[:50]}...")
+                match = re.search(r'dn=([^&]+)', link)
+                magnetname=unquote(match.group(1)) if match else link[:50] + "..."
+                label = QLabel(f"Descargando torrent: {magnetname}")
                 bar = QProgressBar()
                 bar.setValue(0)
-
                 self.inner_layout.addWidget(label)
                 self.inner_layout.addWidget(bar)
                 self.labels.append(label)
@@ -227,26 +224,32 @@ class DownloadWindow(QWidget):
 
                 torrent_hash = add_magnet_link(link, self.folder_path)
                 if torrent_hash:
-                    self.torrent_hashes[torrent_hash] = (len(self.labels)-1, link[:50])
-                continue
+                    self.torrent_hashes[torrent_hash] = (len(self.labels)-1, label.text())
 
             elif link.endswith(".torrent"):
-                # Igual que antes, pero en load_torrent_after_download:
-                def load_torrent_after_download(self, index, file_path):
-                    self.mark_finished(index)
-                    try:
-                        torrent_hash = add_torrent_file(file_path, self.folder_path)
+                label = QLabel(f"Descargando archivo .torrent: {os.path.basename(relative_path)}")
+                bar = QProgressBar()
+                bar.setValue(0)
+                self.inner_layout.addWidget(label)
+                self.inner_layout.addWidget(bar)
+                self.labels.append(label)
+                self.progress_bars.append(bar)
+
+                def handle_torrent_ready(idx=index, lbl=label.text()):
+                    def after_download():
+                        full_path = os.path.abspath(relative_path)
+                        torrent_hash = add_torrent_file(full_path, self.folder_path)
                         if torrent_hash:
-                            label = QLabel(f"Descargando torrent: {os.path.basename(file_path)}")
-                            bar = QProgressBar()
-                            bar.setValue(0)
-                            self.inner_layout.addWidget(label)
-                            self.inner_layout.addWidget(bar)
-                            self.labels.append(label)
-                            self.progress_bars.append(bar)
-                            self.torrent_hashes[torrent_hash] = (len(self.labels)-1, os.path.basename(file_path))
-                    except Exception as e:
-                        print(f"Error al agregar torrent: {e}")
+                            self.torrent_hashes[torrent_hash] = (idx, lbl)
+                    return after_download
+
+                signals = DownloadSignals()
+                signals.progress.connect(self.update_progress)
+                signals.finished.connect(lambda idx=index: handle_torrent_ready()(idx))
+
+                thread = FileDownloader(link, relative_path, index, signals)
+                QThreadPool.globalInstance().start(thread)
+
             else:
                 # Descarga directa normal
                 dir_path = os.path.dirname(relative_path)
@@ -256,22 +259,25 @@ class DownloadWindow(QWidget):
                 label = QLabel(f"Descargando: {relative_path}")
                 bar = QProgressBar()
                 bar.setValue(0)
-
                 self.inner_layout.addWidget(label)
                 self.inner_layout.addWidget(bar)
-
                 self.labels.append(label)
                 self.progress_bars.append(bar)
 
                 signals = DownloadSignals()
                 signals.progress.connect(self.update_progress)
-                signals.finished.connect(self.mark_finished)
+                signals.finished.connect(lambda idx=index: self.mark_finished(idx))
 
                 thread = FileDownloader(link, relative_path, index, signals)
-                thread.start()
-        
+                QThreadPool.globalInstance().start(thread)
+
         self.total_downloads = len(self.progress_bars)
         self.show()
+
+    def open_settings_dialog(self):
+        dialog = SettingsDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.apply_settings()
 
     def update_torrent_progress(self):
         if not self.torrent_hashes:
@@ -281,17 +287,19 @@ class DownloadWindow(QWidget):
             client.auth_log_in()
             torrents = client.torrents_info()
             for t in torrents:
-                if t.hash in self.torrent_hashes:
+                if t.hash in self.torrent_hashes and t.state not in ("checkingUP", "checkingDL", "queuedDL"):
                     index, name = self.torrent_hashes[t.hash]
                     percent = int(t.progress * 100)
                     self.progress_bars[index].setValue(percent)
                     if percent >= 100:
                         self.mark_finished(index)
-                        del self.torrent_hashes[t.hash]
+                        self.torrent_hashes.pop(t.hash, None)
         except Exception as e:
             print(f"Error al actualizar progreso de torrent: {e}")
 
     def update_progress(self, index, percent):
+        if index >= len(self.progress_bars):
+            return
         self.progress_bars[index].setValue(percent)
 
     def mark_finished(self, index):

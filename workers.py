@@ -1,7 +1,7 @@
-import os, requests, time, threading
+import os, requests, time
 from PyQt5.QtCore import QObject, pyqtSignal, QRunnable, QThreadPool
-from PyQt5.QtGui import QPixmap, QImage  # <-- Agregado
-from bs4 import BeautifulSoup           # <-- Agregado
+from PyQt5.QtGui import QPixmap, QImage
+from bs4 import BeautifulSoup
 from settings_dialog import load_config,DEFAULT_CONFIG
 
 MAX_RETRIES = 100
@@ -20,51 +20,51 @@ class FileDownloader(QRunnable):
         self.index = index
         self.signals = signals
 
-        self.max_parallel = load_config().get("max_parallel_downloads", DEFAULT_CONFIG["max_parallel_downloads"])
-        self.download_semaphore = threading.Semaphore(self.max_parallel)
+        QThreadPool.globalInstance().setMaxThreadCount(
+        load_config().get("max_parallel_downloads", DEFAULT_CONFIG["max_parallel_downloads"])
+)
 
     def run(self):
-        with self.download_semaphore:
-            for attempt in range(1, MAX_RETRIES + 1):
-                try:
-                    downloaded = 0
-                    mode = 'wb'
-                    headers = {}
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                downloaded = 0
+                mode = 'wb'
+                headers = {}
 
-                    if os.path.exists(self.filename):
-                        downloaded = os.path.getsize(self.filename)
-                        headers['Range'] = f'bytes={downloaded}-'
-                        mode = 'ab'
+                if os.path.exists(self.filename):
+                    downloaded = os.path.getsize(self.filename)
+                    headers['Range'] = f'bytes={downloaded}-'
+                    mode = 'ab'
 
-                    with requests.get(self.url, stream=True, headers=headers, timeout=15) as r:
-                        total_length = r.headers.get('content-length')
-                        if total_length is None:
-                            total_length = 0
-                        else:
-                            total_length = int(total_length) + downloaded
-
-                        dir_path = os.path.dirname(self.filename)
-                        if dir_path:
-                            os.makedirs(dir_path, exist_ok=True)
-
-                        with open(self.filename, mode) as f:
-                            for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
-                                if chunk:
-                                    f.write(chunk)
-                                    downloaded += len(chunk)
-                                    if total_length:
-                                        percent = int((downloaded / total_length) * 100)
-                                        self.signals.progress.emit(self.index, percent)
-
-                    self.signals.finished.emit(self.index)
-                    return
-
-                except Exception as e:
-                    print(f"[{self.index}] ❌ Error en intento {attempt}: {e}")
-                    if attempt < MAX_RETRIES:
-                        time.sleep(RETRY_DELAY * attempt)
+                with requests.get(self.url, stream=True, headers=headers, timeout=15) as r:
+                    total_length = r.headers.get('content-length')
+                    if total_length is None:
+                        total_length = 0
                     else:
-                        self.signals.finished.emit(self.index)
+                        total_length = int(total_length) + downloaded
+
+                    dir_path = os.path.dirname(self.filename)
+                    if dir_path:
+                        os.makedirs(dir_path, exist_ok=True)
+
+                    with open(self.filename, mode) as f:
+                        for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                if total_length:
+                                    percent = int((downloaded / total_length) * 100)
+                                    self.signals.progress.emit(self.index, percent)
+
+                self.signals.finished.emit(self.index)
+                return
+
+            except Exception as e:
+                print(f"[{self.index}] ❌ Error en intento {attempt}: {e}")
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY * attempt)
+                else:
+                    self.signals.finished.emit(self.index)
 
 class ImageLoadedSignal(QObject):
     finished = pyqtSignal(QPixmap)
