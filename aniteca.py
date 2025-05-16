@@ -1,4 +1,5 @@
 import requests
+from functools import partial
 
 headers = {
         "Content-Type": "application/json",
@@ -18,15 +19,20 @@ def search_aniteca(query):
             episodios = get_chapter_links(anime["id"], anime["numepisodios"])
             for ep in episodios:
                 try:
-                    link_directo = extract_direct_link(ep['servername'], ep['online_id'])
-                    if link_directo:
-                        results.append({
-                            "title": anime['nombre'],
-                            "chapter": ep['capitulo'],
-                            "chapters": anime["numepisodios"],
-                            "url_type": ep['servername'],
-                            "url": link_directo
-                        })
+                    deferred_link = partial(extract_direct_link, ep['servername'], ep['online_id'])
+                    results.append({
+                        "title": anime['nombre'],
+                        "chapter": ep['capitulo'],
+                        "chapters": anime["numepisodios"],
+                        "url_type": ep['servername'],
+                        "url": deferred_link,
+                        "resolucion": ep["resolucion"],
+                        "idioma": ep["idioma"],
+                        "subtitulo": ep["subtitulo"],
+                        "fansub": ep["fansub"],
+                        "format": ep["format"],
+                        "password": ep["password"]
+                    })
                 except Exception as e:
                     print(f"[LinkError] {e}")
     except Exception as e:
@@ -91,12 +97,20 @@ def get_chapter_links(anime_id, ultimocap):
 
         links = []
         for entry in data["data"]:
+            idioma = entry.get("idiomas", [{}])[0].get("idioma", {}).get("idioma") if entry.get("idiomas") else None
+            subtitulo = entry.get("subtitulos", [{}])[0].get("subs", {}).get("subtitulo") if entry.get("subtitulos") else None
+            fansub = entry.get("fansubs", [{}])[0].get("fansub", {}).get("nombrefansub") if entry.get("fansubs") else None
+
             links.append({
                 "capitulo": entry["numcap"],
                 "servername": entry["servername"],
                 "online_id": entry["online_id"],
                 "password": entry["password"],
-                "format": entry["format"]
+                "format": entry["format"],
+                "resolucion": entry["resol"],
+                "idioma": idioma,
+                "subtitulo": subtitulo,
+                "fansub": fansub
             })
         return links
     except Exception as e:
