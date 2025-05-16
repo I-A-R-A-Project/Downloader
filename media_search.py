@@ -2,19 +2,15 @@ import re, subprocess, sys, requests
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLineEdit, QListWidget,
     QLabel, QListWidgetItem, QTextEdit, QPushButton, QHBoxLayout,
-    QMessageBox, QDialog
+    QMessageBox, QDialog,QTreeWidget,QTreeWidgetItem
 )
 from PyQt5.QtGui import QMovie
-from PyQt5.QtCore import (
-    Qt, QSize, QThreadPool, 
-)
+from PyQt5.QtCore import Qt, QSize, QThreadPool
 from aniteca import search_aniteca
 from bs4 import BeautifulSoup
-from PyQt5.QtWebEngineWidgets import QWebEngineView
-
+from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
 from workers import FullDetailsWorker, ImageLoaderWorker, SearchWorker, SiteSearchWorker
 
-# --- TMDb con imagen ---
 TMDB_API_KEY = 'TU_API_KEY_AQUI'
 def search_tmdb(query):
     url = f'https://api.themoviedb.org/3/search/multi'
@@ -115,28 +111,43 @@ class MultiChoiceDownloader(QWidget):
         self.setGeometry(300, 300, 600, 400)
         self.results_dict = results_dict
         self.selected_links = []
+
         self.layout = QVBoxLayout()
-        self.list_widget = QListWidget()
+        self.tree_widget = QTreeWidget()
+        self.tree_widget.setHeaderHidden(True)
+
         for source, results in results_dict.items():
+            group_item = QTreeWidgetItem([f"{source}"])
+            group_item.setFlags(group_item.flags() & ~Qt.ItemIsSelectable)  # No seleccionable
+            self.tree_widget.addTopLevelItem(group_item)
+
             for result in results:
                 title = result["title"]
-                item = QListWidgetItem(f"[{source}] {result['url_type']} - {title} {result['chapter']}/{result['chapters']}")
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(Qt.Unchecked)
-                item.setData(Qt.UserRole, result["url"])
-                self.list_widget.addItem(item)
-        self.layout.addWidget(self.list_widget)
+                item_text = f"{result['url_type']} - {title} {result['chapter']}/{result['chapters']}"
+                child_item = QTreeWidgetItem([item_text])
+                child_item.setFlags(child_item.flags() | Qt.ItemIsUserCheckable)
+                child_item.setCheckState(0, Qt.Unchecked)
+                child_item.setData(0, Qt.UserRole, result["url"])  # Guardar la URL
+                group_item.addChild(child_item)
+
+        self.tree_widget.expandAll()  # Mostrar todo al inicio (opcional)
+        self.layout.addWidget(self.tree_widget)
+
         self.btn_confirm = QPushButton("Descargar seleccionados")
         self.btn_confirm.clicked.connect(self.confirm_selection)
         self.layout.addWidget(self.btn_confirm)
+
         self.setLayout(self.layout)
 
     def confirm_selection(self):
         self.selected_links = []
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            if item.checkState() == Qt.Checked:
-                self.selected_links.append((item.text(), item.data(Qt.UserRole)))
+        top_level_count = self.tree_widget.topLevelItemCount()
+        for i in range(top_level_count):
+            group_item = self.tree_widget.topLevelItem(i)
+            for j in range(group_item.childCount()):
+                child = group_item.child(j)
+                if child.checkState(0) == Qt.Checked:
+                    self.selected_links.append(child.data(Qt.UserRole))
         if self.selected_links:
             links_str = "\n".join(f"{title}\n{link}" for title, link in self.selected_links)
             QMessageBox.information(self, "Links seleccionados", links_str)
@@ -324,20 +335,8 @@ class MediaSearchUI(QWidget):
     def show_trailer(self):
         yt_url = self.current_item.data(Qt.UserRole)["trailer"]
         embed_url = yt_url.split('?')[0]
-        html = f"""<html><head><style>
-        body {{ margin: 0; background-color: #000; }}
-        iframe {{ width: 100%; height: 100%; border: none; }}
-        </style></head><body>
-        <iframe src="{embed_url}?autoplay=1" allow="autoplay; encrypted-media" allowfullscreen></iframe>        </body>
-        </html>"""
-        self.trailer_window = QDialog(self)
-        self.trailer_window.setWindowTitle("Tráiler")
-        self.trailer_window.resize(640, 360)
-        layout = QVBoxLayout()
-        web_view = QWebEngineView()
-        web_view.setHtml(html)
-        layout.addWidget(web_view)
-        self.trailer_window.setLayout(layout)
+
+        self.trailer_window = TrailerWindow(embed_url, self)
         self.trailer_window.exec_()
 
     def download_item(self):
@@ -359,6 +358,7 @@ class MediaSearchUI(QWidget):
                     results,
                     key=lambda x: (
                         x.get("title", "").lower(),
+                        x.get("url_type", "").lower(),
                         int(x.get("chapter") or 0)
                     )
                 )
@@ -389,7 +389,42 @@ class MediaSearchUI(QWidget):
             worker = SiteSearchWorker(name, func, title)
             worker.signals.result_ready.connect(update_results)
             pool.start(worker)
-           
+
+class SilentPage(QWebEnginePage):
+    def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
+        pass
+class TrailerWindow(QDialog):
+    def __init__(self, embed_url, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Tráiler")
+        self.resize(640, 360)
+
+        html = f"""
+        <html>
+          <head>
+            <style>
+              body {{ margin: 0; background-color: #000; }}
+              iframe {{ width: 100%; height: 100%; border: none; }}
+            </style>
+          </head>
+          <body>
+            <iframe src="{embed_url}?autoplay=1" allow="autoplay; encrypted-media" allowfullscreen></iframe>
+          </body>
+        </html>
+        """
+
+        layout = QVBoxLayout()
+        self.web_view = QWebEngineView()
+        self.web_view.setPage(SilentPage(self.web_view)) 
+        self.web_view.setHtml(html)
+        layout.addWidget(self.web_view)
+        self.setLayout(layout)
+
+    def closeEvent(self, event):
+        # Esto detiene el video cargando una página en blanco
+        self.web_view.setHtml("<html><body></body></html>")
+        super().closeEvent(event)
+
 # --- Ejecutar aplicación ---
 if __name__ == '__main__':
     app = QApplication(sys.argv)
