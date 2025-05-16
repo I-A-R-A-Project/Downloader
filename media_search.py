@@ -8,7 +8,7 @@ from PyQt5.QtGui import QMovie
 from PyQt5.QtCore import Qt, QSize, QThreadPool
 from aniteca import search_aniteca
 from bs4 import BeautifulSoup
-from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
+from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineSettings
 from workers import FullDetailsWorker, ImageLoaderWorker, SearchWorker, SiteSearchWorker
 
 TMDB_API_KEY = 'TU_API_KEY_AQUI'
@@ -34,31 +34,33 @@ def search_tmdb(query):
 def search_nyaa(query):
     results = []
     try:
-        url = f"https://nyaa.si/?f=0&c=0_0&q={query.replace(' ', '+')}&s=seeders&o=desc"
+        url = f"https://nyaa.si/?f=0&c=1_0&q={query.replace(' ', '+')}&s=seeders&o=desc"
         r = requests.get(url, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
         rows = soup.select("tr.default")
+
         for row in rows[:100]:
             title_tag = row.select_one("td:nth-child(2) a[href*='view']")
-            torrent_tag = row.select_one("td.text-center a[href$='.torrent']")
+            magnet_tag = row.select_one("td.text-center a[href^='magnet:?']")
 
-            if title_tag and torrent_tag:
+            if title_tag and magnet_tag:
                 title = title_tag.text.strip()
-                torrent_url = "https://nyaa.si" + torrent_tag["href"]
-
-                # Heurística: buscar número de episodio
-                chapter = None
-                match = re.search(r'\b(?:ep?\.?|episode)?\s*(\d{1,4})\b', title, re.IGNORECASE)
-                if match:
-                    chapter = int(match.group(1))
+                magnet_url = magnet_tag["href"]
 
                 results.append({
                     "title": title,
-                    "chapter": chapter,
+                    "chapter": None,
                     "chapters": None,
-                    "url_type": "torrent",
-                    "url": torrent_url
+                    "url_type": "magnet",
+                    "url": magnet_url,
+                    "resolucion": None,
+                    "idioma": None,
+                    "subtitulo": None,
+                    "fansub": None,
+                    "format": None,
+                    "password": None
                 })
+
     except Exception as e:
         print(f"[Nyaa] Error: {e}")
     return results
@@ -71,35 +73,42 @@ def search_1337x(query):
         r = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
         entries = soup.select("td.coll-1.name")
+
         for entry in entries[:100]:
             link = entry.select_one("a:nth-of-type(2)")
-            if link:
-                title = link.text.strip()
-                detail_url = "https://1337x.to" + link["href"]
+            if not link:
+                continue
 
-                # Scrapear enlace directo .torrent desde la página del torrent
+            title = link.text.strip()
+            detail_url = "https://1337x.to" + link["href"]
+
+            # Ir a la página de detalles y buscar el magnet
+            try:
                 detail_r = requests.get(detail_url, headers=headers, timeout=10)
                 detail_soup = BeautifulSoup(detail_r.text, "html.parser")
-                torrent_tag = detail_soup.select_one("a[href$='.torrent']")
+                magnet_tag = detail_soup.select_one("a[href^='magnet:?']")
 
-                if not torrent_tag:
+                if not magnet_tag:
                     continue
 
-                torrent_url = torrent_tag["href"]
-
-                # Heurística: buscar número de episodio
-                chapter = None
-                match = re.search(r'\b(?:ep?\.?|episode)?\s*(\d{1,4})\b', title, re.IGNORECASE)
-                if match:
-                    chapter = int(match.group(1))
+                magnet_url = magnet_tag["href"]
 
                 results.append({
                     "title": title,
-                    "chapter": chapter,
+                    "chapter": None,
                     "chapters": None,
-                    "url_type": "torrent",
-                    "url": torrent_url
+                    "url_type": "magnet",
+                    "url": magnet_url,
+                    "resolucion": None,
+                    "idioma": None,
+                    "subtitulo": None,
+                    "fansub": None,
+                    "format": None,
+                    "password": None
                 })
+            except Exception as e:
+                print(f"[1337x detail] Error: {e}")
+
     except Exception as e:
         print(f"[1337x] Error: {e}")
     return results
@@ -122,12 +131,15 @@ class MultiChoiceDownloader(QWidget):
             self.tree_widget.addTopLevelItem(group_item)
 
             for result in results:
-                title = result["title"]
-                item_text = f"{result['url_type']} - {title} {result['chapter']}/{result['chapters']}"
+                item_text = f"{result['url_type']} - {result['title']}"
+                chapter = result["chapter"]
+                chapters = result["chapters"]
+                if isinstance(chapter, (int)) and isinstance(chapters, (int)):
+                    item_text += f" {chapter}/{chapters}"
                 child_item = QTreeWidgetItem([item_text])
                 child_item.setFlags(child_item.flags() | Qt.ItemIsUserCheckable)
                 child_item.setCheckState(0, Qt.Unchecked)
-                child_item.setData(0, Qt.UserRole, result["url"])  # Guardar la URL
+                child_item.setData(0, Qt.UserRole, (item_text, result["url"], result["password"]))
                 group_item.addChild(child_item)
 
         self.tree_widget.expandAll()  # Mostrar todo al inicio (opcional)
@@ -142,14 +154,30 @@ class MultiChoiceDownloader(QWidget):
     def confirm_selection(self):
         self.selected_links = []
         top_level_count = self.tree_widget.topLevelItemCount()
+
         for i in range(top_level_count):
             group_item = self.tree_widget.topLevelItem(i)
             for j in range(group_item.childCount()):
                 child = group_item.child(j)
                 if child.checkState(0) == Qt.Checked:
-                    self.selected_links.append(child.data(Qt.UserRole))
+                    title, url, password = child.data(0, Qt.UserRole)
+                    if callable(url):
+                        try:
+                            link = url()  # Ejecutar función para obtener link real
+                        except Exception as e:
+                            print(f"Error ejecutando función diferida para {title}: {e}")
+                            link = None
+                    else:
+                        link = url
+
+                    if link:
+                        self.selected_links.append((title, link))
+
         if self.selected_links:
-            links_str = "\n".join(f"{title}\n{link}" for title, link in self.selected_links)
+            links_str = "\n\n".join(
+                f"{title}\n{link}"
+                for title, link in self.selected_links
+            )
             QMessageBox.information(self, "Links seleccionados", links_str)
         else:
             QMessageBox.warning(self, "Nada seleccionado", "Por favor selecciona al menos un enlace.")
@@ -161,20 +189,20 @@ class MediaSearchUI(QWidget):
         self.setWindowTitle("Buscador de medios")
         self.resize(800, 500)
         layout = QVBoxLayout()
+        self.spinner_movie = QMovie("spinner.gif")
+        self.spinner_movie.setScaledSize(QSize(20, 20)) 
 
         search_layout = QHBoxLayout()
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("Buscar anime, película o serie...")
         self.search_bar.returnPressed.connect(self.perform_search)
         search_layout.addWidget(self.search_bar)
-        self.spinner = QLabel()
-        self.spinner_movie = QMovie("spinner.gif")
-        self.spinner_movie.setScaledSize(QSize(20, 20)) 
-        self.spinner.setMovie(self.spinner_movie)
-        self.spinner.setFixedSize(24, 24)
-        self.spinner.setAlignment(Qt.AlignCenter)
-        self.spinner.setVisible(False)
-        search_layout.addWidget(self.spinner)
+        self.spinner_search_bar = QLabel()
+        self.spinner_search_bar.setMovie(self.spinner_movie)
+        self.spinner_search_bar.setFixedSize(24, 24)
+        self.spinner_search_bar.setAlignment(Qt.AlignCenter)
+        self.spinner_search_bar.setVisible(False)
+        search_layout.addWidget(self.spinner_search_bar)
         layout.addLayout(search_layout)
 
         self.results_list = QListWidget()
@@ -199,8 +227,14 @@ class MediaSearchUI(QWidget):
         self.download_button = QPushButton("Descargar")
         self.download_button.clicked.connect(self.download_item)
         self.download_button.setEnabled(False)
+        self.spinner_details = QLabel()
+        self.spinner_details.setMovie(self.spinner_movie)
+        self.spinner_details.setFixedSize(24, 24)
+        self.spinner_details.setAlignment(Qt.AlignCenter)
+        self.spinner_details.setVisible(False)
         buttons.addWidget(self.trailer_button)
         buttons.addWidget(self.download_button)
+        buttons.addWidget(self.spinner_details)
 
         details_center = QVBoxLayout()
         # Descripción
@@ -238,7 +272,7 @@ class MediaSearchUI(QWidget):
         if not term:
             return
 
-        self.spinner.show()
+        self.spinner_search_bar.show()
         self.spinner_movie.start()
         self.search_bar.setDisabled(True)
         self.search_bar.setPlaceholderText("Buscando...")
@@ -251,7 +285,7 @@ class MediaSearchUI(QWidget):
         self.search_bar.setDisabled(False)
         self.search_bar.setPlaceholderText("Buscar anime, película o serie...")
         self.spinner_movie.stop()
-        self.spinner.setVisible(False)
+        self.spinner_search_bar.setVisible(False)
 
         self.results_list.clear()
 
@@ -284,6 +318,7 @@ class MediaSearchUI(QWidget):
             "Rx": "<br>Rx<br>Hentai"
         }
 
+        self.trailer_button.setEnabled(False)
         data = item.data(Qt.UserRole)
         self.current_item = item
 
@@ -337,7 +372,7 @@ class MediaSearchUI(QWidget):
         embed_url = yt_url.split('?')[0]
 
         self.trailer_window = TrailerWindow(embed_url, self)
-        self.trailer_window.exec_()
+        self.trailer_window.show()
 
     def download_item(self):
         if not self.current_item:
@@ -345,6 +380,8 @@ class MediaSearchUI(QWidget):
 
         title = self.current_item.data(Qt.UserRole)['title']
         print(f"📥 Buscar para descarga: {title}")
+        self.spinner_details.show()
+        self.spinner_movie.start()
         self.download_button.setText("Buscando...")
         self.download_button.setEnabled(False)
 
@@ -369,6 +406,8 @@ class MediaSearchUI(QWidget):
             self.pending_sites.discard(site_name)
 
             if not self.pending_sites:
+                self.spinner_movie.stop()
+                self.spinner_details.setVisible(False)
                 if self.results_dict:
                     self.selector_window = MultiChoiceDownloader(self.results_dict)
                     self.selector_window.show()
