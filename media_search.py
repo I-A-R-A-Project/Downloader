@@ -132,10 +132,16 @@ class MultiChoiceDownloader(QWidget):
 
             for result in results:
                 item_text = f"{result['url_type']} - {result['title']}"
+                fansub = result["fansub"]
+                if isinstance(fansub, (str)):
+                    item_text += f" [{fansub}]"
                 chapter = result["chapter"]
                 chapters = result["chapters"]
                 if isinstance(chapter, (int)) and isinstance(chapters, (int)):
                     item_text += f" {chapter}/{chapters}"
+                resol = result["resolucion"]
+                if isinstance(resol, (int)):
+                    item_text += f" {resol}p"
                 child_item = QTreeWidgetItem([item_text])
                 child_item.setFlags(child_item.flags() | Qt.ItemIsUserCheckable)
                 child_item.setCheckState(0, Qt.Unchecked)
