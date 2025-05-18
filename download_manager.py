@@ -208,6 +208,7 @@ class DownloadWindow(QWidget):
     def start_downloads(self, direct_links):
         self.completed_downloads = 0
         for index, (relative_path, link) in enumerate(direct_links):
+            full_path = os.path.join(self.folder_path, relative_path)
             if not link:
                 continue
 
@@ -233,7 +234,7 @@ class DownloadWindow(QWidget):
 
             else:
                 # Descarga directa normal
-                dir_path = os.path.dirname(relative_path)
+                dir_path = os.path.dirname(full_path)
                 if dir_path:
                     os.makedirs(dir_path, exist_ok=True)
 
@@ -249,7 +250,7 @@ class DownloadWindow(QWidget):
                 signals.progress.connect(self.update_progress)
                 signals.finished.connect(lambda idx=index: self.mark_finished(idx))
 
-                thread = FileDownloader(link, relative_path, index, signals)
+                thread = FileDownloader(link, full_path, index, signals)
                 QThreadPool.globalInstance().start(thread)
 
         self.total_downloads = len(self.progress_bars)
@@ -258,7 +259,9 @@ class DownloadWindow(QWidget):
     def open_settings_dialog(self):
         dialog = SettingsDialog(self)
         if dialog.exec_() == QDialog.Accepted:
-            self.apply_settings()
+            self.folder_path,
+            self.open_on_finish,
+            self.max_parallel_downloads = apply_settings()
 
     def update_torrent_progress(self):
         try:
@@ -311,7 +314,6 @@ class LinkInputWindow(QWidget):
         super().__init__()
         self.setWindowTitle("Pegar enlaces de paginas de descarga")
         self.setMinimumSize(400, 200)
-        self.config = load_config()
 
         layout = QVBoxLayout()
         self.instructions = QLabel("Pega uno o más enlaces (uno por línea):")
@@ -335,7 +337,7 @@ class LinkInputWindow(QWidget):
     def open_settings_dialog(self):
         dialog = SettingsDialog(self)
         if dialog.exec_() == QDialog.Accepted:
-            self.apply_settings()
+            apply_settings()
     
     def proceed(self):
         text = self.textbox.toPlainText().strip()
@@ -343,12 +345,13 @@ class LinkInputWindow(QWidget):
             self.links = [line.strip() for line in text.splitlines() if line.strip()]
             self.close()
 
-def apply_settings(self):
-    self.config = load_config()
-    self.folder_path = self.config.get("folder_path")
-    self.open_on_finish = self.config.get("open_on_finish")
-    self.max_parallel_downloads = self.config.get("max_parallel_downloads")
-    print(f"✅ Configuración actualizada: {self.config}")
+def apply_settings():
+    config = load_config()
+    folder_path = config.get("folder_path")
+    open_on_finish = config.get("open_on_finish")
+    max_parallel_downloads = config.get("max_parallel_downloads")
+    print(f"✅ Configuración actualizada: {config}")
+    return folder_path, open_on_finish, max_parallel_downloads
 
 if __name__ == '__main__':
     os.system("title Descargas")
