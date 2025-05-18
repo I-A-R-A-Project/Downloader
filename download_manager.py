@@ -6,7 +6,7 @@ from PyQt5.QtCore import QUrl, QTimer, pyqtSignal, QThreadPool
 from bs4 import BeautifulSoup
 from workers import DownloadSignals, FileDownloader
 from settings_dialog import SettingsDialog, load_config, DEFAULT_CONFIG
-from torrent import add_magnet_link, add_torrent_file, get_client
+from torrent import TorrentUpdater, add_magnet_link, add_torrent_file
 
 #Mucho ruido en consola, shhhh
 class SilentPage(QWebEnginePage):
@@ -196,7 +196,7 @@ class DownloadWindow(QWidget):
 
         self.torrent_hashes = {}
         self.torrent_timer = QTimer()
-        self.torrent_timer.timeout.connect(self.update_torrent_progress)
+        self.torrent_timer.timeout.connect(self.start_torrent_update)
         self.torrent_timer.start(3000)  # cada 3 segundos
 
         self.progress_bars = []
@@ -263,35 +263,36 @@ class DownloadWindow(QWidget):
             self.open_on_finish,
             self.max_parallel_downloads = apply_settings()
 
-    def update_torrent_progress(self):
-        try:
-            client = get_client()
-            client.auth_log_in()
-            torrents = client.torrents_info()
-            for t in torrents:
-                if t.state in ("pausedDL", "pausedUP", "checkingUP", "checkingDL", "queuedDL"):
-                    continue  # Ignorar torrents pausados o en verificación
-                # Si el torrent ya está en la UI, solo actualizamos su progreso
-                if t.hash in self.torrent_hashes:
-                    index, _ = self.torrent_hashes[t.hash]
-                    percent = int(t.progress * 100)
-                    self.progress_bars[index].setValue(percent)
-                    if percent >= 100:
-                        self.mark_finished(index)
-                        self.torrent_hashes.pop(t.hash, None)
-                # Si es nuevo, lo agregamos a la UI
-                else:
-                    label = QLabel(f"Descargando torrent: {t.name}")
-                    bar = QProgressBar()
-                    bar.setValue(int(t.progress * 100))
-                    self.inner_layout.addWidget(label)
-                    self.inner_layout.addWidget(bar)
-                    index = len(self.labels)
-                    self.labels.append(label)
-                    self.progress_bars.append(bar)
-                    self.torrent_hashes[t.hash] = (index, t.name)
-        except Exception as e:
-            print(f"Error al actualizar progreso de torrents: {e}")
+    def start_torrent_update(self):
+        updater = TorrentUpdater()
+        updater.signals.result.connect(self.on_torrent_data_received)
+        updater.signals.error.connect(self.on_torrent_update_error)
+        QThreadPool.globalInstance().start(updater)
+
+    def on_torrent_update_error(self,message):
+        print(f"Error al actualizar progreso de torrents: {message}")
+
+    def on_torrent_data_received(self, torrents):
+        for t in torrents:
+            if t.state in ("pausedDL", "pausedUP", "checkingUP", "checkingDL", "queuedDL"):
+                continue
+            if t.hash in self.torrent_hashes:
+                index, _ = self.torrent_hashes[t.hash]
+                percent = int(t.progress * 100)
+                self.progress_bars[index].setValue(percent)
+                if percent >= 100:
+                    self.mark_finished(index)
+                    self.torrent_hashes.pop(t.hash, None)
+            else:
+                label = QLabel(f"Descargando torrent: {t.name}")
+                bar = QProgressBar()
+                bar.setValue(int(t.progress * 100))
+                self.inner_layout.addWidget(label)
+                self.inner_layout.addWidget(bar)
+                index = len(self.labels)
+                self.labels.append(label)
+                self.progress_bars.append(bar)
+                self.torrent_hashes[t.hash] = (index, t.name)
 
     def update_progress(self, index, percent):
         if index >= len(self.progress_bars):

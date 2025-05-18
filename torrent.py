@@ -1,6 +1,7 @@
 import os
 from qbittorrentapi import Client
 import time
+from PyQt5.QtCore import QObject, pyqtSignal
 
 def get_client():
     return Client(
@@ -8,6 +9,26 @@ def get_client():
         username='admin',
         password='adminadmin'
     )
+
+from PyQt5.QtCore import QRunnable, pyqtSignal, QObject
+
+class TorrentUpdateSignals(QObject):
+    result = pyqtSignal(list)
+    error = pyqtSignal(str)
+
+class TorrentUpdater(QRunnable):
+    def __init__(self):
+        super().__init__()
+        self.signals = TorrentUpdateSignals()
+
+    def run(self):
+        try:
+            client = get_client()
+            client.auth_log_in()
+            torrents = client.torrents_info()
+            self.signals.result.emit(list(torrents))
+        except Exception as e:
+            self.signals.error.emit(str(e))
 
 def add_torrent_file(file_path, save_path):
     client = get_client()
@@ -22,7 +43,6 @@ def add_torrent_file(file_path, save_path):
                 return t.hash
         time.sleep(1)
     return None
-
 
 def add_magnet_link(magnet_url, save_path):
     client = get_client()

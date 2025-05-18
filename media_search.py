@@ -5,11 +5,11 @@ from PyQt5.QtWidgets import (
     QMessageBox, QDialog,QTreeWidget,QTreeWidgetItem
 )
 from PyQt5.QtGui import QMovie
-from PyQt5.QtCore import Qt, QSize, QThreadPool
+from PyQt5.QtCore import Qt, QSize, QThreadPool, pyqtSignal
 from aniteca import search_aniteca
 from bs4 import BeautifulSoup
-from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineSettings
-from workers import FullDetailsWorker, ImageLoaderWorker, SearchWorker, SiteSearchWorker
+from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
+from workers import FullDetailsWorker, ImageLoaderWorker, SearchWorker, SiteSearchWorker, URLWorker
 
 TMDB_API_KEY = 'TU_API_KEY_AQUI'
 def search_tmdb(query):
@@ -114,12 +114,14 @@ def search_1337x(query):
     return results
 
 class MultiChoiceDownloader(QWidget):
+    selection_ready = pyqtSignal(list)  
     def __init__(self, results_dict):
         super().__init__()
         self.setWindowTitle("Selecciona los enlaces para descargar")
         self.setGeometry(300, 300, 600, 400)
         self.results_dict = results_dict
         self.selected_links = []
+        self.thread_pool = QThreadPool()
 
         self.layout = QVBoxLayout()
         self.tree_widget = QTreeWidget()
@@ -142,6 +144,9 @@ class MultiChoiceDownloader(QWidget):
                 resol = result["resolucion"]
                 if isinstance(resol, (int)):
                     item_text += f" {resol}p"
+                password = result["password"]
+                if isinstance(password, (int)):
+                    item_text += f" - PASSWORD: {password}"
                 child_item = QTreeWidgetItem([item_text])
                 child_item.setFlags(child_item.flags() | Qt.ItemIsUserCheckable)
                 child_item.setCheckState(0, Qt.Unchecked)
@@ -159,7 +164,11 @@ class MultiChoiceDownloader(QWidget):
 
     def confirm_selection(self):
         self.selected_links = []
+        self.pending = 0
+        self.results_temp = []
+
         top_level_count = self.tree_widget.topLevelItemCount()
+        index = 0
 
         for i in range(top_level_count):
             group_item = self.tree_widget.topLevelItem(i)
@@ -167,26 +176,41 @@ class MultiChoiceDownloader(QWidget):
                 child = group_item.child(j)
                 if child.checkState(0) == Qt.Checked:
                     title, url, password = child.data(0, Qt.UserRole)
-                    if callable(url):
-                        try:
-                            link = url()  # Ejecutar función para obtener link real
-                        except Exception as e:
-                            print(f"Error ejecutando función diferida para {title}: {e}")
-                            link = None
-                    else:
-                        link = url
+                    self.results_temp.append((index, title, None))  # Guardar posición y título
+                    worker = URLWorker(index, title, url)
+                    worker.signals.finished.connect(self.on_link_ready)
+                    self.thread_pool.start(worker)
+                    self.pending += 1
+                    index += 1
 
-                    if link:
-                        self.selected_links.append((title, link))
+        if self.pending == 0:
+            QMessageBox.warning(self, "Nada seleccionado", "Por favor selecciona al menos un enlace.")
 
+    def on_link_ready(self, index, title, link):
+        if link:
+            self.results_temp[index] = (index, title, link)
+        else:
+            self.results_temp[index] = None  # O descartar
+
+        self.pending -= 1
+        if self.pending == 0:
+            self.show_results()
+
+    def show_results(self):
+        self.selected_links = [
+            (title, link) for _, title, link in sorted(filter(None, self.results_temp))
+        ]
         if self.selected_links:
             links_str = "\n\n".join(
                 f"{title}\n{link}"
                 for title, link in self.selected_links
             )
             QMessageBox.information(self, "Links seleccionados", links_str)
+
+            self.selection_ready.emit([url for _, url in self.selected_links])
+
         else:
-            QMessageBox.warning(self, "Nada seleccionado", "Por favor selecciona al menos un enlace.")
+            QMessageBox.warning(self, "Error", "No se pudieron obtener los enlaces.")
 
 # --- UI principal ---
 class MediaSearchUI(QWidget):
@@ -400,8 +424,10 @@ class MediaSearchUI(QWidget):
                 sorted_results = sorted(
                     results,
                     key=lambda x: (
-                        x.get("title", "").lower(),
-                        x.get("url_type", "").lower(),
+                        x.get("title").lower(),
+                        x.get("url_type").lower(),
+                        (x.get("fansub") or "").lower(),
+                        int(x.get("resolucion") or 0),
                         int(x.get("chapter") or 0)
                     )
                 )
@@ -418,12 +444,14 @@ class MediaSearchUI(QWidget):
                     self.selector_window = MultiChoiceDownloader(self.results_dict)
                     self.selector_window.show()
 
-                    def handle_selection():
-                        aux = self.selector_window.selected_links
-                        links = [url for _, url in aux]
+                    self.selector_window = MultiChoiceDownloader(self.results_dict)
+                    self.selector_window.show()
+
+                    def handle_selection(links):
                         subprocess.Popen(["python", "download_manager.py"] + links)
 
-                    self.selector_window.btn_confirm.clicked.connect(handle_selection)
+                    self.selector_window.selection_ready.connect(handle_selection)
+
                 else:
                     QMessageBox.information(self, "Sin resultados", f"No se encontraron descargas para: {title}")
                 self.download_button.setText("Descargar")

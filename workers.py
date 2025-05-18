@@ -1,5 +1,5 @@
 import os, requests, time
-from PyQt5.QtCore import QObject, pyqtSignal, QRunnable, QThreadPool
+from PyQt5.QtCore import QObject, pyqtSignal, QRunnable, QThreadPool, pyqtSlot
 from PyQt5.QtGui import QPixmap, QImage
 from bs4 import BeautifulSoup
 from settings_dialog import load_config,DEFAULT_CONFIG
@@ -21,8 +21,8 @@ class FileDownloader(QRunnable):
         self.signals = signals
 
         QThreadPool.globalInstance().setMaxThreadCount(
-        load_config().get("max_parallel_downloads", DEFAULT_CONFIG["max_parallel_downloads"])
-)
+            load_config().get("max_parallel_downloads", DEFAULT_CONFIG["max_parallel_downloads"])
+        )
 
     def run(self):
         for attempt in range(1, MAX_RETRIES + 1):
@@ -65,6 +65,26 @@ class FileDownloader(QRunnable):
                     time.sleep(RETRY_DELAY * attempt)
                 else:
                     self.signals.finished.emit(self.index)
+
+class URLWorkerSignals(QObject):
+    finished = pyqtSignal(int, str, str)  # index, title, link
+
+class URLWorker(QRunnable):
+    def __init__(self, index, title, url):
+        super().__init__()
+        self.index = index
+        self.title = title
+        self.url = url
+        self.signals = URLWorkerSignals()
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            link = self.url() if callable(self.url) else self.url
+        except Exception as e:
+            print(f"Error ejecutando función diferida para {self.title}: {e}")
+            link = None
+        self.signals.finished.emit(self.index, self.title, link)
 
 class ImageLoadedSignal(QObject):
     finished = pyqtSignal(QPixmap)
