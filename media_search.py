@@ -4,8 +4,8 @@ from PyQt5.QtWidgets import (
     QLabel, QListWidgetItem, QTextEdit, QPushButton, QHBoxLayout,
     QMessageBox, QDialog,QTreeWidget,QTreeWidgetItem
 )
-from PyQt5.QtGui import QMovie
-from PyQt5.QtCore import Qt, QSize, QThreadPool, pyqtSignal
+from PyQt5.QtGui import QMovie, QKeyEvent
+from PyQt5.QtCore import Qt, QTimer, QSize, QThreadPool, pyqtSignal
 from aniteca import search_aniteca
 from bs4 import BeautifulSoup
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
@@ -492,6 +492,14 @@ class TrailerWindow(QDialog):
         self.web_view.setHtml(html)
         layout.addWidget(self.web_view)
         self.setLayout(layout)
+        #autoplay
+        QTimer.singleShot(2000, self.simulate_k_keypress)
+
+    def simulate_k_keypress(self):
+        event = QKeyEvent(QKeyEvent.KeyPress, Qt.Key_K, Qt.NoModifier, 'k')
+        QApplication.postEvent(self.web_view.focusProxy(), event)
+        event_release = QKeyEvent(QKeyEvent.KeyRelease, Qt.Key_K, Qt.NoModifier, 'k')
+        QApplication.postEvent(self.web_view.focusProxy(), event_release)
 
     def closeEvent(self, event):
         # Esto detiene el video cargando una página en blanco
