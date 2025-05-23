@@ -1,5 +1,4 @@
-import re, os, sys, uuid
-from urllib.parse import unquote
+import time, re, os, sys, uuid, functools
 from PyQt5.QtWidgets import QApplication, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QProgressBar, QScrollArea, QPushButton, QDialog, QTextEdit
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
 from PyQt5.QtCore import QUrl, QTimer, pyqtSignal, QThreadPool
@@ -7,6 +6,13 @@ from bs4 import BeautifulSoup
 from workers import DownloadSignals, FileDownloader
 from settings_dialog import SettingsDialog, load_config, DEFAULT_CONFIG
 from torrent import TorrentUpdater, add_magnet_link, add_torrent_file
+
+from enum import Enum
+
+class DownloadType(Enum):
+    NORMAL = 0
+    TORRENT = 1
+    TEMPORAL = 2
 
 #Mucho ruido en consola, shhhh
 class SilentPage(QWebEnginePage):
@@ -197,16 +203,19 @@ class DownloadWindow(QWidget):
         self.torrent_hashes = {}
         self.torrent_timer = QTimer()
         self.torrent_timer.timeout.connect(self.start_torrent_update)
-        self.torrent_timer.start(3000)  # cada 3 segundos
+        self.torrent_timer.start(3000)
 
         self.progress_bars = []
         self.labels = []
+        self.temp_progress_bars = []
+        self.temp_labels = []
+        self.torrent_progress_bars = []
+        self.torrent_labels = []
         self.downloader = UniversalDownloader(urls)
         self.downloader.direct_links_ready.connect(self.start_downloads)
         self.downloader.start()
 
     def start_downloads(self, direct_links):
-        self.completed_downloads = 0
         for index, (relative_path, link) in enumerate(direct_links):
             full_path = os.path.join(self.folder_path, relative_path)
             if not link:
@@ -214,22 +223,34 @@ class DownloadWindow(QWidget):
 
             if link.startswith("magnet:?"):
                 torrent_hash = add_magnet_link(link, self.folder_path)
-                print("Magnet agregado "+torrent_hash)
+                if torrent_hash:
+                    print("Magnet agregado "+torrent_hash)
 
             elif link.endswith(".torrent"):
-                label = QLabel(f"Descargando archivo .torrent: {os.path.basename(relative_path)}")
+                def make_on_finished(idx, path):
+                    def check_file(attempt=1):
+                        if os.path.exists(path):
+                            add_torrent_file(path, self.folder_path)
+                            self.mark_finished(idx, DownloadType.TEMPORAL)
+                        elif attempt < 10:
+                            QTimer.singleShot(200, lambda: check_file(attempt + 1))
+                        else:
+                            print(f"❌ Archivo .torrent no encontrado: {path}")
+                    return lambda: check_file()
+                
+                label = QLabel(f"Descargando .torrent: {relative_path}")
                 bar = QProgressBar()
                 bar.setValue(0)
                 self.inner_layout.addWidget(label)
                 self.inner_layout.addWidget(bar)
-                self.labels.append(label)
-                self.progress_bars.append(bar)
+                self.temp_labels.append(label)
+                self.temp_progress_bars.append(bar)
 
                 signals = DownloadSignals()
                 signals.progress.connect(self.update_progress)
-                signals.finished.connect(lambda: add_torrent_file(os.path.abspath(relative_path), self.folder_path))
+                signals.finished.connect(make_on_finished(index, full_path))
 
-                thread = FileDownloader(link, relative_path, index, signals)
+                thread = FileDownloader(link, full_path, index, signals)
                 QThreadPool.globalInstance().start(thread)
 
             else:
@@ -252,8 +273,7 @@ class DownloadWindow(QWidget):
 
                 thread = FileDownloader(link, full_path, index, signals)
                 QThreadPool.globalInstance().start(thread)
-
-        self.total_downloads = len(self.progress_bars)
+        
         self.show()
 
     def open_settings_dialog(self):
@@ -270,7 +290,14 @@ class DownloadWindow(QWidget):
         QThreadPool.globalInstance().start(updater)
 
     def on_torrent_update_error(self,message):
-        print(f"Error al actualizar progreso de torrents: {message}")
+        if message!="""<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">
+            <html><head>
+            <title>404 Not Found</title>
+            </head><body>
+            <h1>Not Found</h1>
+            <p>The requested URL was not found on this server.</p>
+            </body></html>""":
+            print(f"Error al actualizar progreso de torrents: {message}")
 
     def on_torrent_data_received(self, torrents):
         for t in torrents:
@@ -279,7 +306,7 @@ class DownloadWindow(QWidget):
             if t.hash in self.torrent_hashes:
                 index, _ = self.torrent_hashes[t.hash]
                 percent = int(t.progress * 100)
-                self.progress_bars[index].setValue(percent)
+                self.torrent_progress_bars[index].setValue(percent)
                 if percent >= 100:
                     self.mark_finished(index)
                     self.torrent_hashes.pop(t.hash, None)
@@ -289,9 +316,9 @@ class DownloadWindow(QWidget):
                 bar.setValue(int(t.progress * 100))
                 self.inner_layout.addWidget(label)
                 self.inner_layout.addWidget(bar)
-                index = len(self.labels)
-                self.labels.append(label)
-                self.progress_bars.append(bar)
+                index = len(self.torrent_labels)
+                self.torrent_labels.append(label)
+                self.torrent_progress_bars.append(bar)
                 self.torrent_hashes[t.hash] = (index, t.name)
 
     def update_progress(self, index, percent):
@@ -299,16 +326,26 @@ class DownloadWindow(QWidget):
             return
         self.progress_bars[index].setValue(percent)
 
-    def mark_finished(self, index):
-        done=f"✅ Completado: {self.labels[index].text()[12:]}"
-        print(done)
-        self.labels[index].setText(done)
-        self.inner_layout.removeWidget(self.progress_bars[index])
-        self.progress_bars[index].deleteLater()
-        self.completed_downloads += 1
-        if self.completed_downloads == self.total_downloads:
-            QTimer.singleShot(10000, self.close)            
+    def mark_finished(self, index, download_type=DownloadType.NORMAL):
+        if download_type == DownloadType.TORRENT:
+            lb = self.torrent_labels[index]
+            pb = self.torrent_progress_bars[index]
+        elif download_type == DownloadType.TEMPORAL:
+            lb = self.temp_labels[index]
+            pb = self.temp_progress_bars[index]
+        else:  # NORMAL
+            lb = self.labels[index]
+            pb = self.progress_bars[index]
 
+        done = f"✅ Completado: {lb.text()[12:]}"
+        print(done)
+        lb.setText(done)
+        self.inner_layout.removeWidget(pb)
+        pb.deleteLater()
+        if download_type == DownloadType.TEMPORAL:
+            self.inner_layout.removeWidget(lb)
+            lb.deleteLater()
+         
 #Optional - Ventana para ingresar links
 class LinkInputWindow(QWidget):
     def __init__(self):
