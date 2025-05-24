@@ -37,10 +37,14 @@ def search_nyaa(query):
         url = f"https://nyaa.si/?f=0&c=1_0&q={query.replace(' ', '+')}&s=seeders&o=desc"
         r = requests.get(url, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
-        rows = soup.select("tr.default")
-
-        for row in rows[:100]:
-            title_tag = row.select_one("td:nth-child(2) a[href*='view']")
+        rows = soup.select("tr.success")+soup.select("tr.default")
+        for row in rows:
+            title_tag = None
+            for a in row.select("td:nth-child(2) a"):
+                if a.has_attr('href') and '/view/' in a['href'] and not '#comments' in a['href']:
+                    if not a.find('i'):
+                        title_tag = a
+                        break
             magnet_tag = row.select_one("td.text-center a[href^='magnet:?']")
 
             if title_tag and magnet_tag:
@@ -51,7 +55,7 @@ def search_nyaa(query):
                     "title": title,
                     "chapter": None,
                     "chapters": None,
-                    "url_type": "magnet",
+                    "url_type": "torrent",
                     "url": magnet_url,
                     "resolucion": None,
                     "idioma": None,
@@ -97,7 +101,7 @@ def search_1337x(query):
                     "title": title,
                     "chapter": None,
                     "chapters": None,
-                    "url_type": "magnet",
+                    "url_type": "torrent",
                     "url": magnet_url,
                     "resolucion": None,
                     "idioma": None,
@@ -126,71 +130,109 @@ class MultiChoiceDownloader(QWidget):
         self.layout = QVBoxLayout()
         self.tree_widget = QTreeWidget()
         self.tree_widget.setHeaderHidden(True)
+        self.tree_widget.itemChanged.connect(self.handle_item_changed)
 
         for source, results in results_dict.items():
-            group_item = QTreeWidgetItem([f"{source}"])
-            group_item.setFlags(group_item.flags() & ~Qt.ItemIsSelectable)  # No seleccionable
+            group_name=f"{source}"
+            if source=="Nyaa" or source=="1337x":
+                group_name+=f" - torrents"
+            group_item = QTreeWidgetItem([group_name])
+            group_item.setFlags(group_item.flags() & ~Qt.ItemIsSelectable)
             self.tree_widget.addTopLevelItem(group_item)
 
+            aux={}
             for result in results:
-                item_text = f"{result['url_type']} - {result['title']}"
+                item_text = ""
+                subgroup_text = ""
+                subgroup_item = None
+                if result['url_type']=="torrent":
+                    item_text += f"{result['title']}"
+                else:
+                    subgroup_text += f"{result['url_type']} - {result['title']}"
+                item_text += f"{result['title']}"
                 fansub = result["fansub"]
-                if isinstance(fansub, (str)):
-                    item_text += f" [{fansub}]"
+                resol = result["resolucion"]
                 chapter = result["chapter"]
                 chapters = result["chapters"]
                 if isinstance(chapter, (int)) and isinstance(chapters, (int)):
                     item_text += f" {chapter}/{chapters}"
-                resol = result["resolucion"]
+                if isinstance(fansub, (str)):
+                    subgroup_text += f" [{fansub}]"
                 if isinstance(resol, (int)):
-                    item_text += f" {resol}p"
+                    subgroup_text += f" ({resol}p)"
+                    if subgroup_text not in aux:
+                        subgroup_item = QTreeWidgetItem([subgroup_text])
+                        subgroup_item.setFlags(subgroup_item.flags() | Qt.ItemIsUserCheckable)
+                        subgroup_item.setCheckState(0, Qt.Unchecked)
+                        aux[subgroup_text] = subgroup_item
+                        group_item.addChild(aux[subgroup_text])
                 password = result["password"]
                 if isinstance(password, (int)):
                     item_text += f" - PASSWORD: {password}"
                 child_item = QTreeWidgetItem([item_text])
                 child_item.setFlags(child_item.flags() | Qt.ItemIsUserCheckable)
                 child_item.setCheckState(0, Qt.Unchecked)
-                child_item.setData(0, Qt.UserRole, (item_text, result["url"], result["password"]))
-                group_item.addChild(child_item)
+                child_item.setData(0, Qt.UserRole, (item_text, result["url"]))
+                if subgroup_text in aux:
+                    aux[subgroup_text].addChild(child_item)
+                else:
+                    group_item.addChild(child_item)
 
-        self.tree_widget.expandAll()  # Mostrar todo al inicio (opcional)
         self.layout.addWidget(self.tree_widget)
-
         self.btn_confirm = QPushButton("Descargar seleccionados")
         self.btn_confirm.clicked.connect(self.confirm_selection)
         self.layout.addWidget(self.btn_confirm)
-
         self.setLayout(self.layout)
+
+    def handle_item_changed(self, item, column):
+        if item.childCount() > 0:
+            state = item.checkState(0)
+            for i in range(item.childCount()):
+                child = item.child(i)
+                child.setCheckState(0, state)
 
     def confirm_selection(self):
         self.selected_links = []
         self.pending = 0
         self.results_temp = []
-
         top_level_count = self.tree_widget.topLevelItemCount()
         index = 0
-
         for i in range(top_level_count):
             group_item = self.tree_widget.topLevelItem(i)
             for j in range(group_item.childCount()):
                 child = group_item.child(j)
-                if child.checkState(0) == Qt.Checked:
-                    title, url, password = child.data(0, Qt.UserRole)
-                    self.results_temp.append((index, title, None))  # Guardar posición y título
+
+                if child.childCount() > 0:
+                    for k in range(child.childCount()):
+                        grandchild = child.child(k)
+                        if grandchild.checkState(0) == Qt.Checked:
+                            self.pending += self.procesar_item_si_valido(grandchild, index)
+                            index += 1
+                else:
+                    if child.checkState(0) == Qt.Checked:
+                        self.pending += self.procesar_item_si_valido(child, index)
+                        index += 1
+        if self.pending == 0:
+            print(self.results_temp)
+            print(self.selected_links)
+            QMessageBox.warning(self, "Nada seleccionado", "Por favor selecciona al menos un enlace.")
+
+    def procesar_item_si_valido(self, item, index):
+                data = item.data(0, Qt.UserRole)
+                if data is not None:
+                    title, url = data
+                    self.results_temp.append((index, title, None))
                     worker = URLWorker(index, title, url)
                     worker.signals.finished.connect(self.on_link_ready)
                     self.thread_pool.start(worker)
-                    self.pending += 1
-                    index += 1
-
-        if self.pending == 0:
-            QMessageBox.warning(self, "Nada seleccionado", "Por favor selecciona al menos un enlace.")
+                    return 1
+                return 0
 
     def on_link_ready(self, index, title, link):
         if link:
             self.results_temp[index] = (index, title, link)
         else:
-            self.results_temp[index] = None  # O descartar
+            self.results_temp[index] = None
 
         self.pending -= 1
         if self.pending == 0:
