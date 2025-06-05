@@ -87,7 +87,7 @@ class URLWorker(QRunnable):
         self.signals.finished.emit(self.index, self.title, link)
 
 class ImageLoadedSignal(QObject):
-    finished = pyqtSignal(QPixmap)
+    finished = pyqtSignal(str, QPixmap)
 
 class ImageLoaderWorker(QRunnable):
     def __init__(self, image_url):
@@ -101,12 +101,12 @@ class ImageLoaderWorker(QRunnable):
             image = QImage()
             image.loadFromData(img_data)
             pixmap = QPixmap.fromImage(image)
-            self.signals.finished.emit(pixmap)
+            self.signals.finished.emit(self.image_url, pixmap)
         except:
             self.signals.finished.emit(None)
 
 class FullDetailsWorkerSignals(QObject):
-    finished = pyqtSignal(str, str)
+    finished = pyqtSignal(str, str, str)
 
 class FullDetailsWorker(QRunnable):
     def __init__(self, url):
@@ -115,7 +115,7 @@ class FullDetailsWorker(QRunnable):
         self.signals = FullDetailsWorkerSignals()
 
     def run(self):
-        full_description = "Sin descripción."
+        full_description = None
         trailer_url = None
         try:
             resp = requests.get(self.url, headers={"User-Agent": "Mozilla/5.0"})
@@ -131,7 +131,7 @@ class FullDetailsWorker(QRunnable):
         except Exception as e:
             print("[FullDetailsWorker] Error:", e)
 
-        self.signals.finished.emit(full_description, trailer_url)
+        self.signals.finished.emit(self.url, full_description, trailer_url)
 
 class SiteSearchWorkerSignals(QObject):
     result_ready = pyqtSignal(str, list)
@@ -148,8 +148,8 @@ class SiteSearchWorker(QRunnable):
         results = self.search_func(self.query)
         self.signals.result_ready.emit(self.site_name, results)
 
-def search_mal(query):
-    url = f"https://myanimelist.net/anime.php?cat=anime&q={query}&type=0&score=0&status=0&p=0&r=0&sm=0&sd=0&sy=0&em=0&ed=0&ey=0&c[]=a&c[]=b&c[]=c&c[]=g"
+def search_mal(query,cat):
+    url = f"https://myanimelist.net/{cat}.php?cat={cat}&q={query}&type=0&score=0&status=0&sm=0&sd=0&sy=0&em=0&ed=0&ey=0&c[]=a&c[]=b&c[]=c&c[]=g"
     try:
         response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
         response.raise_for_status()
@@ -166,7 +166,7 @@ def search_mal(query):
             title_tag = row.select_one("td:nth-of-type(2) a strong")
             description_tag = row.select_one(".pt4")
             info_cells = row.find_all("td", class_="ac")
-
+            #print(info_cells)
             title = title_tag.text.strip()
             link = title_tag.find_parent("a")["href"]
 
@@ -181,6 +181,7 @@ def search_mal(query):
             rating = info_cells[3].text.strip() if len(info_cells) > 3 else ""
 
             results.append({
+                "loaded": False,
                 "title": title,
                 "url": link,
                 "trailer": None,
@@ -204,12 +205,14 @@ class SearchWorkerSignals(QObject):
     finished = pyqtSignal(list)
 
 class SearchWorker(QRunnable):
-    def __init__(self, term):
+    def __init__(self, term, cat):
         super().__init__()
         self.term = term
+        self.cat = cat
         self.signals = SearchWorkerSignals()
 
     def run(self):
-        results = search_mal(self.term)
+        if self.cat=='anime' or self.cat=='manga':
+            results = search_mal(self.term, self.cat)
         self.signals.finished.emit(results)
 

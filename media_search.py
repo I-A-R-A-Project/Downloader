@@ -1,15 +1,19 @@
 import re, subprocess, sys, requests
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QLineEdit, QListWidget,
-    QLabel, QListWidgetItem, QTextEdit, QPushButton, QHBoxLayout,
-    QMessageBox, QDialog,QTreeWidget,QTreeWidgetItem
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QRadioButton , QButtonGroup, QLineEdit, QListWidget,
+    QLabel, QListWidgetItem, QTextEdit, QPushButton,
+    QMessageBox, QDialog, QTreeWidget, QTreeWidgetItem
 )
 from PyQt5.QtGui import QMovie, QKeyEvent
 from PyQt5.QtCore import Qt, QTimer, QSize, QThreadPool, pyqtSignal
 from aniteca import search_aniteca
 from bs4 import BeautifulSoup
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
-from workers import FullDetailsWorker, ImageLoaderWorker, SearchWorker, SiteSearchWorker, URLWorker
+from workers import (
+    FullDetailsWorker, ImageLoaderWorker,
+    SearchWorker, SiteSearchWorker, URLWorker
+)
 
 TMDB_API_KEY = 'TU_API_KEY_AQUI'
 def search_tmdb(query):
@@ -119,15 +123,17 @@ def search_1337x(query):
 
 class MultiChoiceDownloader(QWidget):
     selection_ready = pyqtSignal(list)  
-    def __init__(self, results_dict):
+    def __init__(self, results_dict,title):
         super().__init__()
-        self.setWindowTitle("Selecciona los enlaces para descargar")
+        self.setWindowTitle(title)
         self.setGeometry(300, 300, 600, 400)
         self.results_dict = results_dict
         self.selected_links = []
         self.thread_pool = QThreadPool()
 
         self.layout = QVBoxLayout()
+        label = QLabel("Selecciona los enlaces para descargar")
+        self.layout.addWidget(label)
         self.tree_widget = QTreeWidget()
         self.tree_widget.setHeaderHidden(True)
         self.tree_widget.itemChanged.connect(self.handle_item_changed)
@@ -264,16 +270,46 @@ class MediaSearchUI(QWidget):
         self.spinner_movie = QMovie("spinner.gif")
         self.spinner_movie.setScaledSize(QSize(20, 20)) 
 
+        types_layout = QHBoxLayout()
+        category_group = QButtonGroup()
+        self.gen_rbutton = QRadioButton("General")
+        self.anime_rbutton = QRadioButton("Anime")
+        self.manga_rbutton = QRadioButton("Manga")
+        self.vn_rbutton = QRadioButton("Visual Novel")
+        self.games_rbutton = QRadioButton("Games")
+        self.radio_map = [
+            (self.gen_rbutton, "general"),
+            (self.anime_rbutton, "anime"),
+            (self.manga_rbutton, "manga"),
+            (self.vn_rbutton, "VN"),
+            (self.games_rbutton, "games"),
+        ]
+        for rbutton, category_value in self.radio_map:
+            category_group.addButton(rbutton)
+            rbutton.setStyleSheet("font-weight: bold;")
+            rbutton.toggled.connect(lambda checked,
+                value=category_value: self.set_category(value) if checked else None
+            )
+            rbutton.setEnabled(False)
+            types_layout.addWidget(rbutton)
+        self.anime_rbutton.toggle()
+        self.category = "anime"
+        layout.addLayout(types_layout)
+
         search_layout = QHBoxLayout()
         self.search_bar = QLineEdit()
-        self.search_bar.setPlaceholderText("Buscar anime, película o serie...")
+        self.search_bar.setPlaceholderText("Buscar...")
         self.search_bar.returnPressed.connect(self.perform_search)
-        search_layout.addWidget(self.search_bar)
+        self.search_button = QPushButton("🔎")
+        self.search_button.setFixedSize(24, 24)
+        self.search_button.clicked.connect(self.perform_search)
         self.spinner_search_bar = QLabel()
         self.spinner_search_bar.setMovie(self.spinner_movie)
         self.spinner_search_bar.setFixedSize(24, 24)
         self.spinner_search_bar.setAlignment(Qt.AlignCenter)
         self.spinner_search_bar.setVisible(False)
+        search_layout.addWidget(self.search_bar)
+        search_layout.addWidget(self.search_button)
         search_layout.addWidget(self.spinner_search_bar)
         layout.addLayout(search_layout)
 
@@ -316,23 +352,30 @@ class MediaSearchUI(QWidget):
         details_inner_layout.addWidget(self.details)
         # Campos adicionales
         details_right = QVBoxLayout()
-        self.info_type = QLabel("Tipo: ")
-        self.info_eps = QLabel("Episodios: ")
-        self.info_score = QLabel("Score: ")
-        self.info_rating = QLabel("Rating: ")
-        for label in [self.info_type, self.info_eps, self.info_score, self.info_rating]:
+        self.labels_info = []
+        for _ in range(4):
+            label = QLabel()
             label.setStyleSheet("font-weight: bold;")
             label.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
             details_right.addWidget(label)
+            self.labels_info.append(label)
         details_inner_layout.addLayout(details_right)
         details_center.addLayout(details_inner_layout)
         details_center.addLayout(buttons)
 
         details_layout.addLayout(details_center)
         layout.addLayout(details_layout)
-
+        self.download_label = QLabel()
+        self.active_downloads = set()
+        self.selector_windows = {}
+        self.total_links_found = {}
+        layout.addWidget(self.download_label)
         self.setLayout(layout)
         self.current_item = None
+
+    def set_category(self, value):
+        self.category = value
+        print("Categoría seleccionada:", self.category)
 
     def perform_search(self):
         term = self.search_bar.text().strip()
@@ -344,12 +387,13 @@ class MediaSearchUI(QWidget):
         if not term:
             return
 
+        self.search_button.setHidden(True)
         self.spinner_search_bar.show()
         self.spinner_movie.start()
         self.search_bar.setDisabled(True)
         self.search_bar.setPlaceholderText("Buscando...")
 
-        worker = SearchWorker(term)
+        worker = SearchWorker(term,self.category)
         worker.signals.finished.connect(self.populate_results)
         QThreadPool.globalInstance().start(worker)
 
@@ -357,7 +401,8 @@ class MediaSearchUI(QWidget):
         self.search_bar.setDisabled(False)
         self.search_bar.setPlaceholderText("Buscar anime, película o serie...")
         self.spinner_movie.stop()
-        self.spinner_search_bar.setVisible(False)
+        self.spinner_search_bar.setHidden(True)
+        self.search_button.show()
 
         self.results_list.clear()
 
@@ -397,15 +442,11 @@ class MediaSearchUI(QWidget):
         desc = data.get("description", "Sin descripción.")
         self.details.setPlainText(desc)
 
-        self.info_type.setText(f"<b>Tipo:<br>{data.get('type', '')}</b>")
-        self.info_eps.setText(f"<b>Episodios:<br>{data.get('episodes', '')}</b>")
-        self.info_score.setText(f"<b>Score:<br>{score_to_color(data.get('score', ''))}</b>")
-
+        self.labels_info[0].setText(f"<b>Tipo:<br>{data.get('type', '')}</b>")
+        self.labels_info[1].setText(f"<b>Episodios:<br>{data.get('episodes', '')}</b>")
+        self.labels_info[2].setText(f"<b>Score:<br>{score_to_color(data.get('score', ''))}</b>")
         rating_text = RATING_TEXT.get(data.get("rating", ""), "<br>No rating")
-        self.info_rating.setText(f"<b>Rating:{rating_text}</b>")
-
-        self.download_button.setEnabled(True)
-
+        self.labels_info[3].setText(f"<b>Rating:{rating_text}</b>")
         self.spinner_movie.start()
         self.image_label.setMovie(self.spinner_movie)
 
@@ -417,27 +458,32 @@ class MediaSearchUI(QWidget):
             self.spinner_movie.stop()
             self.image_label.clear()
 
-        worker = FullDetailsWorker(data["url"])
-        worker.signals.finished.connect(self.update_details)
-        QThreadPool.globalInstance().start(worker)
+        if not data.get("loaded"):
+            worker = FullDetailsWorker(data["url"])
+            worker.signals.finished.connect(self.update_details)
+            QThreadPool.globalInstance().start(worker)
+        self.download_button.setEnabled(True)
+        self.download_button.setText("Descargar")
 
-    def update_details(self, full_description,trailer_url):
-        if self.current_item:
-            data = self.current_item.data(Qt.UserRole)
-            if "...read more" in data["description"]: 
+    def update_details(self, url, full_description,trailer_url):
+        data = self.current_item.data(Qt.UserRole)
+        if url==data["url"]:
+            if full_description and "...read more" in data["description"]: 
                 self.details.setPlainText(full_description)
                 data["description"] = full_description
             data["trailer"] = trailer_url
+            data["loaded"] = True
             self.current_item.setData(Qt.UserRole, data)
-        if trailer_url:
-            self.trailer_button.setEnabled(True)
-        
-    def set_detail_image(self, pixmap):
-        self.spinner_movie.stop()
-        if pixmap:
-            self.image_label.setPixmap(pixmap)
-        else:
-            self.image_label.clear()
+            if trailer_url:
+                self.trailer_button.setEnabled(True)
+
+    def set_detail_image(self, url, pixmap):
+        if url==self.current_item.data(Qt.UserRole)["image"]:
+            self.spinner_movie.stop()
+            if pixmap:
+                self.image_label.setPixmap(pixmap)
+            else:
+                self.image_label.clear()
 
     def show_trailer(self):
         yt_url = self.current_item.data(Qt.UserRole)["trailer"]
@@ -449,17 +495,22 @@ class MediaSearchUI(QWidget):
     def download_item(self):
         if not self.current_item:
             return
-
         title = self.current_item.data(Qt.UserRole)['title']
+        if title in self.active_downloads:
+            print(f"⏳ Ya se está buscando: {title}")
+            return
+        self.active_downloads.add(title)
+
         print(f"📥 Buscar para descarga: {title}")
         self.spinner_details.show()
         self.spinner_movie.start()
-        self.download_button.setText("Buscando...")
         self.download_button.setEnabled(False)
-
+        self.download_button.setText(f"Buscando y cargando enlaces...")
+        
         self.results_dict = {}
         self.pending_sites = {"Aniteca", "Nyaa", "1337x"}
-        self.total_links_found = 0
+        self.total_links_found[title] = 0
+        self.update_download_label()
 
         def update_results(site_name, results):
             if results:
@@ -474,36 +525,48 @@ class MediaSearchUI(QWidget):
                     )
                 )
                 self.results_dict[site_name] = sorted_results
-                self.total_links_found += len(sorted_results)
+                self.total_links_found[title] += len(sorted_results)
 
-            self.download_button.setText(f"Cargando: {self.total_links_found} enlaces")
+            self.download_label.setText(f"Cargando: {self.total_links_found} enlaces encontrados")
             self.pending_sites.discard(site_name)
+            self.update_download_label()
 
             if not self.pending_sites:
+                QTimer.singleShot(5000, lambda: self.remove_download_entry(title)) 
                 self.spinner_movie.stop()
                 self.spinner_details.setVisible(False)
-                if self.results_dict:
-                    self.selector_window = MultiChoiceDownloader(self.results_dict)
-                    self.selector_window.show()
+                self.active_downloads.discard(title)
 
-                    self.selector_window = MultiChoiceDownloader(self.results_dict)
-                    self.selector_window.show()
+                if self.results_dict:
+                    selector_window = MultiChoiceDownloader(self.results_dict, title)
+                    self.selector_windows[title] = selector_window
+                    selector_window.show()
 
                     def handle_selection(links):
                         subprocess.Popen(["python", "download_manager.py"] + links)
+                        selector_window.close()
+                        del self.selector_windows[title]
 
-                    self.selector_window.selection_ready.connect(handle_selection)
-
+                    selector_window.selection_ready.connect(handle_selection)
                 else:
                     QMessageBox.information(self, "Sin resultados", f"No se encontraron descargas para: {title}")
-                self.download_button.setText("Descargar")
 
-        # Encolar cada búsqueda
         pool = QThreadPool.globalInstance()
         for name, func in [("Aniteca", search_aniteca), ("Nyaa", search_nyaa), ("1337x", search_1337x)]:
             worker = SiteSearchWorker(name, func, title)
             worker.signals.result_ready.connect(update_results)
             pool.start(worker)
+
+    def update_download_label(self):
+        summary = []
+        for title, count in self.total_links_found.items():
+            summary.append(f"Cargando: {count} enlaces encontrados - {title}")
+        self.download_label.setText("\n".join(summary))
+
+    def remove_download_entry(self, title):
+        if title in self.total_links_found:
+            del self.total_links_found[title]
+            self.update_download_label()
 
 class SilentPage(QWebEnginePage):
     def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
