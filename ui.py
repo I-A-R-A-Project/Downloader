@@ -1,10 +1,10 @@
 import os
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QScrollArea, QLabel, QProgressBar,
-    QPushButton, QHBoxLayout, QDialog, QTextEdit
+    QLineEdit, QFormLayout, QDialogButtonBox, QFileDialog, 
+    QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
+    QPushButton, QHBoxLayout, QProgressBar, QDialog, QTextEdit
 )
 from PyQt5.QtCore import QTimer, QThreadPool
-
 from browser_handler import UniversalDownloader
 from workers import DownloadSignals, FileDownloader
 from torrent import TorrentUpdater, add_magnet_link, add_torrent_file
@@ -17,9 +17,8 @@ class DownloadType(Enum):
     TORRENT = 1
     TEMPORAL = 2
 
-
 class DownloadWindow(QWidget):
-    def __init__(self, urls):
+    def __init__(self, download_entries):
         super().__init__()
         self.setWindowTitle("Descargador Universal")
         self.setMinimumSize(400, 200)
@@ -51,7 +50,7 @@ class DownloadWindow(QWidget):
         self.temp_labels = []
         self.torrent_progress_bars = []
         self.torrent_labels = []
-        self.downloader = UniversalDownloader(urls)
+        self.downloader = UniversalDownloader(download_entries)
         self.downloader.direct_links_ready.connect(self.start_downloads)
         self.downloader.start()
 
@@ -177,6 +176,66 @@ class DownloadWindow(QWidget):
             self.inner_layout.removeWidget(lb)
             lb.deleteLater()
 
+class DownloadDetailsDialog(QDialog):
+    def __init__(self, urls, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Detalles de descarga")
+        self.resize(600, 400)
+
+        self.config = load_config()
+        self.default_path = self.config.get("folder_path", DEFAULT_CONFIG["folder_path"])
+
+        self.entries = []  # Guarda widgets por fila
+
+        layout = QVBoxLayout(self)
+        for url in urls:
+            form = QFormLayout()
+            url_label = QLabel(url)
+            url_label.setWordWrap(True)
+
+            # Campo contraseña
+            pass_input = QLineEdit()
+            pass_input.setEchoMode(QLineEdit.Password)
+
+            # Campo path con botón
+            form.addRow(QLabel("<b>URL:</b>"), url_label)
+            form.addRow("Contraseña:", pass_input)
+
+            path_input = QLineEdit(self.default_path)
+            browse_btn = QPushButton("📁")
+            browse_btn.setFixedWidth(30)
+            browse_btn.clicked.connect(lambda _, p=path_input: self.choose_path(p))
+            path_container = QHBoxLayout()
+            path_container.addWidget(path_input)
+            path_container.addWidget(browse_btn)
+            form.addRow("Guardar en:", path_container)
+
+            layout.addLayout(form)
+            self.entries.append({
+                "url": url,
+                "password_widget": pass_input,
+                "path_widget": path_input
+            })
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    def choose_path(self, path_input):
+        folder = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta", path_input.text())
+        if folder:
+            path_input.setText(folder)
+
+    def get_results(self):
+        return [
+            {
+                "url": e["url"],
+                "password": e["password_widget"].text().strip(),
+                "path": e["path_widget"].text().strip()
+            }
+            for e in self.entries
+        ]
 
 class LinkInputWindow(QWidget):
     def __init__(self):
@@ -210,10 +269,15 @@ class LinkInputWindow(QWidget):
 
     def proceed(self):
         text = self.textbox.toPlainText().strip()
-        if text:
-            self.links = [line.strip() for line in text.splitlines() if line.strip()]
+        if not text:
+            return
+        urls = [line.strip() for line in text.splitlines() if line.strip()]
+        if not urls:
+            return
+        dialog = DownloadDetailsDialog(urls, self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.links = dialog.get_results()
             self.close()
-
 
 def apply_settings():
     config = load_config()
