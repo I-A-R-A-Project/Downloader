@@ -16,17 +16,20 @@ class UniversalDownloader(QWebEngineView):
         self.urls = []
         self.offscreen_results = []
 
-        for url in urls:
+        for entry in urls:
+            url = entry.get("url", "")
+            path = entry.get("path", "")
+            password = entry.get("password", "")
             if url.startswith("magnet:?"):
                 print(f"🔗 Magnet detectado: {url}")
                 filename = f"{uuid.uuid4().hex[:8]}.magnet"
-                self.offscreen_results.append((filename, url))
+                self.offscreen_results.append((os.path.join(path, filename), url))
             elif url.endswith(".torrent") or "torrage" in url or "itorrents" in url:
                 print(f"🔗 Torrent detectado: {url}")
                 filename = url.split("/")[-1].split("?")[0]
-                self.offscreen_results.append((filename, url))
+                self.offscreen_results.append((os.path.join(path, filename), url))
             else:
-                self.urls.append((url, ""))
+                self.urls.append((url, path))
 
         self.current_index = 0
         self.results = []

@@ -52,9 +52,8 @@ def search_nyaa(query):
             magnet_tag = row.select_one("td.text-center a[href^='magnet:?']")
 
             if title_tag and magnet_tag:
-                title = title_tag.text.strip()
+                title = title_tag['title']
                 magnet_url = magnet_tag["href"]
-
                 results.append({
                     "title": title,
                     "chapter": None,
@@ -148,23 +147,36 @@ class MultiChoiceDownloader(QWidget):
 
             aux={}
             for result in results:
+                # Si los campos vienen vacíos, intento parsear el title plano
+                if not any([result.get("fansub"), result.get("resolucion"), result.get("chapter")]):
+                    parsed = self.parse_release_name(result["title"])
+                    for k, v in parsed.items():
+                        if v and not result.get(k):
+                            result[k] = v
+
                 item_text = ""
                 subgroup_text = ""
                 subgroup_item = None
-                if result['url_type']=="torrent":
-                    item_text += f"{result['title']}"
-                else:
+
+                if not result['url_type'] == "torrent":
                     subgroup_text += f"{result['url_type']} - {result['title']}"
+
                 item_text += f"{result['title']}"
-                fansub = result["fansub"]
-                resol = result["resolucion"]
-                chapter = result["chapter"]
-                chapters = result["chapters"]
-                if isinstance(chapter, (int)) and isinstance(chapters, (int)):
+
+                fansub = result.get("fansub")
+                resol = result.get("resolucion")
+                chapter = result.get("chapter")
+                chapters = result.get("chapters")
+
+                if isinstance(chapter, (int, str)) and isinstance(chapters, (int)):
                     item_text += f" {chapter}/{chapters}"
-                if isinstance(fansub, (str)):
+                elif isinstance(chapter, (int, str)):
+                    item_text += f" {chapter}"
+
+                if isinstance(fansub, str):
                     subgroup_text += f" [{fansub}]"
-                if isinstance(resol, (int)):
+
+                if isinstance(resol, int):
                     subgroup_text += f" ({resol}p)"
                     if subgroup_text not in aux:
                         subgroup_item = QTreeWidgetItem([subgroup_text])
@@ -172,13 +184,16 @@ class MultiChoiceDownloader(QWidget):
                         subgroup_item.setCheckState(0, Qt.Unchecked)
                         aux[subgroup_text] = subgroup_item
                         group_item.addChild(aux[subgroup_text])
-                password = result["password"]
-                if isinstance(password, (int)):
+
+                password = result.get("password")
+                if isinstance(password, (int, str)):
                     item_text += f" - PASSWORD: {password}"
+
                 child_item = QTreeWidgetItem([item_text])
                 child_item.setFlags(child_item.flags() | Qt.ItemIsUserCheckable)
                 child_item.setCheckState(0, Qt.Unchecked)
                 child_item.setData(0, Qt.UserRole, (item_text, result["url"]))
+
                 if subgroup_text in aux:
                     aux[subgroup_text].addChild(child_item)
                 else:
@@ -190,6 +205,48 @@ class MultiChoiceDownloader(QWidget):
         self.layout.addWidget(self.btn_confirm)
         self.setLayout(self.layout)
 
+    def parse_release_name(self,text):
+        data = {
+            "fansub": None,
+            "title": None,
+            "chapter": None,
+            "resolucion": None,
+            "extra": None
+        }
+
+        # Fansub: [Texto] al inicio
+        fansub_match = re.match(r'^\[(.*?)\]', text)
+        if fansub_match:
+            data["fansub"] = fansub_match.group(1)
+            text = text[fansub_match.end():].strip()
+
+        # Capítulo: - 12 / - 09v2 / [12] / S01E12
+        chapter_match = re.search(r'(?:-| )(S\d+E\d+|\d+v?\d*|\[\d+\])', text, re.IGNORECASE)
+        if chapter_match:
+            chap = chapter_match.group(1).strip(" -[]")
+            data["chapter"] = chap
+            # título sería lo que está antes
+            data["title"] = text[:chapter_match.start()].strip(" -")
+
+        # Resolución: 480p, 720p, 1080p
+        resol_match = re.search(r'(\d{3,4}p)', text)
+        if resol_match:
+            try:
+                data["resolucion"] = int(resol_match.group(1)[:-1])
+            except ValueError:
+                pass
+
+        # Extra: WEB-DL, WEBRip, HEVC, AAC, MultiSub, etc.
+        extras = re.findall(r'(WEB-?DL|WEBRip|HEVC|x264|AAC|MultiSub|VOSTFR|AMZN|CR)', text, re.IGNORECASE)
+        if extras:
+            data["extra"] = " ".join(extras)
+
+        # Si no detectamos título aún, lo dejamos como todo
+        if not data["title"]:
+            data["title"] = text
+
+        return data
+    
     def handle_item_changed(self, item, column):
         if item.childCount() > 0:
             state = item.checkState(0)
