@@ -11,8 +11,8 @@ from aniteca import search_aniteca
 from bs4 import BeautifulSoup
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
 from workers import (
-    FullDetailsWorker, ImageLoaderWorker,
-    SearchWorker, SiteSearchWorker, URLWorker
+    FullDetailsWorker, GameSearchWorker, ImageLoaderWorker,
+    AnimeSearchWorker, SiteSearchWorker, URLWorker
 )
 
 TMDB_API_KEY = 'TU_API_KEY_AQUI'
@@ -347,10 +347,10 @@ class MediaSearchUI(QWidget):
             rbutton.toggled.connect(lambda checked,
                 value=category_value: self.set_category(value) if checked else None
             )
-            rbutton.setEnabled(False)
+            rbutton.setEnabled(True)
             types_layout.addWidget(rbutton)
-        self.anime_rbutton.toggle()
-        self.category = "anime"
+        self.games_rbutton.toggle()
+        self.category = "games"
         layout.addLayout(types_layout)
 
         search_layout = QHBoxLayout()
@@ -450,9 +450,17 @@ class MediaSearchUI(QWidget):
         self.search_bar.setDisabled(True)
         self.search_bar.setPlaceholderText("Buscando...")
 
-        worker = SearchWorker(term,self.category)
-        worker.signals.finished.connect(self.populate_results)
-        QThreadPool.globalInstance().start(worker)
+        pool = QThreadPool.globalInstance()
+
+        if self.category == "games":
+            API_KEY = "aa29f7a40ca3431ea2b3352ac0e223cc"
+            worker = GameSearchWorker(term, API_KEY)
+            worker.signals.finished.connect(self.populate_results)
+            pool.start(worker)
+        elif self.category == "anime":
+            worker = AnimeSearchWorker(term, self.category)
+            worker.signals.finished.connect(self.populate_results)
+            pool.start(worker)
 
     def populate_results(self, results):
         self.search_bar.setDisabled(False)
@@ -464,8 +472,14 @@ class MediaSearchUI(QWidget):
         self.results_list.clear()
 
         for item in results:
-            if item['source'] == "MyAnimeList":
-                lw_item = QListWidgetItem(f"[{item['source']}] - {item['title']}")
+            source = item.get('source', '')
+            if source == "RAWG":
+                title = item['title']
+                rating = item.get("rating", "N/A")
+                released = item.get("released", "Desconocido")
+                lw_item = QListWidgetItem(f"[{source}] {title} ({released}) ★{rating}")
+            elif source == "MyAnimeList":
+                lw_item = QListWidgetItem(f"[{source}] - {item['title']}")
             else:
                 lw_item = QListWidgetItem(item['title'])
 
@@ -498,41 +512,43 @@ class MediaSearchUI(QWidget):
 
         desc = data.get("description", "Sin descripción.")
         self.details.setPlainText(desc)
+        source = data.get("source", "")
 
-        self.labels_info[0].setText(f"<b>Tipo:<br>{data.get('type', '')}</b>")
-        self.labels_info[1].setText(f"<b>Episodios:<br>{data.get('episodes', '')}</b>")
-        self.labels_info[2].setText(f"<b>Score:<br>{score_to_color(data.get('score', ''))}</b>")
-        rating_text = RATING_TEXT.get(data.get("rating", ""), "<br>No rating")
-        self.labels_info[3].setText(f"<b>Rating:{rating_text}</b>")
-        self.spinner_movie.start()
-        self.image_label.setMovie(self.spinner_movie)
+        if source=="MyAnimeList":
+            self.labels_info[0].setText(f"<b>Tipo:<br>{data.get('type', '')}</b>")
+            self.labels_info[1].setText(f"<b>Episodios:<br>{data.get('episodes', '')}</b>")
+            self.labels_info[2].setText(f"<b>Score:<br>{score_to_color(data.get('score', ''))}</b>")
+            rating_text = RATING_TEXT.get(data.get("rating", ""), "<br>No rating")
+            self.labels_info[3].setText(f"<b>Rating:{rating_text}</b>")
+            self.spinner_movie.start()
+            self.image_label.setMovie(self.spinner_movie)
 
-        if data.get("image"):
-            worker = ImageLoaderWorker(data["image"])
-            worker.signals.finished.connect(self.set_detail_image)
-            QThreadPool.globalInstance().start(worker)
-        else:
-            self.spinner_movie.stop()
-            self.image_label.clear()
-
-        if not data.get("loaded"):
-            worker = FullDetailsWorker(data["url"])
-            worker.signals.finished.connect(self.update_details)
-            QThreadPool.globalInstance().start(worker)
-        self.download_button.setEnabled(True)
-        self.download_button.setText("Descargar")
-
-    def update_details(self, url, full_description,trailer_url):
-        data = self.current_item.data(Qt.UserRole)
-        if url==data["url"]:
-            if full_description and "...read more" in data["description"]: 
-                self.details.setPlainText(full_description)
-                data["description"] = full_description
-            data["trailer"] = trailer_url
-            data["loaded"] = True
-            self.current_item.setData(Qt.UserRole, data)
-            if trailer_url:
+            if data.get("image"):
+                worker = ImageLoaderWorker(data["image"])
+                worker.signals.finished.connect(self.set_detail_image)
+                QThreadPool.globalInstance().start(worker)
+            else:
+                self.spinner_movie.stop()
+                self.image_label.clear()
+            trailer = data.get("trailer")
+            if trailer:
                 self.trailer_button.setEnabled(True)
+                self.current_item.data(Qt.UserRole)["trailer"] = trailer
+            self.download_button.setEnabled(True)
+            self.download_button.setText("Descargar")
+
+        if source == "RAWG":
+            self.labels_info[0].setText(f"<b>Plataformas:<br>{', '.join(data.get('platforms', []))}</b>")
+            self.labels_info[1].setText(f"<b>Géneros:<br>{', '.join(data.get('genres', []))}</b>")
+            self.labels_info[2].setText(f"<b>Fecha lanzamiento:<br>{data.get('released', 'N/A')}</b>")
+            self.labels_info[3].setText(f"<b>Rating:<br>{data.get('rating', 'N/A')}</b>")
+
+            if "Factorio" in data["title"]:
+                self.download_button.setText("Ver mods")
+                self.download_button.setEnabled(True)
+            else:
+                self.download_button.setText("Descargar (próximamente)")
+                self.download_button.setEnabled(False)
 
     def set_detail_image(self, url, pixmap):
         if url==self.current_item.data(Qt.UserRole)["image"]:
@@ -544,15 +560,13 @@ class MediaSearchUI(QWidget):
 
     def show_trailer(self):
         yt_url = self.current_item.data(Qt.UserRole)["trailer"]
-        embed_url = yt_url.split('?')[0]
-
-        self.trailer_window = TrailerWindow(embed_url, self)
+        self.trailer_window = TrailerWindow(yt_url, self)
         self.trailer_window.show()
 
     def download_item(self):
         if not self.current_item:
             return
-        title = self.current_item.data(Qt.UserRole)['title']
+        title = re.sub(r"\s*\([^)]*\)\s*$", "", self.current_item.data(Qt.UserRole)['title']).strip()
         if title in self.active_downloads:
             print(f"⏳ Ya se está buscando: {title}")
             return

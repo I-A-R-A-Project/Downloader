@@ -168,13 +168,14 @@ def search_jikan_mal(query, cat):
     results = []
     
     for item in data.get("data", []):
+        print(item.get("title", ""))
         try:
             results.append({
                 "loaded": True,
                 "title": item.get("title", ""),
                 "other_titles": [t["title"] for t in item.get("titles", []) if t["title"] != item.get("title")],
                 "url": item.get("url", ""),
-                "trailer": item.get("trailer", {}).get("embed_url","").split("?")[0],
+                "trailer": (item.get("trailer", {}).get("embed_url","") or "").split("?")[0],
                 "image": item.get("images", {}).get("jpg", {}).get("image_url"),
                 "description": item.get("synopsis", ""),
                 "genres": [g["name"] for g in item.get("genres", [])],
@@ -190,75 +191,68 @@ def search_jikan_mal(query, cat):
 
     return results
 
-def search_scrapper_mal(query,cat):
-    url = f"https://myanimelist.net/{cat}.php?cat={cat}&q={query}&type=0&score=0&status=0&sm=0&sd=0&sy=0&em=0&ed=0&ey=0&c[]=a&c[]=b&c[]=c&c[]=g"
-    try:
-        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-        response.raise_for_status()
-    except Exception as e:
-        if "Failed to resolve 'myanimelist.net' ([Errno 11001] getaddrinfo failed)" in e:
-            print("[MyAnimeList] Failed connection, check your internet")
-        else:
-            print("[MyAnimeList] Error:", e)
-        return []
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    results = []
-
-    for row in soup.select("tr:has(img)"):
-        try:
-            img_tag = row.select_one("img")
-            title_tag = row.select_one("td:nth-of-type(2) a strong")
-            description_tag = row.select_one(".pt4")
-            info_cells = row.find_all("td", class_="ac")
-            #print(info_cells)
-            title = title_tag.text.strip()
-            link = title_tag.find_parent("a")["href"]
-
-            # Extraer y mejorar la imagen
-            raw_img = img_tag.get("data-src", img_tag.get("src", ""))
-            full_img = raw_img.replace("/r/50x70", "").split("?")[0]  # remueve resize y parámetros
-
-            description = description_tag.get_text(strip=True) if description_tag else ""
-            tipo = info_cells[0].text.strip() if len(info_cells) > 0 else ""
-            episodios = info_cells[1].text.strip() if len(info_cells) > 1 else ""
-            score = info_cells[2].text.strip() if len(info_cells) > 2 else ""
-            rating = info_cells[3].text.strip() if len(info_cells) > 3 else ""
-
-            results.append({
-                "loaded": False,
-                "title": title,
-                "other_titles": [], 
-                "url": link,
-                "trailer": None,
-                "image": full_img,
-                "description": description,
-                "genres": None,
-                "type": tipo,
-                "episodes": episodios,
-                "score": score,
-                "rating": rating,
-                "source": "MyAnimeList"
-            })
-
-        except Exception as e:
-            print("Error procesando un resultado:", e)
-            continue
-
-    return results
-
-class SearchWorkerSignals(QObject):
+class AnimeSearchWorkerSignals(QObject):
     finished = pyqtSignal(list)
 
-class SearchWorker(QRunnable):
+class AnimeSearchWorker(QRunnable):
     def __init__(self, term, cat):
         super().__init__()
         self.term = term
         self.cat = cat
-        self.signals = SearchWorkerSignals()
+        self.signals = AnimeSearchWorkerSignals()
 
     def run(self):
         if self.cat=='anime' or self.cat=='manga':
             results = search_jikan_mal(self.term, self.cat)
         self.signals.finished.emit(results)
+
+class GameSearchWorkerSignals(QObject):
+    finished = pyqtSignal(list)
+
+class GameSearchWorker(QRunnable):
+    def __init__(self, query, api_key):
+        super().__init__()
+        self.query = query
+        self.api_key = api_key
+        self.signals = GameSearchWorkerSignals()
+
+    def run(self):
+        url = "https://api.rawg.io/api/games"
+        params = {
+            "search": self.query,
+            "key": self.api_key,
+            "page_size": 20,
+            "ordering": "-rating"
+        }
+
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            r.raise_for_status()
+            data = r.json().get("results", [])
+        except Exception as e:
+            print("[GameSearchWorker] Error:", e)
+            self.signals.finished.emit([])
+            return
+        
+        results = []
+        for g in data:
+            try:
+                results.append({
+                    "source": "RAWG",
+                    "title": g.get("name", "Sin título"),
+                    "url": f"https://rawg.io/games/{g.get('slug', '')}",
+                    "image": g.get("background_image"),
+                    "released": g.get("released", "Desconocido"),
+                    "rating": g.get("rating", "N/A"),
+                    "genres": [genre["name"] for genre in g.get("genres", [])],
+                    "platforms": [p["platform"]["name"] for p in g.get("platforms", [])],
+                    "description": g.get("short_description", "") or "Sin descripción.",
+                    "trailer": (g.get("clip", {}) or {}).get("clip"),
+                    "loaded": True
+                })
+            except Exception as e:
+                print("[GameSearchWorker] Error procesando resultado:", e)
+        print(results)
+        self.signals.finished.emit(results)
+
 
