@@ -1,4 +1,5 @@
 import os
+import threading
 import json
 import requests
 import subprocess
@@ -327,17 +328,37 @@ class Aria2Client:
             print(f"Error reanudando descarga: {e}")
             return False
 
-def ensure_aria2_running(download_dir=None):
+_aria2_start_lock = threading.Lock()
+_aria2_start_in_progress = False
+
+def ensure_aria2_running(download_dir=None, background=False):
     client = Aria2Client()
-    if not client.is_running():
-        print("Iniciando Aria2...")
-        if client.start_aria2(download_dir):
-            print("✅ Aria2 iniciado correctamente")
-            return True
-        else:
-            print("❌ No se pudo iniciar Aria2")
-            return False
-    return True
+    if client.is_running():
+        return True
+
+    def _start():
+        global _aria2_start_in_progress
+        with _aria2_start_lock:
+            if _aria2_start_in_progress:
+                return
+            _aria2_start_in_progress = True
+        try:
+            print("Iniciando Aria2...")
+            if client.start_aria2(download_dir):
+                print("✅ Aria2 iniciado correctamente")
+            else:
+                print("❌ No se pudo iniciar Aria2")
+        finally:
+            with _aria2_start_lock:
+                _aria2_start_in_progress = False
+
+    if background:
+        thread = threading.Thread(target=_start, daemon=True)
+        thread.start()
+        return True
+
+    _start()
+    return client.is_running()
 
 def get_client():
     client = Aria2Client()

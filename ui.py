@@ -165,7 +165,11 @@ class DownloadWindow(QWidget):
         print("✅ Todos los torrents han sido agregados a Aria2")
 
     def start_downloads(self, direct_links):
+        print(f"[DEBUG] start_downloads received {len(direct_links)} links")
         for index, (relative_path, link) in enumerate(direct_links):
+            if not relative_path or not link:
+                print(f"[WARN] Skipping empty link at index {index}: {relative_path} / {link}")
+                continue
             full_path = os.path.join(self.folder_path, relative_path)
             if not link:
                 continue

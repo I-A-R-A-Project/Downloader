@@ -1,4 +1,4 @@
-import re, os, uuid
+import re, os, uuid, requests
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
 from PyQt5.QtCore import QUrl, QTimer, pyqtSignal
 from bs4 import BeautifulSoup
@@ -15,7 +15,14 @@ class UniversalDownloader(QWebEngineView):
         self.setPage(SilentPage(self))
         self.urls = []
         self.offscreen_results = []
+        self.visited_urls = set()
+        self._load_finished = False
+        self._load_index = None
+        self._load_timeout_ms = 20000
+        self._html_timeout_ms = 15000
+        self._html_callback_pending = False
 
+        print(f"[DEBUG] UniversalDownloader init with {len(urls)} entries")
         for entry in urls:
             url = entry.get("url", "")
             path = entry.get("path", "")
@@ -40,25 +47,83 @@ class UniversalDownloader(QWebEngineView):
 
         self.setWindowTitle("Universal Downloader")
         self.loadFinished.connect(self.on_load_finished)
-        self.load(QUrl(self.urls[self.current_index][0]))
+        self.loadStarted.connect(self.on_load_started)
+        # Defer processing until callers connect signals and call start()
+
+    def start_processing(self):
+        while self.current_index < len(self.urls):
+            url, path = self.urls[self.current_index]
+            if "mediafire.com" in url and ("/file/" in url or "/download/" in url):
+                if self._handle_mediafire_file_via_requests(url, path):
+                    self.current_index += 1
+                    continue
+                print("[WARN] MediaFire file requests handling failed. Skipping.")
+                self.results.append((None, None))
+                self.current_index += 1
+                continue
+
+            print(f"[DEBUG] Loading URL: {url}")
+            self.visited_urls.add(url)
+            self.load(QUrl(url))
+            return
+
+        print(f"[DEBUG] Completed. Results: {len(self.results)}")
+        self.direct_links_ready.emit(self.results)
+        self.close()
+
+    def on_load_started(self):
+        self._load_finished = False
+        idx = self.current_index
+        self._load_index = idx
+        QTimer.singleShot(self._load_timeout_ms, lambda: self._on_load_timeout(idx))
+
+    def _on_load_timeout(self, index):
+        if self._load_finished:
+            return
+        if index != self.current_index:
+            return
+        url, path = self.urls[self.current_index]
+        print(f"[WARN] Load timeout at idx={self.current_index} url={url}.")
+        if "mediafire.com" in url:
+            try:
+                print("[DEBUG] Fallback: fetching MediaFire HTML via requests.")
+                r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                r.raise_for_status()
+                if "/folder/" in url:
+                    self.handle_mediafire_folder(r.text, path)
+                    return
+                if "/file/" in url or "/download/" in url:
+                    self.handle_mediafire_file(r.text, path, url)
+                    return
+            except Exception as e:
+                print(f"[ERROR] Fallback requests failed: {e}")
+        self.results.append((None, None))
+        self.proceed_to_next()
 
     def start(self):
         if self.urls:
             self.show()
+            self.start_processing()
         else:
             self.close()
 
     def on_load_finished(self):
+        if self._load_index is not None and self._load_index != self.current_index:
+            print(f"[DEBUG] Ignoring stale loadFinished for idx={self._load_index}")
+            return
+        self._load_finished = True
+        print(f"[DEBUG] on_load_finished idx={self.current_index} total={len(self.urls)}")
         print(self.urls[self.current_index])
         print(f"[{self.current_index+1}/{len(self.urls)}] Páginas cargadas...")
         QTimer.singleShot(1000, self.route_url_handling)
 
     def route_url_handling(self):
         url, path = self.urls[self.current_index]
+        print(f"[DEBUG] route_url_handling url={url}")
         if "mediafire.com" in url:
             self.handle_mediafire(url, path)
         elif "4shared.com" in url:
-            self.page().toHtml(lambda html: self.handle_4shared(html, path))
+            self._call_with_html_timeout(self.handle_4shared, path)
         elif "drive.google.com" in url:
             self.handle_gdrive(url, path)
         else:
@@ -99,15 +164,51 @@ class UniversalDownloader(QWebEngineView):
 
     def handle_mediafire(self, url, path):
         if "/folder/" in url:
-            self.page().toHtml(lambda html: self.handle_mediafire_folder(html, path))
+            self._call_with_html_timeout(self.handle_mediafire_folder, path)
         elif "/file/" in url or "/download/" in url:
-            self.page().toHtml(lambda html: self.handle_mediafire_file(html, path))
+            if not self._handle_mediafire_file_via_requests(url, path):
+                self._call_with_html_timeout(self.handle_mediafire_file, path, url)
         else:
             print("❌ URL de MediaFire no reconocida.")
             self.results.append(None)
             self.proceed_to_next()
 
-    def handle_mediafire_folder(self, html, base_path):
+    def _handle_mediafire_file_via_requests(self, url, path):
+        try:
+            print("[DEBUG] MediaFire file via requests")
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            r.raise_for_status()
+            if "/file/" in url or "/download/" in url:
+                self.handle_mediafire_file(r.text, path, url, auto_next=False)
+                return True
+        except Exception as e:
+            print(f"[ERROR] MediaFire file requests failed: {e}")
+        return False
+
+    def _call_with_html_timeout(self, handler, *args):
+        self._html_callback_pending = True
+
+        def _on_html(html):
+            if not self._html_callback_pending:
+                return
+            self._html_callback_pending = False
+            handler(html, *args)
+
+        self.page().toHtml(_on_html)
+        QTimer.singleShot(
+            self._html_timeout_ms,
+            lambda: self._on_html_timeout(handler.__name__)
+        )
+
+    def _on_html_timeout(self, handler_name):
+        if not self._html_callback_pending:
+            return
+        self._html_callback_pending = False
+        print(f"[WARN] toHtml timeout in {handler_name}. Skipping.")
+        self.results.append((None, None))
+        self.proceed_to_next()
+
+    def handle_mediafire_folder(self, html, base_path, auto_next=True):
         soup = BeautifulSoup(html, "html.parser")
         aux = []
         title_tag = soup.find(id="folder_name")
@@ -129,14 +230,22 @@ class UniversalDownloader(QWebEngineView):
         file_links = list(set(aux))
         if file_links:
             print(f"📁 {len(file_links)} archivos encontrados en carpeta '{folder_name}'.")
+            print(f"[DEBUG] base_path={base_path} subfolder_path={subfolder_path}")
             insert_position = self.current_index + 1
+            existing_urls = {u for u, _ in self.urls}
             for link in reversed(file_links):
+                if link in existing_urls or link in self.visited_urls:
+                    continue
                 self.urls.insert(insert_position, (link, subfolder_path))
+                existing_urls.add(link)
+            print(f"[DEBUG] Queue size after insert: {len(self.urls)}")
         else:
             print("❌ No se encontraron archivos en la carpeta.")
-        self.proceed_to_next()
+        if auto_next:
+            self.proceed_to_next()
 
-    def handle_mediafire_file(self, html, current_path):
+    def handle_mediafire_file(self, html, current_path, source_url=None, auto_next=True):
+        print(f"[DEBUG] handle_mediafire_file url={source_url}")
         soup = BeautifulSoup(html, "html.parser")
         button = soup.find("a", {"id": "downloadButton"})
         filename_tag = soup.find("div", class_="filename")
@@ -148,14 +257,39 @@ class UniversalDownloader(QWebEngineView):
             print(f"💾 Guardar como: {full_path}")
             self.results.append((full_path, direct_link))
         else:
-            print("❌ No se encontró el enlace de descarga.")
-            self.results.append((None, None))
-        self.proceed_to_next()
+            print("❌ No se encontró el enlace de descarga en HTML.")
+            # Fallback: fetch via requests and re-parse
+            if source_url:
+                try:
+                    r = requests.get(source_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                    r.raise_for_status()
+                    soup2 = BeautifulSoup(r.text, "html.parser")
+                    button2 = soup2.find("a", {"id": "downloadButton"})
+                    filename_tag2 = soup2.find("div", class_="filename")
+                    if button2 and button2.has_attr("href"):
+                        direct_link = button2["href"]
+                        filename = filename_tag2.text.strip() if filename_tag2 else os.path.basename(direct_link)
+                        full_path = os.path.join(current_path, filename)
+                        print(f"✅ Enlace directo (fallback): {direct_link}")
+                        print(f"💾 Guardar como: {full_path}")
+                        self.results.append((full_path, direct_link))
+                    else:
+                        print("❌ Fallback tampoco encontró enlace.")
+                        self.results.append((None, None))
+                except Exception as e:
+                    print(f"❌ Error en fallback MediaFire: {e}")
+                    self.results.append((None, None))
+            else:
+                self.results.append((None, None))
+        if auto_next:
+            self.proceed_to_next()
 
     def proceed_to_next(self):
         self.current_index += 1
         if self.current_index < len(self.urls):
-            self.load(QUrl(self.urls[self.current_index][0]))
+            print(f"[DEBUG] Advancing to idx={self.current_index} total={len(self.urls)}")
+            self.start_processing()
         else:
+            print(f"[DEBUG] Completed. Results: {len(self.results)}")
             self.direct_links_ready.emit(self.results)
             self.close()
