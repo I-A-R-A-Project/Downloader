@@ -2,7 +2,7 @@ import json
 import os
 from PyQt5.QtWidgets import QFileDialog,QDialog, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QSpinBox, QPushButton,QLineEdit,QMessageBox
 
-CONFIG_PATH = "config.json"
+CONFIG_PATH = os.path.join(os.environ["APPDATA"], "MediaSearchPrototype", "config.json")
 DEFAULT_CONFIG = {
     "folder_path": os.path.join(os.environ["USERPROFILE"], "Downloads"),
     "open_on_finish": False,
@@ -15,6 +15,8 @@ def load_config():
     with open(CONFIG_PATH, "r") as f:
         return json.load(f) 
 def save_config(config):
+    config_dir = os.path.dirname(CONFIG_PATH)
+    os.makedirs(config_dir, exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=4)
 

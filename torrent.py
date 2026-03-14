@@ -31,9 +31,18 @@ class TorrentUpdater(QRunnable):
             stopped_downloads = [d for d in client.get_stopped_downloads() 
                                if d.state not in ("complete", "removed") and d.progress < 1.0]
             all_downloads = active_downloads + stopped_downloads
-            self.signals.result.emit(all_downloads)
+            
+            if hasattr(self, 'signals') and self.signals:
+                try:
+                    self.signals.result.emit(all_downloads)
+                except RuntimeError:
+                    pass  # Signals were deleted, ignore
         except Exception as e:
-            self.signals.error.emit(str(e))
+            if hasattr(self, 'signals') and self.signals:
+                try:
+                    self.signals.error.emit(str(e))
+                except RuntimeError:
+                    pass  # Signals were deleted, ignore
 
 class Aria2Client:
     def __init__(self, url=ARIA2_RPC_URL, secret=ARIA2_SECRET):
@@ -345,12 +354,6 @@ def add_magnet_link(magnet_url, save_path):
     gid = client.add_magnet(magnet_url, save_path)
     if gid:
         print(f"Magnet agregado con GID: {gid}")
-        
-        for _ in range(10):
-            download_info = client.get_download_status(gid)
-            if download_info:
-                return gid
-            time.sleep(1)
     
     return gid
 
@@ -363,12 +366,6 @@ def add_torrent_file(file_path, save_path):
     gid = client.add_torrent_file(file_path, save_path)
     if gid:
         print(f"Torrent agregado con GID: {gid}")
-        
-        for _ in range(10):
-            download_info = client.get_download_status(gid)
-            if download_info:
-                return gid
-            time.sleep(1)
     
     return gid
 
