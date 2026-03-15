@@ -5,7 +5,7 @@ from torrent import ensure_aria2_running
 
 def parse_input(args):
     if len(args) == 1 and isinstance(args[0], str) and args[0].endswith(".json"):
-        with open(args[0], "r", encoding="utf-8") as f:
+        with open(args[0], "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         return data
     else:
@@ -53,15 +53,8 @@ if __name__ == '__main__':
     check_aria2_availability()
     
     args = sys.argv[1:]
+    entries = parse_input(args) if args else []
 
-    if not args:
-        link_input = LinkInputWindow()
-        link_input.show()
-        app.exec_()
-        args = link_input.links
-    else:
-        args = parse_input(args)
-
-    if args:
-        window = DownloadWindow(args)
-        sys.exit(app.exec_())
+    window = DownloadWindow(entries)
+    window.show()
+    sys.exit(app.exec_())

@@ -86,18 +86,9 @@ class DownloadWindow(QWidget):
         # Separar torrents de otras descargas
         self.torrent_urls = []
         self.regular_entries = []
-        
-        for entry in download_entries:
-            url = entry.get("url", "")
-            if url.startswith("magnet:?") or url.endswith(".torrent"):
-                self.torrent_urls.append(url)
-            else:
-                self.regular_entries.append(entry)
-        
-        # Asegurar que Aria2 esté corriendo para torrents
-        if self.torrent_urls:
-            ensure_aria2_running(self.folder_path)
-            self.cleanup_previous_downloads()
+        self.downloaders = []
+        self._aria2_checked = False
+        self._empty_state_container = None
 
         self.scroll = QScrollArea(self)
         self.scroll.setWidgetResizable(True)
@@ -122,16 +113,10 @@ class DownloadWindow(QWidget):
         self.torrent_progress_bars = []
         self.torrent_labels = []
         
-        if self.torrent_urls:
-            self.process_torrents_parallel()
-        
-        if self.regular_entries:
-            self.downloader = UniversalDownloader(self.regular_entries)
-            self.downloader.direct_links_ready.connect(self.start_downloads)
-            self.downloader.start()
+        if download_entries:
+            self.load_entries(download_entries)
         else:
-            # Si solo hay torrents, mostrar la ventana inmediatamente
-            QTimer.singleShot(100, self.show)
+            self.show_empty_state()
         
     def cleanup_previous_downloads(self):
         try:
@@ -150,14 +135,15 @@ class DownloadWindow(QWidget):
         except Exception as e:
             pass
             
-    def process_torrents_parallel(self):
-        if not self.torrent_urls:
+    def process_torrents_parallel(self, torrents=None):
+        target = torrents or self.torrent_urls
+        if not target:
             return
             
-        print(f"⚡ Procesando {len(self.torrent_urls)} torrents en paralelo...")
+        print(f"⚡ Procesando {len(target)} torrents en paralelo...")
         
         # Crear un procesador de torrents en un hilo separado
-        processor = TorrentProcessor(self.torrent_urls, self.folder_path)
+        processor = TorrentProcessor(target, self.folder_path)
         processor.signals.finished.connect(self.on_torrents_processed)
         QThreadPool.globalInstance().start(processor)
     
@@ -165,7 +151,9 @@ class DownloadWindow(QWidget):
         print("✅ Todos los torrents han sido agregados a Aria2")
 
     def start_downloads(self, direct_links):
-        for index, (relative_path, link) in enumerate(direct_links):
+        base_index = len(self.progress_bars)
+        for offset, (relative_path, link) in enumerate(direct_links):
+            index = base_index + offset
             full_path = os.path.join(self.folder_path, relative_path)
             if not link:
                 continue
@@ -195,6 +183,60 @@ class DownloadWindow(QWidget):
             QThreadPool.globalInstance().start(thread)
 
         self.show()
+
+    def load_entries(self, entries):
+        if not entries:
+            return
+        new_torrents = []
+        new_regular = []
+        for entry in entries:
+            url = entry.get("url", "")
+            if url.startswith("magnet:?") or url.endswith(".torrent"):
+                new_torrents.append(url)
+            else:
+                new_regular.append(entry)
+
+        if new_torrents:
+            if not self._aria2_checked:
+                ensure_aria2_running(self.folder_path)
+                self.cleanup_previous_downloads()
+                self._aria2_checked = True
+            self.torrent_urls.extend(new_torrents)
+            self.process_torrents_parallel(new_torrents)
+
+        if new_regular:
+            self.regular_entries.extend(new_regular)
+            downloader = UniversalDownloader(new_regular)
+            downloader.direct_links_ready.connect(self.start_downloads)
+            downloader.start()
+            self.downloaders.append(downloader)
+
+    def show_empty_state(self):
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        label = QLabel("No se pasaron enlaces.")
+        button = QPushButton("Agregar enlaces")
+        button.clicked.connect(self.open_link_input)
+        layout.addWidget(label)
+        layout.addWidget(button)
+        self.inner_layout.addWidget(container)
+        self._empty_state_container = container
+
+    def open_link_input(self):
+        self._link_input = LinkInputWindow()
+        self._link_input.links_ready.connect(self.on_links_ready)
+        self._link_input.show()
+        self._link_input.raise_()
+        self._link_input.activateWindow()
+
+    def on_links_ready(self, links):
+        if not links:
+            return
+        if self._empty_state_container:
+            self.inner_layout.removeWidget(self._empty_state_container)
+            self._empty_state_container.deleteLater()
+            self._empty_state_container = None
+        self.load_entries(links)
 
     def open_settings_dialog(self):
         dialog = SettingsDialog(self)
@@ -435,6 +477,8 @@ class DownloadDetailsDialog(QDialog):
         ]
 
 class LinkInputWindow(QWidget):
+    links_ready = pyqtSignal(list)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Pegar enlaces de paginas de descarga")
@@ -474,6 +518,7 @@ class LinkInputWindow(QWidget):
         dialog = DownloadDetailsDialog(urls, self)
         if dialog.exec_() == QDialog.Accepted:
             self.links = dialog.get_results()
+            self.links_ready.emit(self.links)
             self.close()
 
 def apply_settings():
