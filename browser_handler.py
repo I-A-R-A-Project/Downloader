@@ -34,17 +34,21 @@ class UniversalDownloader(QWebEngineView):
         self.current_index = 0
         self.results = []
 
-        if not self.urls:
-            QTimer.singleShot(100, lambda: self.direct_links_ready.emit(self.offscreen_results))
-            return
-
         self.setWindowTitle("Universal Downloader")
         self.loadFinished.connect(self.on_load_finished)
-        self.process_current_url()
+        self._started = False
 
     def start(self):
+        if self._started:
+            return
+        self._started = True
+        if not self.urls:
+            QTimer.singleShot(0, lambda: self.direct_links_ready.emit(self.offscreen_results))
+            self.close()
+            return
         if self.urls:
             self.show()
+            self.process_current_url()
         else:
             self.close()
 
@@ -111,7 +115,7 @@ class UniversalDownloader(QWebEngineView):
 
     def handle_mediafire(self, url, path):
         if "/folder/" in url:
-            self.page().toHtml(lambda html: self.safe_handle_mediafire_folder(html, url, path))
+            self.handle_mediafire_folder_api(url, path)
         elif "/file/" in url or "/download/" in url:
             self.handle_mediafire_file_requests(url, path)
         else:
@@ -124,9 +128,8 @@ class UniversalDownloader(QWebEngineView):
             self.handle_mediafire_folder(html, base_path)
         except Exception as e:
             print(f"❌ Error procesando carpeta MediaFire (WebEngine): {e}")
-            if not self.try_mediafire_folder_html(url, base_path):
-                self.results.append((None, None))
-                self.proceed_to_next()
+            self.results.append((None, None))
+            self.proceed_to_next()
 
     def handle_mediafire_folder_api(self, url, base_path):
         folder_key = self.extract_mediafire_folder_key(url)
@@ -136,43 +139,20 @@ class UniversalDownloader(QWebEngineView):
             self.proceed_to_next()
             return
         try:
-            import requests
-            headers = {"User-Agent": "Mozilla/5.0"}
             all_links = []
             all_folders = []
-            chunk = 1
-            more_chunks = True
-            while more_chunks:
-                params = {
-                    "folder_key": folder_key,
-                    "content_type": "folders,files",
-                    "filter": "all",
-                    "response_format": "json",
-                    "chunk": chunk,
-                }
-                response = requests.get(
-                    "https://www.mediafire.com/api/1.5/folder/get_content.php",
-                    params=params,
-                    timeout=30,
-                    headers=headers,
-                )
-                response.raise_for_status()
-                data = response.json()
-                content = data.get("response", {}).get("folder_content", {})
-                files = content.get("files", [])
-                folders = content.get("folders", [])
-                for f in files:
-                    quickkey = f.get("quickkey")
-                    filename = f.get("filename") or "archivo"
-                    if quickkey:
-                        all_links.append(self.build_mediafire_file_url(quickkey, filename))
-                for f in folders:
-                    sub_key = f.get("folderkey")
-                    name = (f.get("name") or "Subcarpeta").replace(" ", "_")
-                    if sub_key:
-                        all_folders.append(self.build_mediafire_folder_url(sub_key, name))
-                more_chunks = content.get("more_chunks") == "yes"
-                chunk += 1
+            files = self.fetch_mediafire_folder_items(folder_key, "files")
+            folders = self.fetch_mediafire_folder_items(folder_key, "folders")
+            for f in files:
+                quickkey = f.get("quickkey")
+                filename = f.get("filename") or "archivo"
+                if quickkey:
+                    all_links.append(self.build_mediafire_file_url(quickkey, filename))
+            for f in folders:
+                sub_key = f.get("folderkey")
+                name = (f.get("name") or "Subcarpeta").replace(" ", "_")
+                if sub_key:
+                    all_folders.append(self.build_mediafire_folder_url(sub_key, name))
             if all_links or all_folders:
                 folder_name = self.extract_mediafire_folder_name(url)
                 subfolder_path = os.path.join(base_path, folder_name)
@@ -180,12 +160,10 @@ class UniversalDownloader(QWebEngineView):
                 insert_position = self.current_index + 1
                 for link in reversed(all_links + all_folders):
                     self.urls.insert(insert_position, (link, subfolder_path))
+                self.proceed_to_next()
             else:
                 print("❌ No se encontraron archivos en la carpeta (API). Probando HTML...")
-                if self.try_mediafire_folder_html(url, base_path):
-                    return
-                print("❌ No se encontraron archivos en la carpeta.")
-            self.proceed_to_next()
+                self.page().toHtml(lambda html: self.safe_handle_mediafire_folder(html, url, base_path))
         except Exception as e:
             print(f"❌ Error procesando carpeta MediaFire (API): {e}")
             self.results.append((None, None))
@@ -312,6 +290,49 @@ class UniversalDownloader(QWebEngineView):
         safe_name = folder_name.replace(" ", "_")
         return f"https://www.mediafire.com/folder/{folder_key}/{safe_name}"
 
+    def normalize_mediafire_items(self, value, key):
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = value.get(key)
+            if isinstance(nested, list):
+                return nested
+            if isinstance(nested, dict):
+                return [nested]
+        return []
+
+    def fetch_mediafire_folder_items(self, folder_key, content_type):
+        import requests
+        headers = {"User-Agent": "Mozilla/5.0"}
+        items = []
+        chunk = 1
+        more_chunks = True
+        while more_chunks:
+            params = {
+                "folder_key": folder_key,
+                "content_type": content_type,
+                "filter": "all",
+                "response_format": "json",
+                "chunk": chunk,
+            }
+            response = requests.get(
+                "https://www.mediafire.com/api/1.5/folder/get_content.php",
+                params=params,
+                timeout=30,
+                headers=headers,
+            )
+            response.raise_for_status()
+            data = response.json()
+            content = data.get("response", {}).get("folder_content", {})
+            raw = content.get(content_type)
+            if content_type == "files":
+                items.extend(self.normalize_mediafire_items(raw, "file"))
+            else:
+                items.extend(self.normalize_mediafire_items(raw, "folder"))
+            more_chunks = str(content.get("more_chunks", "")).lower() == "yes"
+            chunk += 1
+        return items
+
     def try_mediafire_folder_html(self, url, base_path):
         html = self.fetch_mediafire_html(url)
         if not html:
@@ -347,7 +368,6 @@ class UniversalDownloader(QWebEngineView):
 
     def handle_mediafire_file_requests(self, url, current_path):
         if self.try_mediafire_file_html(url, current_path):
-            self.proceed_to_next()
             return
         print("❌ No se encontró el enlace de descarga (HTML).")
         self.results.append((None, None))
