@@ -13,12 +13,14 @@ class DownloadSignals(QObject):
     finished = pyqtSignal(int)       # index
 
 class FileDownloader(QRunnable):
-    def __init__(self, url, filename, index, signals):
+    def __init__(self, url, filename, index, signals, headers=None, cookies=None):
         super().__init__()
         self.url = url
         self.filename = filename
         self.index = index
         self.signals = signals
+        self.headers = headers or {}
+        self.cookies = cookies or {}
 
         QThreadPool.globalInstance().setMaxThreadCount(
             load_config().get("max_parallel_downloads", DEFAULT_CONFIG["max_parallel_downloads"])
@@ -29,14 +31,20 @@ class FileDownloader(QRunnable):
             try:
                 downloaded = 0
                 mode = 'wb'
-                headers = {}
+                headers = dict(self.headers)
 
                 if os.path.exists(self.filename):
                     downloaded = os.path.getsize(self.filename)
                     headers['Range'] = f'bytes={downloaded}-'
                     mode = 'ab'
 
-                with requests.get(self.url, stream=True, headers=headers, timeout=15) as r:
+                with requests.get(
+                    self.url,
+                    stream=True,
+                    headers=headers,
+                    cookies=self.cookies,
+                    timeout=15
+                ) as r:
                     total_length = r.headers.get('content-length')
                     if total_length is None:
                         total_length = 0
@@ -254,5 +262,33 @@ class GameSearchWorker(QRunnable):
                 print("[GameSearchWorker] Error procesando resultado:", e)
         print(results)
         self.signals.finished.emit(results)
+
+
+class GDriveSignals(QObject):
+    finished = pyqtSignal(int, str, bool, str)
+
+
+class GDriveDownloader(QRunnable):
+    def __init__(self, url, output_path, index, display_name, is_folder):
+        super().__init__()
+        self.url = url
+        self.output_path = output_path
+        self.index = index
+        self.display_name = display_name
+        self.is_folder = is_folder
+        self.signals = GDriveSignals()
+
+    def run(self):
+        try:
+            from gdrive_handler import gdown_download
+        except Exception as e:
+            self.signals.finished.emit(self.index, self.display_name, False, f"gdown no disponible: {e}")
+            return
+
+        try:
+            gdown_download(self.url, self.output_path, is_folder=self.is_folder)
+            self.signals.finished.emit(self.index, self.display_name, True, "")
+        except Exception as e:
+            self.signals.finished.emit(self.index, self.display_name, False, str(e))
 
 

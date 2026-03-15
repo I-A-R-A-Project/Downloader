@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import QTimer, QThreadPool, QRunnable, pyqtSignal, QObject
 from browser_handler import UniversalDownloader
-from workers import DownloadSignals, FileDownloader
+from workers import DownloadSignals, FileDownloader, GDriveDownloader
 from torrent import TorrentUpdater, add_magnet_link, add_torrent_file, ensure_aria2_running
 from settings_dialog import SettingsDialog, load_config, DEFAULT_CONFIG
 from enum import Enum
@@ -152,37 +152,97 @@ class DownloadWindow(QWidget):
 
     def start_downloads(self, direct_links):
         base_index = len(self.progress_bars)
-        for offset, (relative_path, link) in enumerate(direct_links):
-            index = base_index + offset
-            full_path = os.path.join(self.folder_path, relative_path)
-            if not link:
+        offset = 0
+        for item in direct_links:
+            if isinstance(item, dict):
+                if item.get("type") == "gdrive_gdown":
+                    self.start_gdrive_download(item)
+                elif item.get("type") == "direct":
+                    relative_path = item["path"]
+                    link = item["url"]
+                    headers = item.get("headers")
+                    cookies = item.get("cookies")
+                    index = base_index + offset
+                    offset += 1
+                    self._start_direct_download(relative_path, link, index, headers, cookies)
                 continue
 
-            # Los torrents ya fueron procesados en paralelo, solo manejar archivos regulares
-            if link.startswith("magnet:?") or link.endswith(".torrent"):
-                continue  # Skip torrents, ya fueron procesados
-
-            # Solo procesar descargas regulares
-            dir_path = os.path.dirname(full_path)
-            if dir_path:
-                os.makedirs(dir_path, exist_ok=True)
-
-            label = QLabel(f"Descargando: {relative_path}")
-            bar = QProgressBar()
-            bar.setValue(0)
-            self.inner_layout.addWidget(label)
-            self.inner_layout.addWidget(bar)
-            self.labels.append(label)
-            self.progress_bars.append(bar)
-
-            signals = DownloadSignals()
-            signals.progress.connect(self.update_progress)
-            signals.finished.connect(lambda idx=index: self.mark_finished(idx))
-
-            thread = FileDownloader(link, full_path, index, signals)
-            QThreadPool.globalInstance().start(thread)
+            relative_path, link = item
+            index = base_index + offset
+            offset += 1
+            self._start_direct_download(relative_path, link, index, None, None)
 
         self.show()
+
+    def _start_direct_download(self, relative_path, link, index, headers, cookies):
+        full_path = os.path.join(self.folder_path, relative_path)
+        if not link:
+            return
+
+        # Los torrents ya fueron procesados en paralelo, solo manejar archivos regulares
+        if link.startswith("magnet:?") or link.endswith(".torrent"):
+            return  # Skip torrents, ya fueron procesados
+
+        # Solo procesar descargas regulares
+        dir_path = os.path.dirname(full_path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+
+        label = QLabel(f"Descargando: {relative_path}")
+        bar = QProgressBar()
+        bar.setValue(0)
+        self.inner_layout.addWidget(label)
+        self.inner_layout.addWidget(bar)
+        self.labels.append(label)
+        self.progress_bars.append(bar)
+
+        signals = DownloadSignals()
+        signals.progress.connect(self.update_progress)
+        signals.finished.connect(lambda idx=index: self.mark_finished(idx))
+
+        thread = FileDownloader(link, full_path, index, signals, headers=headers, cookies=cookies)
+        QThreadPool.globalInstance().start(thread)
+
+    def start_gdrive_download(self, item):
+        display_name = item.get("display_name") or "Google Drive"
+        is_folder = bool(item.get("is_folder"))
+        url = item.get("url")
+        path = item.get("path", self.folder_path)
+
+        if not url:
+            return
+
+        base_path = path if os.path.isabs(path) else os.path.join(self.folder_path, path)
+        if base_path:
+            os.makedirs(base_path, exist_ok=True)
+
+        if is_folder:
+            output_path = base_path
+        else:
+            filename = item.get("filename")
+            output_path = os.path.join(base_path, filename) if filename else base_path
+
+        index = len(self.temp_labels)
+        label = QLabel(f"Descargando: {display_name}")
+        bar = QProgressBar()
+        bar.setRange(0, 0)  # Indeterminado
+        self.inner_layout.addWidget(label)
+        self.inner_layout.addWidget(bar)
+        self.temp_labels.append(label)
+        self.temp_progress_bars.append(bar)
+
+        worker = GDriveDownloader(url, output_path, index, display_name, is_folder)
+        worker.signals.finished.connect(self.on_gdrive_finished)
+        QThreadPool.globalInstance().start(worker)
+
+    def on_gdrive_finished(self, index, name, success, message):
+        if success:
+            self.mark_finished(index, DownloadType.TEMPORAL)
+        else:
+            if index < len(self.temp_labels):
+                self.temp_labels[index].setText(f"❌ Error Google Drive: {name}")
+            if message:
+                print(f"❌ Error Google Drive ({name}): {message}")
 
     def load_entries(self, entries):
         if not entries:

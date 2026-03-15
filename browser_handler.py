@@ -2,6 +2,13 @@ import re, os, uuid
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
 from PyQt5.QtCore import QUrl, QTimer, pyqtSignal
 from bs4 import BeautifulSoup
+from gdrive_handler import (
+    gdown_available,
+    parse_gdrive_folder_id,
+    parse_gdrive_file_id,
+    resolve_gdrive_file,
+    resolve_gdrive_folder_zip,
+)
 
 class SilentPage(QWebEnginePage):
     def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
@@ -99,18 +106,73 @@ class UniversalDownloader(QWebEngineView):
         self.proceed_to_next()
 
     def handle_gdrive(self, url, current_path):
-        match = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
-        if match:
-            file_id = match.group(1)
-            direct_link = f"https://drive.usercontent.google.com/download?id={file_id}&export=download"
-            filename = f"{file_id}.bin"
-            full_path = os.path.join(current_path, filename)
-            print(f"✅ Enlace directo (Google Drive): {direct_link}")
-            print(f"💾 Guardar como: {full_path}")
-            self.results.append((full_path, direct_link))
-        else:
-            print("❌ No se pudo extraer el ID del archivo de Google Drive.")
-            self.results.append((None, None))
+        folder_id = parse_gdrive_folder_id(url)
+        file_id = parse_gdrive_file_id(url)
+
+        if folder_id:
+            if gdown_available():
+                print("📁 Google Drive folder detectada. Usando gdown...")
+                self.results.append({
+                    "type": "gdrive_gdown",
+                    "url": url,
+                    "path": current_path,
+                    "is_folder": True,
+                    "display_name": f"Google Drive folder {folder_id}",
+                })
+            else:
+                print("📁 Google Drive folder detectada. Intentando descarga ZIP...")
+                resolved = resolve_gdrive_folder_zip(url)
+                if resolved:
+                    full_path = os.path.join(current_path, resolved["filename"])
+                    print(f"✅ Enlace directo (Google Drive ZIP): {resolved['download_url']}")
+                    print(f"💾 Guardar como: {full_path}")
+                    self.results.append({
+                        "type": "direct",
+                        "path": full_path,
+                        "url": resolved["download_url"],
+                        "headers": resolved["headers"],
+                        "cookies": resolved["cookies"],
+                    })
+                else:
+                    print("❌ No se pudo resolver la carpeta de Google Drive.")
+                    self.results.append((None, None))
+
+            self.proceed_to_next()
+            return
+
+        if file_id:
+            if gdown_available():
+                print("📄 Google Drive archivo detectado. Usando gdown...")
+                self.results.append({
+                    "type": "gdrive_gdown",
+                    "url": url,
+                    "path": current_path,
+                    "is_folder": False,
+                    "display_name": f"Google Drive file {file_id}",
+                    "file_id": file_id,
+                })
+            else:
+                resolved = resolve_gdrive_file(url)
+                if resolved:
+                    full_path = os.path.join(current_path, resolved["filename"])
+                    print(f"✅ Enlace directo (Google Drive): {resolved['download_url']}")
+                    print(f"💾 Guardar como: {full_path}")
+                    self.results.append({
+                        "type": "direct",
+                        "path": full_path,
+                        "url": resolved["download_url"],
+                        "headers": resolved["headers"],
+                        "cookies": resolved["cookies"],
+                    })
+                else:
+                    print("❌ No se pudo resolver el archivo de Google Drive.")
+                    self.results.append((None, None))
+
+            self.proceed_to_next()
+            return
+
+        print("❌ No se pudo extraer el ID del archivo de Google Drive.")
+        self.results.append((None, None))
         self.proceed_to_next()
 
     def handle_mediafire(self, url, path):
