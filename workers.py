@@ -317,6 +317,26 @@ class FactorioInfoWorker(QRunnable):
         except Exception as e:
             self.signals.finished.emit(self.mod_id, {}, str(e))
 
+class DependencyResolveSignals(QObject):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(list)
+
+class DependencyResolveWorker(QRunnable):
+    def __init__(self, window, dependencies, visited):
+        super().__init__()
+        self.window = window
+        self.dependencies = dependencies
+        self.visited = visited
+        self.signals = DependencyResolveSignals()
+
+    def run(self):
+        items = self.window.resolve_dependencies(
+            self.dependencies,
+            visited=self.visited,
+            progress_cb=self.signals.progress.emit
+        )
+        self.signals.finished.emit(items)
+
 def parse_page_bar(soup):
     total = None
     current_page = None

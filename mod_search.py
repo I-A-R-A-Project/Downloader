@@ -1,4 +1,4 @@
-import argparse, random, sys, subprocess, requests, re
+import argparse, random, sys, subprocess, requests, re, json, tempfile
 from PyQt5.QtCore import Qt, QThreadPool, QSize
 from PyQt5.QtGui import QMovie
 from PyQt5.QtWidgets import (
@@ -6,7 +6,15 @@ from PyQt5.QtWidgets import (
     QLineEdit, QListWidget, QListWidgetItem, QPushButton, QComboBox,
     QTextEdit, QMessageBox, QStackedLayout, QDialog, QDialogButtonBox
 )
-from workers import ImageLoaderWorker, FactorioSearchWorker, FactorioInfoWorker, MODINFO_URL
+from settings_dialog import load_config, DEFAULT_CONFIG
+from mod_paths_dialog import ModPathsDialog, DEFAULT_MOD_PATHS
+from workers import (
+    ImageLoaderWorker,
+    FactorioSearchWorker,
+    FactorioInfoWorker,
+    DependencyResolveWorker,
+    MODINFO_URL,
+)
 
 
 SPINNER_PATH = "spinner.gif"
@@ -27,16 +35,16 @@ class FactorioCartDialog(QDialog):
             title = item.get("title") or "Sin título"
             self.list_widget.addItem(QListWidgetItem(title))
         layout.addWidget(self.list_widget)
-        controls = QHBoxLayout()
-        self.remove_button = QPushButton("Quitar seleccionado")
-        self.remove_button.clicked.connect(self.remove_selected)
-        controls.addWidget(self.remove_button)
-        controls.addStretch(1)
-        layout.addLayout(controls)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        buttons_row = QHBoxLayout()
+        self.remove_button = QPushButton("Quitar seleccionado")
+        self.remove_button.clicked.connect(self.remove_selected)
+        buttons_row.addWidget(self.remove_button)
+        buttons_row.addStretch(1)
+        buttons_row.addWidget(buttons)
+        layout.addLayout(buttons_row)
 
     def remove_selected(self):
         row = self.list_widget.currentRow()
@@ -80,6 +88,9 @@ class ModSearchWindow(QWidget):
         top_row.addWidget(QLabel("Listado:"))
         top_row.addWidget(self.mode_combo)
         top_row.addStretch(1)
+        self.settings_button = QPushButton("Carpetas de Mods ⚙")
+        self.settings_button.clicked.connect(self.open_settings_dialog)
+        top_row.addWidget(self.settings_button)
         layout.addLayout(top_row)
 
         search_row = QHBoxLayout()
@@ -276,22 +287,22 @@ class ModSearchWindow(QWidget):
         version = latest.get("version")
         if not version:
             return
-        added = []
-        main_item = self.build_cart_item(mod_id, version)
-        if main_item:
-            added.append(main_item)
+        added = self.add_cart_items([self.build_cart_item_data(mod_id, version)])
+        if added:
+            self.update_cart_button()
+            self.status_label.setText(f"Agregado: {added[0]['title']}")
+        else:
+            self.status_label.setText("Este mod ya está en el carrito.")
 
         deps = self.get_release_dependencies(latest)
-        dep_items = self.resolve_dependencies(deps, visited={mod_id})
-        added.extend(dep_items)
-
-        if not added:
-            QMessageBox.information(self, "Carrito", "Este mod ya está en el carrito.")
+        if not deps:
             return
 
-        self.update_cart_button()
-        summary = "\n".join(f"- {item['title']}" for item in added)
-        QMessageBox.information(self, "Carrito", f"Agregado:\n{summary}")
+        self.status_label.setText("Resolviendo dependencias...")
+        worker = DependencyResolveWorker(self, deps, visited={mod_id})
+        worker.signals.progress.connect(self.status_label.setText)
+        worker.signals.finished.connect(self.on_dependencies_resolved)
+        self.thread_pool.start(worker)
 
     def update_status_label(self):
         total = self.total_found
@@ -474,25 +485,33 @@ class ModSearchWindow(QWidget):
         deps = info_json.get("dependencies") or []
         return [d for d in deps if isinstance(d, str)]
 
-    def build_cart_item(self, mod_id, version):
+    def build_cart_item_data(self, mod_id, version):
         anticache = random.random()
         download_url = f"{DOWNLOAD_BASE}/{mod_id}/{version}.zip?anticache={anticache:.18f}"
         title = f"{mod_id}_{version}.zip"
-        if any(
-            item.get("mod_id") == mod_id and item.get("version") == version
-            for item in self.cart_items
-        ):
-            return None
-        item = {
+        return {
             "title": title,
             "url": download_url,
             "mod_id": mod_id,
             "version": version,
         }
-        self.cart_items.append(item)
-        return item
 
-    def resolve_dependencies(self, dependencies, visited=None):
+    def add_cart_items(self, items):
+        added = []
+        for item in items:
+            if not item:
+                continue
+            if any(
+                existing.get("mod_id") == item.get("mod_id")
+                and existing.get("version") == item.get("version")
+                for existing in self.cart_items
+            ):
+                continue
+            self.cart_items.append(item)
+            added.append(item)
+        return added
+
+    def resolve_dependencies(self, dependencies, visited=None, progress_cb=None):
         if visited is None:
             visited = set()
         resolved = []
@@ -503,6 +522,8 @@ class ModSearchWindow(QWidget):
             if dep_name in visited:
                 continue
             visited.add(dep_name)
+            if progress_cb:
+                progress_cb(f"Resolviendo dependencia: {dep_name}")
             info = self.fetch_modinfo(dep_name)
             if not info:
                 continue
@@ -512,12 +533,10 @@ class ModSearchWindow(QWidget):
             version = release.get("version")
             if not version:
                 continue
-            item = self.build_cart_item(dep_name, version)
-            if item:
-                resolved.append(item)
+            resolved.append(self.build_cart_item_data(dep_name, version))
             nested_deps = self.get_release_dependencies(release)
             if nested_deps:
-                resolved.extend(self.resolve_dependencies(nested_deps, visited))
+                resolved.extend(self.resolve_dependencies(nested_deps, visited, progress_cb))
         return resolved
 
     def parse_dependency(self, dep):
@@ -626,10 +645,32 @@ class ModSearchWindow(QWidget):
         urls = [item["url"] for item in self.cart_items if item.get("url")]
         if not urls:
             return
-        subprocess.Popen(["python", "download_manager.py"] + urls)
+        config = load_config()
+        mods_path = (
+            config.get("factorio_mods_path")
+            or config.get("mods_folder_path")
+            or DEFAULT_MOD_PATHS["factorio_mods_path"]
+        )
+        entries = [{"url": url, "path": mods_path} for url in urls]
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json", encoding="utf-8") as f:
+            json.dump(entries, f, indent=2)
+            json_path = f.name
+        subprocess.Popen(["python", "download_manager.py", json_path])
         self.cart_items = []
         self.update_cart_button()
 
+    def open_settings_dialog(self):
+        dialog = ModPathsDialog(self)
+        dialog.exec_()
+
+    def on_dependencies_resolved(self, items):
+        added = self.add_cart_items(items)
+        if added:
+            self.update_cart_button()
+            count = len(added)
+            self.status_label.setText(f"Dependencias agregadas: {count}")
+        else:
+            self.status_label.setText("Dependencias ya estaban en el carrito.")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -640,7 +681,6 @@ def main():
     window = ModSearchWindow(game=args.game)
     window.show()
     sys.exit(app.exec_())
-
 
 if __name__ == "__main__":
     main()
