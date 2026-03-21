@@ -392,6 +392,9 @@ class MediaSearchUI(QWidget):
         self.download_button = QPushButton("Descargar")
         self.download_button.clicked.connect(self.download_item)
         self.download_button.setEnabled(False)
+        self.mods_button = QPushButton("Ver mods")
+        self.mods_button.clicked.connect(self.open_mods)
+        self.mods_button.setEnabled(False)
         self.spinner_details = QLabel()
         self.spinner_details.setMovie(self.spinner_movie)
         self.spinner_details.setFixedSize(24, 24)
@@ -399,6 +402,7 @@ class MediaSearchUI(QWidget):
         self.spinner_details.setVisible(False)
         buttons.addWidget(self.trailer_button)
         buttons.addWidget(self.download_button)
+        buttons.addWidget(self.mods_button)
         buttons.addWidget(self.spinner_details)
 
         details_center = QVBoxLayout()
@@ -440,6 +444,7 @@ class MediaSearchUI(QWidget):
         self.details.clear()
         self.image_label.clear()
         self.download_button.setEnabled(False)
+        self.mods_button.setEnabled(False)
 
         if not term:
             return
@@ -536,6 +541,7 @@ class MediaSearchUI(QWidget):
                 self.current_item.data(Qt.UserRole)["trailer"] = trailer
             self.download_button.setEnabled(True)
             self.download_button.setText("Descargar")
+            self.mods_button.setEnabled(False)
 
         if source == "RAWG":
             self.labels_info[0].setText(f"<b>Plataformas:<br>{', '.join(data.get('platforms', []))}</b>")
@@ -543,12 +549,12 @@ class MediaSearchUI(QWidget):
             self.labels_info[2].setText(f"<b>Fecha lanzamiento:<br>{data.get('released', 'N/A')}</b>")
             self.labels_info[3].setText(f"<b>Rating:<br>{data.get('rating', 'N/A')}</b>")
 
-            if "Factorio" in data["title"]:
-                self.download_button.setText("Ver mods")
-                self.download_button.setEnabled(True)
+            self.download_button.setText("Descargar (próximamente)")
+            self.download_button.setEnabled(False)
+            if "Factorio" in data.get("title", ""):
+                self.mods_button.setEnabled(True)
             else:
-                self.download_button.setText("Descargar (próximamente)")
-                self.download_button.setEnabled(False)
+                self.mods_button.setEnabled(False)
 
     def set_detail_image(self, url, pixmap):
         if url==self.current_item.data(Qt.UserRole)["image"]:
@@ -627,6 +633,17 @@ class MediaSearchUI(QWidget):
             worker = SiteSearchWorker(name, func, title)
             worker.signals.result_ready.connect(update_results)
             pool.start(worker)
+
+    def open_mods(self):
+        if not self.current_item:
+            return
+        data = self.current_item.data(Qt.UserRole) or {}
+        if data.get("source") != "RAWG":
+            return
+        title = data.get("title", "")
+        if "Factorio" not in title:
+            return
+        subprocess.Popen(["python", "mod_search.py", "--game", "factorio"])
 
     def update_download_label(self):
         summary = []
