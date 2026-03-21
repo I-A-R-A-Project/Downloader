@@ -1,21 +1,25 @@
 import argparse
+import os
+import random
 import re
 import sys
 import requests
 from bs4 import BeautifulSoup
-from PyQt5.QtCore import Qt, QThreadPool, QRunnable, pyqtSignal, QObject, QUrl, QSize
+from PyQt5.QtCore import Qt, QThreadPool, QRunnable, pyqtSignal, QObject, QSize
 from PyQt5.QtGui import QPixmap, QImage, QMovie
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QPushButton, QComboBox,
     QTextEdit, QDialog, QMessageBox, QStackedLayout
 )
-from PyQt5.QtWebEngineWidgets import QWebEngineView
+from settings_dialog import load_config, DEFAULT_CONFIG
 
 
 FACTORIO_BASE = "https://mods.factorio.com"
 RE146_BASE = "https://re146.dev/factorio/mods/en#"
 SPINNER_PATH = "spinner.gif"
+MODINFO_URL = "https://re146.dev/factorio/mods/modinfo"
+DOWNLOAD_BASE = "https://mods-storage.re146.dev"
 
 
 class ModSearchSignals(QObject):
@@ -68,6 +72,53 @@ class ImageLoaderWorker(QRunnable):
             self.signals.finished.emit(self.url, QPixmap())
 
 
+class ModInfoSignals(QObject):
+    finished = pyqtSignal(str, dict, str)  # mod_id, data, error
+
+
+class ModInfoWorker(QRunnable):
+    def __init__(self, mod_id):
+        super().__init__()
+        self.mod_id = mod_id
+        self.signals = ModInfoSignals()
+
+    def run(self):
+        try:
+            rand = random.random()
+            params = {"rand": f"{rand:.18f}", "id": self.mod_id}
+            resp = requests.get(MODINFO_URL, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            self.signals.finished.emit(self.mod_id, data, "")
+        except Exception as e:
+            self.signals.finished.emit(self.mod_id, {}, str(e))
+
+
+class DownloadSignals(QObject):
+    finished = pyqtSignal(bool, str)  # ok, message
+
+
+class DownloadWorker(QRunnable):
+    def __init__(self, url, output_path):
+        super().__init__()
+        self.url = url
+        self.output_path = output_path
+        self.signals = DownloadSignals()
+
+    def run(self):
+        try:
+            resp = requests.get(self.url, stream=True, timeout=20)
+            resp.raise_for_status()
+            os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+            with open(self.output_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            self.signals.finished.emit(True, self.output_path)
+        except Exception as e:
+            self.signals.finished.emit(False, str(e))
+
+
 def parse_page_bar(soup):
     total = None
     current_page = None
@@ -117,7 +168,9 @@ def parse_mod_list(html):
         href = (name_tag.get("href") or "").split("#")[0]
         if not href.startswith("/mod/"):
             continue
-        mod_url = f"{FACTORIO_BASE}{href}"
+        clean_href = href.split("?")[0]
+        mod_url = f"{FACTORIO_BASE}{clean_href}"
+        mod_id = clean_href.split("/mod/")[-1].strip("/")
         if mod_url in seen:
             continue
         seen.add(mod_url)
@@ -168,6 +221,7 @@ def parse_mod_list(html):
         items.append({
             "name": name,
             "url": mod_url,
+            "id": mod_id,
             "author": author,
             "author_url": author_url,
             "description": description,
@@ -189,18 +243,6 @@ def parse_mod_list(html):
     }
 
 
-class ModWebView(QDialog):
-    def __init__(self, url, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Descargar mod (re146)")
-        self.resize(900, 650)
-        layout = QVBoxLayout()
-        self.web_view = QWebEngineView()
-        self.web_view.setUrl(QUrl(url))
-        layout.addWidget(self.web_view)
-        self.setLayout(layout)
-
-
 class ModSearchWindow(QWidget):
     def __init__(self, game="factorio"):
         super().__init__()
@@ -219,6 +261,10 @@ class ModSearchWindow(QWidget):
         self.image_cache = {}
         self.current_thumb_url = ""
         self.auto_prefetch_done = False
+        self.preload_queue = []
+        self.preload_inflight = False
+        self.modinfo_cache = {}
+        self.current_mod_id = ""
 
         layout = QVBoxLayout()
 
@@ -326,6 +372,8 @@ class ModSearchWindow(QWidget):
         self.results = []
         self.pending_load = False
         self.auto_prefetch_done = False
+        self.preload_queue = []
+        self.preload_inflight = False
         self.results_list.clear()
         self.clear_details()
         self.set_loading(True, f"Cargando listado: {mode}...")
@@ -344,6 +392,8 @@ class ModSearchWindow(QWidget):
         self.results = []
         self.pending_load = False
         self.auto_prefetch_done = False
+        self.preload_queue = []
+        self.preload_inflight = False
         self.results_list.clear()
         self.clear_details()
         self.set_loading(True, f"Buscando: {query}...")
@@ -373,10 +423,14 @@ class ModSearchWindow(QWidget):
         self.update_status_label()
         for item in items:
             self.add_result_item(item)
+        if self.results_list.count() > 0:
+            self.results_list.setCurrentRow(0)
+        self.start_preload_thumbnails()
         self.prefetch_second_page()
 
     def show_details(self, item):
         data = item.data(Qt.UserRole) or {}
+        self.current_mod_id = data.get("id", "")
         self.name_label.setText(f"<b>Nombre:</b> {data.get('name','')}")
         author = data.get("author", "")
         self.author_label.setText(f"<b>Autor:</b> {author}")
@@ -394,19 +448,35 @@ class ModSearchWindow(QWidget):
         self.downloads_label.setText(f"<b>Descargas:</b> {downloads}")
         self.details.setPlainText(data.get("description", ""))
         self.set_thumbnail(data.get("thumbnail", ""))
-        self.open_button.setEnabled(bool(data.get("url")))
+        self.open_button.setEnabled(False)
+        self.load_modinfo(data.get("id"))
 
     def open_re146(self):
         item = self.results_list.currentItem()
         if not item:
             return
         data = item.data(Qt.UserRole) or {}
-        mod_url = data.get("url")
-        if not mod_url:
+        mod_id = data.get("id")
+        if not mod_id:
             return
-        re146_url = f"{RE146_BASE}{mod_url}"
-        self.web_dialog = ModWebView(re146_url, self)
-        self.web_dialog.show()
+        info = self.modinfo_cache.get(mod_id)
+        if not info:
+            return
+        latest = self.get_latest_release(info)
+        if not latest:
+            return
+        version = latest.get("version")
+        if not version:
+            return
+        anticache = random.random()
+        download_url = f"{DOWNLOAD_BASE}/{mod_id}/{version}.zip?anticache={anticache:.18f}"
+        filename = f"{mod_id}_{version}.zip"
+        folder = load_config().get("folder_path", DEFAULT_CONFIG["folder_path"])
+        output_path = os.path.join(folder, filename)
+        self.open_button.setEnabled(False)
+        worker = DownloadWorker(download_url, output_path)
+        worker.signals.finished.connect(self.on_download_finished)
+        self.thread_pool.start(worker)
 
     def update_status_label(self):
         total = self.total_found
@@ -420,6 +490,9 @@ class ModSearchWindow(QWidget):
         lw_item = QListWidgetItem(item["name"])
         lw_item.setData(Qt.UserRole, item)
         self.results_list.addItem(lw_item)
+        thumb = item.get("thumbnail")
+        if thumb and thumb not in self.image_cache:
+            self.preload_queue.append(thumb)
 
     def clear_details(self):
         self.thumb_label.clear()
@@ -510,6 +583,7 @@ class ModSearchWindow(QWidget):
             self.results.append(item)
             self.add_result_item(item)
         self.update_status_label()
+        self.start_preload_thumbnails()
 
     def on_current_item_changed(self, current, _previous):
         if current:
@@ -522,6 +596,70 @@ class ModSearchWindow(QWidget):
             return
         self.auto_prefetch_done = True
         self.load_next_page()
+
+    def start_preload_thumbnails(self):
+        if self.preload_inflight:
+            return
+        while self.preload_queue:
+            url = self.preload_queue.pop(0)
+            if url in self.image_cache:
+                continue
+            self.preload_inflight = True
+            worker = ImageLoaderWorker(url)
+            worker.signals.finished.connect(self.on_preload_image_ready)
+            self.thread_pool.start(worker)
+            break
+
+    def on_preload_image_ready(self, url, pixmap):
+        self.preload_inflight = False
+        if not pixmap.isNull():
+            scaled = pixmap.scaled(
+                self.thumb_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            self.image_cache[url] = scaled
+        self.start_preload_thumbnails()
+
+    def load_modinfo(self, mod_id):
+        if not mod_id:
+            return
+        if mod_id in self.modinfo_cache:
+            self.apply_modinfo(mod_id, self.modinfo_cache[mod_id])
+            return
+        worker = ModInfoWorker(mod_id)
+        worker.signals.finished.connect(self.on_modinfo_ready)
+        self.thread_pool.start(worker)
+
+    def on_modinfo_ready(self, mod_id, data, error):
+        if error:
+            if mod_id == self.current_mod_id:
+                self.details.setPlainText("No se pudo cargar la descripción.")
+            return
+        if not data:
+            return
+        self.modinfo_cache[mod_id] = data
+        if mod_id == self.current_mod_id:
+            self.apply_modinfo(mod_id, data)
+
+    def apply_modinfo(self, mod_id, data):
+        description = data.get("description") or ""
+        self.details.setPlainText(description.strip() or "Sin descripción.")
+        latest = self.get_latest_release(data)
+        self.open_button.setEnabled(bool(latest))
+
+    def get_latest_release(self, data):
+        releases = data.get("releases") or []
+        if not releases:
+            return None
+        def key_fn(r):
+            return r.get("released_at") or ""
+        return max(releases, key=key_fn)
+
+    def on_download_finished(self, ok, message):
+        if ok:
+            QMessageBox.information(self, "Descarga completa", f"Guardado en:\n{message}")
+        else:
+            QMessageBox.warning(self, "Error", f"No se pudo descargar.\n{message}")
+        self.open_button.setEnabled(True)
 
 
 def main():
