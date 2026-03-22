@@ -1,7 +1,7 @@
 import os
 from PyQt5.QtWidgets import (
     QLineEdit, QFormLayout, QDialogButtonBox, QFileDialog, 
-    QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
     QPushButton, QHBoxLayout, QProgressBar, QDialog, QTextEdit
 )
 from PyQt5.QtCore import QTimer, QThreadPool, QRunnable, pyqtSignal, QObject
@@ -89,6 +89,7 @@ class DownloadWindow(QWidget):
         self.downloaders = []
         self._aria2_checked = False
         self._empty_state_container = None
+        self._closing = False
 
         self.scroll = QScrollArea(self)
         self.scroll.setWidgetResizable(True)
@@ -104,7 +105,6 @@ class DownloadWindow(QWidget):
         self.completed_torrents = set()
         self.torrent_timer = QTimer()
         self.torrent_timer.timeout.connect(self.start_torrent_update)
-        self.torrent_timer.start(3000)
 
         self.progress_bars = []
         self.labels = []
@@ -136,11 +136,14 @@ class DownloadWindow(QWidget):
             pass
             
     def process_torrents_parallel(self, torrents=None):
+        if self._closing:
+            return
         target = torrents or self.torrent_urls
         if not target:
             return
             
         print(f"⚡ Procesando {len(target)} torrents en paralelo...")
+        self.ensure_torrent_timer_running()
         
         # Crear un procesador de torrents en un hilo separado
         processor = TorrentProcessor(target, self.folder_path)
@@ -151,6 +154,8 @@ class DownloadWindow(QWidget):
         print("✅ Todos los torrents han sido agregados a Aria2")
 
     def start_downloads(self, direct_links):
+        if self._closing:
+            return
         base_index = len(self.progress_bars)
         offset = 0
         for item in direct_links:
@@ -210,6 +215,8 @@ class DownloadWindow(QWidget):
         QThreadPool.globalInstance().start(thread)
 
     def load_entries(self, entries):
+        if self._closing:
+            return
         if not entries:
             return
         new_torrents = []
@@ -235,6 +242,10 @@ class DownloadWindow(QWidget):
             downloader.direct_links_ready.connect(self.start_downloads)
             self.downloaders.append(downloader)
             downloader.start()
+
+    def ensure_torrent_timer_running(self):
+        if not self.torrent_timer.isActive():
+            self.torrent_timer.start(3000)
 
     def show_empty_state(self):
         container = QWidget()
@@ -269,12 +280,16 @@ class DownloadWindow(QWidget):
             self.folder_path, self.open_on_finish, self.max_parallel_downloads = apply_settings()
 
     def start_torrent_update(self):
+        if self._closing:
+            return
         updater = TorrentUpdater()
         updater.signals.result.connect(self.on_torrent_data_received)
         updater.signals.error.connect(self.on_torrent_update_error)
         QThreadPool.globalInstance().start(updater)
 
     def on_torrent_update_error(self, message):
+        if self._closing:
+            return
         # Manejar errores específicos de Aria2
         if "No se pudo conectar a Aria2" in message:
             print("⚠️ Aria2 no está disponible - reintentando inicio...")
@@ -316,6 +331,8 @@ class DownloadWindow(QWidget):
         return False
 
     def on_torrent_data_received(self, torrents):
+        if self._closing:
+            return
         for t in torrents:
             # Mapear estados de Aria2 - omitir descargas pausadas o en cola
             if t.state in ("pausedDL", "pausedUP", "checkingUP", "checkingDL", "queuedDL", "waiting", "paused"):
@@ -439,6 +456,36 @@ class DownloadWindow(QWidget):
         if download_type == DownloadType.TEMPORAL:
             self.inner_layout.removeWidget(lb)
             lb.deleteLater()
+
+    def closeEvent(self, event):
+        self._closing = True
+        if self.torrent_timer.isActive():
+            self.torrent_timer.stop()
+
+        for downloader in list(self.downloaders):
+            try:
+                downloader.direct_links_ready.disconnect(self.start_downloads)
+            except Exception:
+                pass
+            try:
+                downloader.close()
+                downloader.deleteLater()
+            except Exception:
+                pass
+        self.downloaders.clear()
+
+        if hasattr(self, "_link_input") and self._link_input:
+            try:
+                self._link_input.close()
+            except Exception:
+                pass
+
+        QThreadPool.globalInstance().clear()
+        event.accept()
+
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
 class DownloadDetailsDialog(QDialog):
     def __init__(self, urls, parent=None):

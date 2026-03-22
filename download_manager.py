@@ -48,7 +48,7 @@ def check_aria2_availability():
 if __name__ == '__main__':
     os.system("title Descargas")
     app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)
+    app.setQuitOnLastWindowClosed(True)
     
     # Verificar disponibilidad de Aria2
     check_aria2_availability()
