@@ -3,6 +3,7 @@ import re
 import traceback
 import uuid
 from urllib.parse import urlparse
+import requests
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineProfile
 from PyQt5.QtCore import QUrl, QTimer, pyqtSignal, Qt
 from bs4 import BeautifulSoup
@@ -98,6 +99,9 @@ class UniversalDownloader(QWebEngineView):
             self.close()
             return
         url, path = self.urls[self.current_index]
+        if self.is_direct_file_url(url):
+            self.handle_direct_file(url, path)
+            return
         # Evitar cargar páginas de archivos MediaFire con WebEngine (causan crash)
         if "mediafire.com" in url and ("/file/" in url or "/download/" in url):
             self.handle_mediafire_file_requests(url, path)
@@ -118,6 +122,8 @@ class UniversalDownloader(QWebEngineView):
                 self.page().toHtml(lambda html: self.handle_4shared(html, path))
             elif "drive.google.com" in url:
                 self.handle_gdrive(url, path)
+            elif self.is_direct_file_url(url):
+                self.handle_direct_file(url, path)
             else:
                 print("❌ Sitio no soportado.")
                 self.results.append((None, None))
@@ -567,3 +573,68 @@ class UniversalDownloader(QWebEngineView):
         print("❌ No se encontró el enlace de descarga (HTML).")
         self.results.append((None, None))
         self.proceed_to_next()
+
+    def is_direct_file_url(self, url):
+        parsed = urlparse(url)
+        path = parsed.path or ""
+        ext = os.path.splitext(path)[1].lower()
+        direct_exts = {
+            ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
+            ".iso", ".exe", ".msi", ".apk", ".pdf", ".cbz", ".cbr"
+        }
+        return ext in direct_exts
+
+    def handle_direct_file(self, url, current_path):
+        filename = self.resolve_direct_filename(url)
+        full_path = os.path.join(current_path, filename)
+        print(f"✅ Enlace directo detectado: {url}")
+        print(f"💾 Guardar como: {full_path}")
+        self.results.append((full_path, url))
+        self.proceed_to_next()
+
+    def resolve_direct_filename(self, url):
+        headers = {"User-Agent": "Mozilla/5.0"}
+        final_url = url
+        filename = None
+
+        try:
+            response = requests.head(url, allow_redirects=True, timeout=15, headers=headers)
+            final_url = response.url or url
+            filename = self.extract_filename_from_headers(response.headers)
+        except Exception:
+            pass
+
+        if not filename:
+            try:
+                response = requests.get(url, stream=True, allow_redirects=True, timeout=15, headers=headers)
+                final_url = response.url or final_url
+                filename = self.extract_filename_from_headers(response.headers)
+                response.close()
+            except Exception:
+                pass
+
+        if not filename:
+            filename = os.path.basename(urlparse(final_url).path)
+
+        if not filename:
+            filename = "archivo_descargado"
+
+        return filename
+
+    def extract_filename_from_headers(self, headers):
+        content_disposition = headers.get("Content-Disposition") or headers.get("content-disposition") or ""
+        if not content_disposition:
+            return None
+
+        filename = None
+        filename_star = re.search(r"filename\*=(?:UTF-8''|)([^;]+)", content_disposition, re.IGNORECASE)
+        if filename_star:
+            filename = filename_star.group(1).strip().strip('"').strip("'")
+        else:
+            filename_match = re.search(r'filename="?([^";]+)"?', content_disposition, re.IGNORECASE)
+            if filename_match:
+                filename = filename_match.group(1).strip()
+
+        if filename:
+            filename = os.path.basename(filename)
+        return filename or None

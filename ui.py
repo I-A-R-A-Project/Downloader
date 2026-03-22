@@ -2,7 +2,7 @@ import os
 from PyQt5.QtWidgets import (
     QLineEdit, QFormLayout, QDialogButtonBox, QFileDialog, 
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
-    QPushButton, QHBoxLayout, QProgressBar, QDialog, QTextEdit
+    QPushButton, QHBoxLayout, QProgressBar, QDialog, QTextEdit, QMessageBox
 )
 from PyQt5.QtCore import QTimer, QThreadPool, QRunnable, pyqtSignal, QObject
 from browser_handler import UniversalDownloader
@@ -87,6 +87,7 @@ class DownloadWindow(QWidget):
         self.torrent_urls = []
         self.regular_entries = []
         self.downloaders = []
+        self.active_file_downloads = {}
         self._aria2_checked = False
         self._empty_state_container = None
         self._closing = False
@@ -204,14 +205,12 @@ class DownloadWindow(QWidget):
         signals = DownloadSignals()
         signals.progress.connect(self.update_progress)
         if on_finished:
-            def _done(idx=index):
-                self.mark_finished(idx)
-                on_finished()
-            signals.finished.connect(_done)
+            signals.finished.connect(lambda idx=index, cb=on_finished: self.on_direct_download_finished(idx, cb))
         else:
-            signals.finished.connect(lambda idx=index: self.mark_finished(idx))
+            signals.finished.connect(lambda idx=index: self.on_direct_download_finished(idx))
 
         thread = FileDownloader(link, full_path, index, signals, headers=headers, cookies=cookies)
+        self.active_file_downloads[index] = thread
         QThreadPool.globalInstance().start(thread)
 
     def load_entries(self, entries):
@@ -246,6 +245,14 @@ class DownloadWindow(QWidget):
     def ensure_torrent_timer_running(self):
         if not self.torrent_timer.isActive():
             self.torrent_timer.start(3000)
+
+    def on_direct_download_finished(self, index, on_finished=None):
+        self.active_file_downloads.pop(index, None)
+        if on_finished:
+            self.mark_finished(index)
+            on_finished()
+            return
+        self.mark_finished(index)
 
     def show_empty_state(self):
         container = QWidget()
@@ -457,10 +464,60 @@ class DownloadWindow(QWidget):
             self.inner_layout.removeWidget(lb)
             lb.deleteLater()
 
-    def closeEvent(self, event):
+    def has_active_work(self):
+        if self.active_file_downloads:
+            return True
+
+        if any(label.text().startswith("Descargando:") for label in self.labels):
+            return True
+
+        if any(label.text().startswith("Descargando torrent:") for label in self.torrent_labels):
+            return True
+
+        if any(not completed for _, _, completed in self.torrent_hashes.values()):
+            return True
+
+        for downloader in self.downloaders:
+            if downloader is None:
+                continue
+            if getattr(downloader, "_gdrive_waiting_download", False):
+                return True
+            current_index = getattr(downloader, "current_index", 0)
+            urls = getattr(downloader, "urls", [])
+            if current_index < len(urls):
+                return True
+            try:
+                if downloader.isVisible():
+                    return True
+            except RuntimeError:
+                continue
+
+        return False
+
+    def confirm_close_if_needed(self):
+        if not self.has_active_work():
+            return True
+
+        answer = QMessageBox.question(
+            self,
+            "Cerrar descargas",
+            "Hay descargas en curso. Si cerras ahora, se cancelara el trabajo activo.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return answer == QMessageBox.Yes
+
+    def shutdown_app(self):
         self._closing = True
         if self.torrent_timer.isActive():
             self.torrent_timer.stop()
+
+        for downloader in list(self.active_file_downloads.values()):
+            try:
+                downloader.cancel()
+            except Exception:
+                pass
+        self.active_file_downloads.clear()
 
         for downloader in list(self.downloaders):
             try:
@@ -481,6 +538,13 @@ class DownloadWindow(QWidget):
                 pass
 
         QThreadPool.globalInstance().clear()
+
+    def closeEvent(self, event):
+        if not self._closing and not self.confirm_close_if_needed():
+            event.ignore()
+            return
+
+        self.shutdown_app()
         event.accept()
 
         app = QApplication.instance()

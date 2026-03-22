@@ -1,8 +1,11 @@
-import os, requests, time
+import os, random, re, requests, time
 from PyQt5.QtCore import QObject, pyqtSignal, QRunnable, QThreadPool, pyqtSlot
 from PyQt5.QtGui import QPixmap, QImage
 from bs4 import BeautifulSoup
 from settings_dialog import load_config, DEFAULT_CONFIG
+
+FACTORIO_BASE = "https://mods.factorio.com"
+MODINFO_URL = "https://re146.dev/factorio/mods/modinfo"
 
 MAX_RETRIES = 100
 RETRY_DELAY = 3
@@ -21,13 +24,19 @@ class FileDownloader(QRunnable):
         self.signals = signals
         self.headers = headers or {}
         self.cookies = cookies or {}
+        self._cancelled = False
 
         QThreadPool.globalInstance().setMaxThreadCount(
             load_config().get("max_parallel_downloads", DEFAULT_CONFIG["max_parallel_downloads"])
         )
 
+    def cancel(self):
+        self._cancelled = True
+
     def run(self):
         for attempt in range(1, MAX_RETRIES + 1):
+            if self._cancelled:
+                return
             try:
                 downloaded = 0
                 mode = 'wb'
@@ -57,6 +66,8 @@ class FileDownloader(QRunnable):
 
                     with open(self.filename, mode) as f:
                         for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                            if self._cancelled:
+                                return
                             if chunk:
                                 f.write(chunk)
                                 downloaded += len(chunk)
@@ -110,8 +121,8 @@ class ImageLoaderWorker(QRunnable):
             image.loadFromData(img_data)
             pixmap = QPixmap.fromImage(image)
             self.signals.finished.emit(self.image_url, pixmap)
-        except:
-            self.signals.finished.emit(None)
+        except Exception:
+            self.signals.finished.emit(self.image_url, QPixmap())
 
 class FullDetailsWorkerSignals(QObject):
     finished = pyqtSignal(str, str, str, str)
@@ -263,6 +274,197 @@ class GameSearchWorker(QRunnable):
         print(results)
         self.signals.finished.emit(results)
 
+class FactorioSearchSignals(QObject):
+    finished = pyqtSignal(object, str)  # payload, error
 
+class FactorioSearchWorker(QRunnable):
+    def __init__(self, mode=None, query=None, page=1):
+        super().__init__()
+        self.mode = mode
+        self.query = query
+        self.params = {
+            "page": page,
+            "factorio_version": 2.0,
+            "show_deprecated": False
+        }
+        self.signals = FactorioSearchSignals()
+
+    def run(self):
+        try:
+            if self.query:
+                url = f"{FACTORIO_BASE}/search"
+                self.params["query"] = self.query
+                params = self.params
+            else:
+                url = f"{FACTORIO_BASE}/browse/{self.mode}"
+                params = self.params
+            resp = requests.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            parsed = parse_mod_list(resp.text)
+            self.signals.finished.emit(parsed, "")
+        except Exception as e:
+            self.signals.finished.emit([], str(e))
+
+class FactorioInfoSignals(QObject):
+    finished = pyqtSignal(str, dict, str)  # mod_id, data, error
+
+class FactorioInfoWorker(QRunnable):
+    def __init__(self, mod_id):
+        super().__init__()
+        self.mod_id = mod_id
+        self.signals = FactorioInfoSignals()
+
+    def run(self):
+        try:
+            rand = random.random()
+            params = {"rand": f"{rand:.18f}", "id": self.mod_id}
+            resp = requests.get(MODINFO_URL, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            self.signals.finished.emit(self.mod_id, data, "")
+        except Exception as e:
+            self.signals.finished.emit(self.mod_id, {}, str(e))
+
+class DependencyResolveSignals(QObject):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(list)
+
+class DependencyResolveWorker(QRunnable):
+    def __init__(self, window, dependencies, visited):
+        super().__init__()
+        self.window = window
+        self.dependencies = dependencies
+        self.visited = visited
+        self.signals = DependencyResolveSignals()
+
+    def run(self):
+        items = self.window.resolve_dependencies(
+            self.dependencies,
+            visited=self.visited,
+            progress_cb=self.signals.progress.emit
+        )
+        self.signals.finished.emit(items)
+
+def parse_page_bar(soup):
+    total = None
+    current_page = None
+    last_page = None
+
+    label = soup.select_one("div.grey")
+    if label:
+        match = re.search(r"Found\s+(\d+)\s+mods", label.get_text(strip=True))
+        if match:
+            total = int(match.group(1))
+
+    for a in soup.select("a.button.square-sm"):
+        href = a.get("href") or ""
+        if "page=" not in href:
+            continue
+        num_match = re.search(r"[?&]page=(\d+)", href)
+        if not num_match:
+            continue
+        page_num = int(num_match.group(1))
+        last_page = max(last_page or page_num, page_num)
+        if "active" in (a.get("class") or []):
+            current_page = page_num
+
+    return {
+        "total": total,
+        "current_page": current_page,
+        "last_page": last_page,
+    }
+
+def parse_mod_list(html):
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
+    seen = set()
+    mod_list = soup.select_one("div.mod-list")
+    if not mod_list:
+        mod_list = soup
+
+    containers = mod_list.select("div.panel-inset-lighter.flex-column.p0")
+    if not containers:
+        containers = mod_list.select("div.panel-inset-lighter")
+
+    for container in containers:
+        name_tag = container.select_one("h2 a.result-field[href^='/mod/']")
+        if not name_tag:
+            continue
+        href = (name_tag.get("href") or "").split("#")[0]
+        if not href.startswith("/mod/"):
+            continue
+        clean_href = href.split("?")[0]
+        mod_url = f"{FACTORIO_BASE}{clean_href}"
+        mod_id = clean_href.split("/mod/")[-1].strip("/")
+        if mod_url in seen:
+            continue
+        seen.add(mod_url)
+        name = name_tag.get_text(strip=True) or "Sin título"
+        author = ""
+        author_url = ""
+        description = ""
+        category = ""
+        updated_text = ""
+        updated_title = ""
+        versions = ""
+        downloads_text = ""
+        downloads_exact = ""
+        thumbnail = ""
+
+        if container:
+            author_tag = container.select_one("a[href^='/user/']")
+            if author_tag:
+                author = author_tag.get_text(strip=True)
+                author_url = f"{FACTORIO_BASE}{author_tag.get('href','')}"
+
+            desc_tag = container.select_one("p.result-field")
+            if desc_tag:
+                description = desc_tag.get_text(" ", strip=True)
+
+            category_tag = container.select_one(".category-label")
+            if category_tag:
+                category = category_tag.get_text(" ", strip=True)
+
+            updated_tag = container.select_one("div[title='Last updated'] span")
+            if updated_tag:
+                updated_text = updated_tag.get_text(strip=True)
+                updated_title = updated_tag.get("title", "")
+
+            versions_tag = container.select_one("div[title='Available for these Factorio versions']")
+            if versions_tag:
+                versions = versions_tag.get_text(" ", strip=True).replace(" ", " ").strip()
+
+            downloads_tag = container.select_one("div[title='Downloads, updated daily'] span")
+            if downloads_tag:
+                downloads_text = downloads_tag.get_text(strip=True)
+                downloads_exact = downloads_tag.get("title", "")
+
+            img_tag = container.select_one("img")
+            if img_tag:
+                thumbnail = img_tag.get("src", "")
+
+        items.append({
+            "name": name,
+            "url": mod_url,
+            "id": mod_id,
+            "author": author,
+            "author_url": author_url,
+            "description": description,
+            "category": category,
+            "updated_text": updated_text,
+            "updated_title": updated_title,
+            "versions": versions,
+            "downloads_text": downloads_text,
+            "downloads_exact": downloads_exact,
+            "thumbnail": thumbnail,
+        })
+
+    page_info = parse_page_bar(soup)
+    return {
+        "items": items,
+        "page": page_info.get("current_page") or 1,
+        "last_page": page_info.get("last_page"),
+        "total": page_info.get("total"),
+    }
 
 
