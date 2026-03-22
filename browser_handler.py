@@ -1,13 +1,15 @@
-import re, os, uuid
-from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
-from PyQt5.QtCore import QUrl, QTimer, pyqtSignal
+import os
+import re
+import traceback
+import uuid
+from urllib.parse import urlparse
+from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineProfile
+from PyQt5.QtCore import QUrl, QTimer, pyqtSignal, Qt
 from bs4 import BeautifulSoup
 from gdrive_handler import (
-    gdown_available,
     parse_gdrive_folder_id,
     parse_gdrive_file_id,
     resolve_gdrive_file,
-    resolve_gdrive_folder_zip,
 )
 
 class SilentPage(QWebEnginePage):
@@ -19,7 +21,17 @@ class UniversalDownloader(QWebEngineView):
 
     def __init__(self, urls):
         super().__init__()
-        self.setPage(SilentPage(self))
+        profile = QWebEngineProfile(f"universal-downloader-{uuid.uuid4().hex[:8]}", self)
+        profile.setPersistentCookiesPolicy(QWebEngineProfile.NoPersistentCookies)
+        profile.setHttpCacheType(QWebEngineProfile.MemoryHttpCache)
+        profile.downloadRequested.connect(self.on_download_requested)
+        cookie_store = profile.cookieStore()
+        cookie_store.cookieAdded.connect(self.on_cookie_added)
+        cookie_store.cookieRemoved.connect(self.on_cookie_removed)
+        cookie_store.loadAllCookies()
+        self.profile = profile
+        self.setPage(SilentPage(profile, self))
+        self.resize(1200, 800)
         self.urls = []
         self.offscreen_results = []
 
@@ -40,9 +52,18 @@ class UniversalDownloader(QWebEngineView):
 
         self.current_index = 0
         self.results = []
+        self._cookies = {}
+        self._gdrive_click_attempts = 0
+        self._gdrive_click_max_attempts = 10
+        self._gdrive_waiting_download = False
+        self._gdrive_folder_id = None
+        self._gdrive_folder_path = ""
 
         self.setWindowTitle("Universal Downloader")
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
         self.loadFinished.connect(self.on_load_finished)
+        self.page().windowCloseRequested.connect(self.on_window_close_requested)
+        self.renderProcessTerminated.connect(self.on_render_process_terminated)
         self._started = False
 
     def start(self):
@@ -54,15 +75,22 @@ class UniversalDownloader(QWebEngineView):
             self.close()
             return
         if self.urls:
-            self.show()
             self.process_current_url()
         else:
             self.close()
 
-    def on_load_finished(self):
-        print(self.urls[self.current_index])
-        print(f"[{self.current_index+1}/{len(self.urls)}] Páginas cargadas...")
-        QTimer.singleShot(1000, self.route_url_handling)
+    def on_load_finished(self, ok=True):
+        try:
+            if self.current_index >= len(self.urls):
+                return
+            print(self.urls[self.current_index])
+            print(f"[{self.current_index+1}/{len(self.urls)}] Páginas cargadas...")
+            if not ok:
+                print("❌ La página no terminó de cargar correctamente.")
+            QTimer.singleShot(1500, self.route_url_handling)
+        except Exception:
+            print("❌ Error en on_load_finished:")
+            print(traceback.format_exc())
 
     def process_current_url(self):
         if not self.urls:
@@ -74,20 +102,29 @@ class UniversalDownloader(QWebEngineView):
         if "mediafire.com" in url and ("/file/" in url or "/download/" in url):
             self.handle_mediafire_file_requests(url, path)
             return
+        self.show()
+        self.raise_()
+        self.activateWindow()
         self.load(QUrl(url))
 
     def route_url_handling(self):
-        url, path = self.urls[self.current_index]
-        if "mediafire.com" in url:
-            self.handle_mediafire(url, path)
-        elif "4shared.com" in url:
-            self.page().toHtml(lambda html: self.handle_4shared(html, path))
-        elif "drive.google.com" in url:
-            self.handle_gdrive(url, path)
-        else:
-            print("❌ Sitio no soportado.")
-            self.results.append(None)
-            self.proceed_to_next()
+        try:
+            if self.current_index >= len(self.urls):
+                return
+            url, path = self.urls[self.current_index]
+            if "mediafire.com" in url:
+                self.handle_mediafire(url, path)
+            elif "4shared.com" in url:
+                self.page().toHtml(lambda html: self.handle_4shared(html, path))
+            elif "drive.google.com" in url:
+                self.handle_gdrive(url, path)
+            else:
+                print("❌ Sitio no soportado.")
+                self.results.append((None, None))
+                self.proceed_to_next()
+        except Exception:
+            print("❌ Error en route_url_handling:")
+            print(traceback.format_exc())
 
     def handle_4shared(self, html, current_path):
         soup = BeautifulSoup(html, "html.parser")
@@ -106,52 +143,20 @@ class UniversalDownloader(QWebEngineView):
         self.proceed_to_next()
 
     def handle_gdrive(self, url, current_path):
-        folder_id = parse_gdrive_folder_id(url)
-        file_id = parse_gdrive_file_id(url)
+        try:
+            folder_id = parse_gdrive_folder_id(url)
+            file_id = parse_gdrive_file_id(url)
 
-        if folder_id:
-            if gdown_available():
-                print("📁 Google Drive folder detectada. Usando gdown...")
-                self.results.append({
-                    "type": "gdrive_gdown",
-                    "url": url,
-                    "path": current_path,
-                    "is_folder": True,
-                    "display_name": f"Google Drive folder {folder_id}",
-                })
-            else:
-                print("📁 Google Drive folder detectada. Intentando descarga ZIP...")
-                resolved = resolve_gdrive_folder_zip(url)
-                if resolved:
-                    full_path = os.path.join(current_path, resolved["filename"])
-                    print(f"✅ Enlace directo (Google Drive ZIP): {resolved['download_url']}")
-                    print(f"💾 Guardar como: {full_path}")
-                    self.results.append({
-                        "type": "direct",
-                        "path": full_path,
-                        "url": resolved["download_url"],
-                        "headers": resolved["headers"],
-                        "cookies": resolved["cookies"],
-                    })
-                else:
-                    print("❌ No se pudo resolver la carpeta de Google Drive.")
-                    self.results.append((None, None))
+            if folder_id:
+                print(f"📁 Google Drive folder detectada: {url}")
+                self._gdrive_click_attempts = 0
+                self._gdrive_waiting_download = True
+                self._gdrive_folder_id = folder_id
+                self._gdrive_folder_path = current_path
+                QTimer.singleShot(3000, self.try_click_gdrive_download_all)
+                return
 
-            self.proceed_to_next()
-            return
-
-        if file_id:
-            if gdown_available():
-                print("📄 Google Drive archivo detectado. Usando gdown...")
-                self.results.append({
-                    "type": "gdrive_gdown",
-                    "url": url,
-                    "path": current_path,
-                    "is_folder": False,
-                    "display_name": f"Google Drive file {file_id}",
-                    "file_id": file_id,
-                })
-            else:
+            if file_id:
                 resolved = resolve_gdrive_file(url)
                 if resolved:
                     full_path = os.path.join(current_path, resolved["filename"])
@@ -168,12 +173,140 @@ class UniversalDownloader(QWebEngineView):
                     print("❌ No se pudo resolver el archivo de Google Drive.")
                     self.results.append((None, None))
 
-            self.proceed_to_next()
-            return
+                self.proceed_to_next()
+                return
 
-        print("❌ No se pudo extraer el ID del archivo de Google Drive.")
-        self.results.append((None, None))
-        self.proceed_to_next()
+            print("❌ No se pudo extraer el ID del archivo de Google Drive.")
+            self.results.append((None, None))
+            self.proceed_to_next()
+        except Exception:
+            print("❌ Error en handle_gdrive:")
+            print(traceback.format_exc())
+            self.results.append((None, None))
+            self.proceed_to_next()
+
+    def try_click_gdrive_download_all(self):
+        if not self._gdrive_waiting_download:
+            return
+        js = (
+            "(() => {"
+            "  const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();"
+            "  const buttons = Array.from(document.querySelectorAll('[role=\"button\"]'));"
+            "  const target = buttons.find((btn) => normalize(btn.innerText || btn.textContent) === 'Descargar todo');"
+            "  if (!target) {"
+            "    return { clicked: false, buttons: buttons.slice(0, 40).map((btn) => normalize(btn.innerText || btn.textContent)) };"
+            "  }"
+            "  const rect = target.getBoundingClientRect();"
+            "  const options = { bubbles: true, cancelable: true, view: window, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };"
+            "  target.dispatchEvent(new MouseEvent('mouseover', options));"
+            "  target.dispatchEvent(new MouseEvent('mousedown', options));"
+            "  target.dispatchEvent(new MouseEvent('mouseup', options));"
+            "  target.dispatchEvent(new MouseEvent('click', options));"
+            "  return { clicked: true, text: normalize(target.innerText || target.textContent), className: target.className };"
+            "})()"
+        )
+        self.page().runJavaScript(js, self.on_gdrive_download_all_clicked)
+
+    def on_gdrive_download_all_clicked(self, result):
+        try:
+            if isinstance(result, dict) and result.get("clicked"):
+                print(f"✅ Click en 'Descargar todo': {result}")
+                return
+
+            self._gdrive_click_attempts += 1
+            if self._gdrive_click_attempts < self._gdrive_click_max_attempts:
+                QTimer.singleShot(1500, self.try_click_gdrive_download_all)
+                return
+
+            print(f"⚠️ No se encontró 'Descargar todo': {result}")
+            self._gdrive_waiting_download = False
+            self.results.append((None, None))
+            self.proceed_to_next()
+        except Exception:
+            print("❌ Error en on_gdrive_download_all_clicked:")
+            print(traceback.format_exc())
+            self._gdrive_waiting_download = False
+            self.results.append((None, None))
+            self.proceed_to_next()
+
+    def on_cookie_added(self, cookie):
+        try:
+            name = bytes(cookie.name()).decode("utf-8", errors="ignore")
+            value = bytes(cookie.value()).decode("utf-8", errors="ignore")
+            domain = cookie.domain() or ""
+            path = cookie.path() or "/"
+            self._cookies[(domain, path, name)] = {
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": path,
+            }
+        except Exception:
+            print("❌ Error almacenando cookie en UniversalDownloader:")
+            print(traceback.format_exc())
+
+    def on_cookie_removed(self, cookie):
+        name = bytes(cookie.name()).decode("utf-8", errors="ignore")
+        domain = cookie.domain() or ""
+        path = cookie.path() or "/"
+        self._cookies.pop((domain, path, name), None)
+
+    def cookies_for_url(self, url):
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path or "/"
+        jar = {}
+        for cookie in self._cookies.values():
+            cookie_domain = (cookie["domain"] or "").lstrip(".").lower()
+            cookie_path = cookie["path"] or "/"
+            if cookie_domain and host != cookie_domain and not host.endswith(f".{cookie_domain}"):
+                continue
+            if not path.startswith(cookie_path):
+                continue
+            jar[cookie["name"]] = cookie["value"]
+        return jar
+
+    def on_download_requested(self, download):
+        try:
+            download_url = download.url().toString()
+            filename = download.downloadFileName() or download.path() or f"{self._gdrive_folder_id or 'drive'}.zip"
+            if os.path.basename(filename) != filename:
+                filename = os.path.basename(filename)
+
+            if self._gdrive_waiting_download:
+                save_target = os.path.join(self._gdrive_folder_path, filename) if self._gdrive_folder_path else filename
+                print(f"✅ ZIP capturado desde Google Drive: {download_url}")
+                self.results.append({
+                    "type": "direct",
+                    "path": save_target,
+                    "url": download_url,
+                    "headers": {"User-Agent": "Mozilla/5.0"},
+                    "cookies": self.cookies_for_url(download_url),
+                })
+                self._gdrive_waiting_download = False
+                download.cancel()
+                self.proceed_to_next()
+                return
+
+            download.cancel()
+        except Exception:
+            print("❌ Error en on_download_requested de UniversalDownloader:")
+            print(traceback.format_exc())
+            self._gdrive_waiting_download = False
+            self.results.append((None, None))
+            self.proceed_to_next()
+
+    def on_window_close_requested(self):
+        if self._gdrive_waiting_download:
+            return
+        self.close()
+
+    def on_render_process_terminated(self, status, exit_code):
+        print(f"❌ QWebEngine render process terminated. status={status}, exit_code={exit_code}")
+        if self._gdrive_waiting_download:
+            self._gdrive_waiting_download = False
+            self.results.append((None, None))
+            self.proceed_to_next()
 
     def handle_mediafire(self, url, path):
         if "/folder/" in url:
@@ -182,7 +315,7 @@ class UniversalDownloader(QWebEngineView):
             self.handle_mediafire_file_requests(url, path)
         else:
             print("❌ URL de MediaFire no reconocida.")
-            self.results.append(None)
+            self.results.append((None, None))
             self.proceed_to_next()
 
     def safe_handle_mediafire_folder(self, html, url, base_path):

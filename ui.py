@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import QTimer, QThreadPool, QRunnable, pyqtSignal, QObject
 from browser_handler import UniversalDownloader
-from workers import DownloadSignals, FileDownloader, GDriveDownloader
+from workers import DownloadSignals, FileDownloader
 from torrent import TorrentUpdater, add_magnet_link, add_torrent_file, ensure_aria2_running
 from settings_dialog import SettingsDialog, load_config, DEFAULT_CONFIG
 from enum import Enum
@@ -154,10 +154,10 @@ class DownloadWindow(QWidget):
         base_index = len(self.progress_bars)
         offset = 0
         for item in direct_links:
+            if not item:
+                continue
             if isinstance(item, dict):
-                if item.get("type") == "gdrive_gdown":
-                    self.start_gdrive_download(item)
-                elif item.get("type") == "direct":
+                if item.get("type") == "direct":
                     relative_path = item["path"]
                     link = item["url"]
                     headers = item.get("headers")
@@ -174,7 +174,7 @@ class DownloadWindow(QWidget):
 
         self.show()
 
-    def _start_direct_download(self, relative_path, link, index, headers, cookies):
+    def _start_direct_download(self, relative_path, link, index, headers, cookies, on_finished=None):
         full_path = os.path.join(self.folder_path, relative_path)
         if not link:
             return
@@ -198,51 +198,16 @@ class DownloadWindow(QWidget):
 
         signals = DownloadSignals()
         signals.progress.connect(self.update_progress)
-        signals.finished.connect(lambda idx=index: self.mark_finished(idx))
+        if on_finished:
+            def _done(idx=index):
+                self.mark_finished(idx)
+                on_finished()
+            signals.finished.connect(_done)
+        else:
+            signals.finished.connect(lambda idx=index: self.mark_finished(idx))
 
         thread = FileDownloader(link, full_path, index, signals, headers=headers, cookies=cookies)
         QThreadPool.globalInstance().start(thread)
-
-    def start_gdrive_download(self, item):
-        display_name = item.get("display_name") or "Google Drive"
-        is_folder = bool(item.get("is_folder"))
-        url = item.get("url")
-        path = item.get("path", self.folder_path)
-
-        if not url:
-            return
-
-        base_path = path if os.path.isabs(path) else os.path.join(self.folder_path, path)
-        if base_path:
-            os.makedirs(base_path, exist_ok=True)
-
-        if is_folder:
-            output_path = base_path
-        else:
-            filename = item.get("filename")
-            output_path = os.path.join(base_path, filename) if filename else base_path
-
-        index = len(self.temp_labels)
-        label = QLabel(f"Descargando: {display_name}")
-        bar = QProgressBar()
-        bar.setRange(0, 0)  # Indeterminado
-        self.inner_layout.addWidget(label)
-        self.inner_layout.addWidget(bar)
-        self.temp_labels.append(label)
-        self.temp_progress_bars.append(bar)
-
-        worker = GDriveDownloader(url, output_path, index, display_name, is_folder)
-        worker.signals.finished.connect(self.on_gdrive_finished)
-        QThreadPool.globalInstance().start(worker)
-
-    def on_gdrive_finished(self, index, name, success, message):
-        if success:
-            self.mark_finished(index, DownloadType.TEMPORAL)
-        else:
-            if index < len(self.temp_labels):
-                self.temp_labels[index].setText(f"❌ Error Google Drive: {name}")
-            if message:
-                print(f"❌ Error Google Drive ({name}): {message}")
 
     def load_entries(self, entries):
         if not entries:
@@ -268,8 +233,8 @@ class DownloadWindow(QWidget):
             self.regular_entries.extend(new_regular)
             downloader = UniversalDownloader(new_regular)
             downloader.direct_links_ready.connect(self.start_downloads)
-            downloader.start()
             self.downloaders.append(downloader)
+            downloader.start()
 
     def show_empty_state(self):
         container = QWidget()

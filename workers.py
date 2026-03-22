@@ -264,31 +264,5 @@ class GameSearchWorker(QRunnable):
         self.signals.finished.emit(results)
 
 
-class GDriveSignals(QObject):
-    finished = pyqtSignal(int, str, bool, str)
-
-
-class GDriveDownloader(QRunnable):
-    def __init__(self, url, output_path, index, display_name, is_folder):
-        super().__init__()
-        self.url = url
-        self.output_path = output_path
-        self.index = index
-        self.display_name = display_name
-        self.is_folder = is_folder
-        self.signals = GDriveSignals()
-
-    def run(self):
-        try:
-            from gdrive_handler import gdown_download
-        except Exception as e:
-            self.signals.finished.emit(self.index, self.display_name, False, f"gdown no disponible: {e}")
-            return
-
-        try:
-            gdown_download(self.url, self.output_path, is_folder=self.is_folder)
-            self.signals.finished.emit(self.index, self.display_name, True, "")
-        except Exception as e:
-            self.signals.finished.emit(self.index, self.display_name, False, str(e))
 
 

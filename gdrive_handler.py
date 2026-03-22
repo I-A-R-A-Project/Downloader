@@ -1,5 +1,4 @@
 import re
-import html
 from urllib.parse import urlparse, parse_qs
 
 import requests
@@ -42,14 +41,6 @@ def parse_gdrive_folder_id(url):
         if match:
             return match.group(1)
     return None
-
-
-def gdown_available():
-    try:
-        import gdown  # noqa: F401
-        return True
-    except Exception:
-        return False
 
 
 def _get_confirm_token(response_text, response_cookies):
@@ -126,53 +117,3 @@ def resolve_gdrive_file(url, session=None):
         "headers": headers,
     }
 
-
-def resolve_gdrive_folder_zip(url, session=None):
-    folder_id = parse_gdrive_folder_id(url)
-    if not folder_id:
-        return None
-    session = session or requests.Session()
-    headers = {"User-Agent": USER_AGENT}
-
-    folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
-    response = session.get(folder_url, headers=headers, timeout=20)
-    folder_name = _extract_title_from_html(response.text) or f"{folder_id}"
-
-    download_url = None
-    match = re.search(r'"downloadUrl":"(.*?)"', response.text or "")
-    if match:
-        raw = match.group(1)
-        raw = raw.replace("\\u0026", "&").replace("\\u003d", "=").replace("\\/", "/")
-        download_url = html.unescape(raw)
-
-    if not download_url:
-        download_url = f"https://drive.google.com/uc?export=download&id={folder_id}"
-
-    response = session.get(download_url, headers=headers, timeout=20, stream=True)
-    content_type = response.headers.get("content-type", "")
-    text = response.text if content_type.startswith("text/html") else ""
-    if not content_type.startswith("text/html"):
-        response.close()
-    token = _get_confirm_token(text, response.cookies)
-    if token:
-        download_url = (
-            f"https://drive.google.com/uc?export=download&confirm={token}&id={folder_id}"
-        )
-
-    cookies = session.cookies.get_dict()
-    filename = f"{folder_name}.zip"
-
-    return {
-        "filename": filename,
-        "download_url": download_url,
-        "cookies": cookies,
-        "headers": headers,
-    }
-
-
-def gdown_download(url, output_path, is_folder=False):
-    import gdown
-
-    if is_folder:
-        return gdown.download_folder(url, output=output_path, quiet=True, use_cookies=True)
-    return gdown.download(url, output=output_path, quiet=True, fuzzy=True, use_cookies=True)
