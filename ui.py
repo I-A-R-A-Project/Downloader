@@ -106,6 +106,10 @@ class DownloadWindow(QWidget):
         self.completed_torrents = set()
         self.torrent_timer = QTimer()
         self.torrent_timer.timeout.connect(self.start_torrent_update)
+        self.external_entries_timer = QTimer(self)
+        self.external_entries_timer.setSingleShot(True)
+        self.external_entries_timer.timeout.connect(self.process_external_entries)
+        self.pending_external_entries = []
 
         self.progress_bars = []
         self.labels = []
@@ -218,6 +222,7 @@ class DownloadWindow(QWidget):
             return
         if not entries:
             return
+        self.clear_empty_state()
         new_torrents = []
         new_regular = []
         for entry in entries:
@@ -242,6 +247,21 @@ class DownloadWindow(QWidget):
             self.downloaders.append(downloader)
             downloader.start()
 
+    def enqueue_external_entries(self, entries):
+        if self._closing or not entries:
+            return
+        self.pending_external_entries.extend(entries)
+        if not self.external_entries_timer.isActive():
+            # Give Qt one paint cycle to focus/redraw the existing window
+            self.external_entries_timer.start(75)
+
+    def process_external_entries(self):
+        if self._closing or not self.pending_external_entries:
+            return
+        entries = self.pending_external_entries
+        self.pending_external_entries = []
+        self.load_entries(entries)
+
     def ensure_torrent_timer_running(self):
         if not self.torrent_timer.isActive():
             self.torrent_timer.start(3000)
@@ -253,6 +273,21 @@ class DownloadWindow(QWidget):
             on_finished()
             return
         self.mark_finished(index)
+
+    def clear_empty_state(self):
+        if not self._empty_state_container:
+            return
+        self.inner_layout.removeWidget(self._empty_state_container)
+        self._empty_state_container.deleteLater()
+        self._empty_state_container = None
+
+    def bring_to_front(self):
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
 
     def show_empty_state(self):
         container = QWidget()
@@ -275,10 +310,6 @@ class DownloadWindow(QWidget):
     def on_links_ready(self, links):
         if not links:
             return
-        if self._empty_state_container:
-            self.inner_layout.removeWidget(self._empty_state_container)
-            self._empty_state_container.deleteLater()
-            self._empty_state_container = None
         self.load_entries(links)
 
     def open_settings_dialog(self):
