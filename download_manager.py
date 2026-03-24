@@ -2,8 +2,8 @@ import os, sys, json, time
 from PyQt5.QtCore import QObject, QIODevice, QSharedMemory, QSystemSemaphore, QTimer, pyqtSignal
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 from PyQt5.QtWidgets import QApplication, QMessageBox
-from ui import DownloadWindow
-from torrent import ensure_aria2_running
+from download_manager.window import DownloadWindow
+from download_manager.torrent import ensure_aria2_running
 
 SERVER_NAME = "MediaSearchPrototype.DownloadManager"
 

@@ -3,11 +3,11 @@ from PyQt5.QtWidgets import (
     QFileDialog, QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QMessageBox
 )
-from settings_dialog import load_config, save_config
+from config import DEFAULT_CONFIG, load_config, save_config
 
 DEFAULT_MOD_PATHS = {
-    "factorio_mods_path": os.path.join(os.environ["APPDATA"], "Factorio", "mods"),
-    "minecraft_mods_path": os.path.join(os.environ["APPDATA"], ".minecraft", "mods"),
+    "factorio_mods_path": DEFAULT_CONFIG["factorio_mods_path"],
+    "minecraft_mods_path": DEFAULT_CONFIG["minecraft_mods_path"],
 }
 
 

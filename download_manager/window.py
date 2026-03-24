@@ -1,69 +1,16 @@
 import os
 from PyQt5.QtWidgets import (
-    QLineEdit, QFormLayout, QDialogButtonBox, QFileDialog, 
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
-    QPushButton, QHBoxLayout, QProgressBar, QDialog, QTextEdit, QMessageBox
+    QPushButton, QHBoxLayout, QProgressBar, QMessageBox
 )
-from PyQt5.QtCore import QTimer, QThreadPool, QRunnable, pyqtSignal, QObject
-from browser_handler import UniversalDownloader
-from workers import DownloadSignals, FileDownloader
-from torrent import TorrentUpdater, add_magnet_link, add_torrent_file, ensure_aria2_running
-from settings_dialog import SettingsDialog, load_config, DEFAULT_CONFIG
+from PyQt5.QtCore import QTimer, QThreadPool
+from download_manager.browser import UniversalDownloader
+from download_manager.torrent import TorrentUpdater, ensure_aria2_running
+from download_manager.dialogs import LinkInputWindow, SettingsDialog, apply_settings
+from download_manager.workers import DownloadSignals, FileDownloader
+from config import DEFAULT_CONFIG, load_config
+from download_manager.torrent_queue import TorrentProcessor
 from enum import Enum
-
-
-class TorrentProcessorSignals(QObject):
-    finished = pyqtSignal()
-
-class TorrentProcessor(QRunnable):
-    def __init__(self, torrents, save_path):
-        super().__init__()
-        self.torrents = torrents
-        self.save_path = save_path
-        self.signals = TorrentProcessorSignals()
-
-    def run(self):
-        magnet_count = 0
-        torrent_file_count = 0
-        
-        for torrent_url in self.torrents:
-            if torrent_url.startswith("magnet:?"):
-                add_magnet_link(torrent_url, self.save_path)
-                magnet_count += 1
-            elif torrent_url.endswith(".torrent"):
-                # Para archivos .torrent, primero descargar y luego agregar
-                self.download_and_add_torrent(torrent_url)
-                torrent_file_count += 1
-        
-        if magnet_count > 0:
-            print(f"⚡ {magnet_count} magnets agregados en paralelo")
-        if torrent_file_count > 0:
-            print(f"⚡ {torrent_file_count} archivos .torrent procesados")
-            
-        self.signals.finished.emit()
-    
-    def download_and_add_torrent(self, torrent_url):
-        try:
-            import requests
-            import tempfile
-            
-            response = requests.get(torrent_url, timeout=30)
-            response.raise_for_status()
-            
-            with tempfile.NamedTemporaryFile(suffix=".torrent", delete=False) as tmp_file:
-                tmp_file.write(response.content)
-                tmp_file_path = tmp_file.name
-            
-            add_torrent_file(tmp_file_path, self.save_path)
-            
-            # Limpiar archivo temporal
-            try:
-                os.unlink(tmp_file_path)
-            except:
-                pass
-                
-        except Exception as e:
-            print(f"❌ Error descargando archivo torrent {torrent_url}: {e}")
 
 
 class DownloadType(Enum):
@@ -586,116 +533,3 @@ class DownloadWindow(QWidget):
         if app is not None:
             app.quit()
 
-class DownloadDetailsDialog(QDialog):
-    def __init__(self, urls, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Detalles de descarga")
-        self.resize(600, 400)
-
-        self.config = load_config()
-        self.default_path = self.config.get("folder_path", DEFAULT_CONFIG["folder_path"])
-
-        self.entries = []  # Guarda widgets por fila
-
-        layout = QVBoxLayout(self)
-        for url in urls:
-            form = QFormLayout()
-            url_label = QLabel(url)
-            url_label.setWordWrap(True)
-
-            # Campo contraseña
-            pass_input = QLineEdit()
-            pass_input.setEchoMode(QLineEdit.Password)
-
-            # Campo path con botón
-            form.addRow(QLabel("<b>URL:</b>"), url_label)
-            form.addRow("Contraseña:", pass_input)
-
-            path_input = QLineEdit(self.default_path)
-            browse_btn = QPushButton("📁")
-            browse_btn.setFixedWidth(30)
-            browse_btn.clicked.connect(lambda _, p=path_input: self.choose_path(p))
-            path_container = QHBoxLayout()
-            path_container.addWidget(path_input)
-            path_container.addWidget(browse_btn)
-            form.addRow("Guardar en:", path_container)
-
-            layout.addLayout(form)
-            self.entries.append({
-                "url": url,
-                "password_widget": pass_input,
-                "path_widget": path_input
-            })
-
-        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.buttons.accepted.connect(self.accept)
-        self.buttons.rejected.connect(self.reject)
-        layout.addWidget(self.buttons)
-
-    def choose_path(self, path_input):
-        folder = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta", path_input.text())
-        if folder:
-            path_input.setText(folder)
-
-    def get_results(self):
-        return [
-            {
-                "url": e["url"],
-                "password": e["password_widget"].text().strip(),
-                "path": e["path_widget"].text().strip()
-            }
-            for e in self.entries
-        ]
-
-class LinkInputWindow(QWidget):
-    links_ready = pyqtSignal(list)
-
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Pegar enlaces de paginas de descarga")
-        self.setMinimumSize(400, 200)
-
-        layout = QVBoxLayout()
-        self.instructions = QLabel("Pega uno o más enlaces (uno por línea):")
-        self.textbox = QTextEdit()
-        self.accept_button = QPushButton("Iniciar Descargas")
-        self.accept_button.clicked.connect(self.proceed)
-        self.settings_button = QPushButton('⚙')
-        self.settings_button.clicked.connect(self.open_settings_dialog)
-        self.settings_button.setFixedWidth(25)
-
-        layout.addWidget(self.instructions)
-        layout.addWidget(self.textbox)
-        buttons = QHBoxLayout()
-        buttons.addWidget(self.accept_button)
-        buttons.addWidget(self.settings_button)
-        layout.addLayout(buttons)
-        self.setLayout(layout)
-
-        self.links = []
-
-    def open_settings_dialog(self):
-        dialog = SettingsDialog(self)
-        if dialog.exec_() == QDialog.Accepted:
-            apply_settings()
-
-    def proceed(self):
-        text = self.textbox.toPlainText().strip()
-        if not text:
-            return
-        urls = [line.strip() for line in text.splitlines() if line.strip()]
-        if not urls:
-            return
-        dialog = DownloadDetailsDialog(urls, self)
-        if dialog.exec_() == QDialog.Accepted:
-            self.links = dialog.get_results()
-            self.links_ready.emit(self.links)
-            self.close()
-
-def apply_settings():
-    config = load_config()
-    folder_path = config.get("folder_path")
-    open_on_finish = config.get("open_on_finish")
-    max_parallel_downloads = config.get("max_parallel_downloads")
-    print(f"✅ Configuración actualizada: {config}")
-    return folder_path, open_on_finish, max_parallel_downloads

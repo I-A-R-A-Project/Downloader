@@ -2,11 +2,20 @@
 
 GUI tools for searching media and managing downloads (HTTP + torrents) built with PyQt5.
 
+## Repo layout
+- `media_search.py`: entrypoint for the media search UI.
+- `download_manager.py`: entrypoint for the download manager UI.
+- `mod_search.py`: entrypoint for the game mods browser UI.
+- `config.py`: shared config loading/saving.
+- `media_search/`: media search package.
+- `download_manager/`: download manager package, direct-link extraction, torrents, dialogs, workers.
+- `mod_search/`: mod browser package.
+
 ## What it does
 - Search anime/manga (Jikan/MyAnimeList), games (RAWG), and collect download links from:
   - Aniteca (direct links)
   - Nyaa / 1337x (magnet links)
-- Browse Factorio mods and queue their downloads with dependency resolution
+- Browse game mods and queue their downloads with dependency resolution
 - Launch a download manager UI for:
   - Direct downloads (MediaFire, Google Drive, 4shared, direct file URLs)
   - Torrents and magnet links via Aria2 RPC
@@ -36,18 +45,19 @@ pip install PyQt5 PyQtWebEngine requests beautifulsoup4
 python media_search.py
 ```
 Notes:
-- Set your TMDb key in `media_search.py` at `TMDB_API_KEY`.
-- RAWG uses the API key embedded in `media_search.py`. Replace it with your own if needed.
-- Factorio entries expose a `Ver mods` button that opens the mod browser.
+- Set your TMDb key in `media_search/sources.py` at `TMDB_API_KEY`.
+- RAWG uses the API key embedded in `media_search/sources.py`. Replace it with your own if needed.
+- Supported game entries can expose a `Ver mods` button that opens the mod browser.
 
 ### 1.1) Mod browser
 ```bash
 python mod_search.py --game factorio
 ```
 Notes:
-- Lets you browse, search, inspect, and queue Factorio mods.
+- Lets you browse, search, inspect, and queue videogame mods.
+- The current built-in implementation focuses on Factorio.
 - Resolves mod dependencies before sending downloads to `download_manager.py`.
-- Uses the configured Factorio mods folder as destination.
+- Uses the configured game mod path as destination when applicable.
 
 ### 2) Download manager UI
 Open the link input UI:
@@ -95,6 +105,7 @@ Config fields:
 - Torrents require Aria2 RPC at `http://localhost:6800/jsonrpc`.
   The app will attempt to start Aria2 automatically.
 - Closing `download_manager.py` asks for confirmation only when there is active work in progress.
+- `download_manager.py` remains single-instance and forwards new entries to the already-open window.
 - Use only sources you are authorized to access and comply with local laws and site terms.
 
 ## Tests

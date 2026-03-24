@@ -7,7 +7,7 @@ import requests
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineProfile
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QUrl, QTimer, pyqtSignal, Qt
 from bs4 import BeautifulSoup
-from gdrive_handler import (
+from download_manager.gdrive_handler import (
     parse_gdrive_folder_id,
     parse_gdrive_file_id,
     resolve_gdrive_file,
