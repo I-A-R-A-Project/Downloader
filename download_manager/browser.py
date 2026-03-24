@@ -13,12 +13,47 @@ from download_manager.gdrive_handler import (
     resolve_gdrive_file,
 )
 
+FILECRYPT_HOSTS = {
+    "filecrypt.cc",
+    "www.filecrypt.cc",
+    "filecrypt.to",
+    "www.filecrypt.to",
+}
+
+INTERACTIVE_DOWNLOAD_HOSTS = {
+    "rapidgator.net",
+    "www.rapidgator.net",
+    "ddownload.com",
+    "www.ddownload.com",
+    "ddl.to",
+    "www.ddl.to",
+}
+
 
 def build_download_path(base_path, *parts):
     segments = [segment for segment in (base_path, *parts) if segment]
     if not segments:
         return ""
     return os.path.normpath(os.path.join(*segments))
+
+
+def is_meaningful_external_url(url):
+    if not url:
+        return False
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not host or host in FILECRYPT_HOSTS:
+        return False
+    if parsed.path and parsed.path not in {"", "/"}:
+        return True
+    if parsed.query or parsed.fragment:
+        return True
+    return False
+
+
+def is_interactive_download_host(url):
+    host = (urlparse(url).hostname or "").lower()
+    return host in INTERACTIVE_DOWNLOAD_HOSTS
 
 
 def extract_filename_from_headers(headers):
@@ -91,8 +126,24 @@ DIRECT_RESOLVE_THREAD_POOL = QThreadPool()
 DIRECT_RESOLVE_THREAD_POOL.setMaxThreadCount(4)
 
 class SilentPage(QWebEnginePage):
+    def __init__(self, profile, owner):
+        super().__init__(profile, owner)
+        self.owner = owner
+
     def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
         pass
+
+    def createWindow(self, window_type):
+        if self.owner and self.owner.should_block_popups():
+            print("⛔ Popup bloqueado.")
+            return None
+        return super().createWindow(window_type)
+
+    def acceptNavigationRequest(self, url, navigation_type, is_main_frame):
+        if self.owner and not self.owner.should_allow_navigation(url, navigation_type, is_main_frame):
+            print(f"⛔ Navegación bloqueada: {url.toString()}")
+            return False
+        return super().acceptNavigationRequest(url, navigation_type, is_main_frame)
 
 class UniversalDownloader(QWebEngineView):
     direct_links_ready = pyqtSignal(list)
@@ -138,6 +189,13 @@ class UniversalDownloader(QWebEngineView):
         self._gdrive_folder_path = ""
         self._active_direct_worker = None
         self._pending_direct_resolution = None
+        self._filecrypt_wait_attempts = 0
+        self._filecrypt_pending_batches = {}
+        self._filecrypt_active_workers = []
+        self._filecrypt_link_targets = {}
+        self._filecrypt_link_wait_attempts = 0
+        self._interactive_wait_attempts = 0
+        self._interactive_download_path = ""
 
         self.setWindowTitle("Universal Downloader")
         self.setAttribute(Qt.WA_DeleteOnClose, False)
@@ -159,6 +217,41 @@ class UniversalDownloader(QWebEngineView):
         else:
             self.close()
 
+    def current_source_url(self):
+        if self.current_index >= len(self.urls):
+            return ""
+        return self.urls[self.current_index][0]
+
+    def should_block_popups(self):
+        return self.is_filecrypt_url(self.current_source_url())
+
+    def should_allow_navigation(self, url, navigation_type, is_main_frame):
+        if not is_main_frame:
+            return True
+
+        current_source = self.current_source_url()
+        if not self.is_filecrypt_url(current_source):
+            return True
+
+        target = url.toString()
+        if target.startswith("about:") or target.startswith("data:"):
+            return True
+
+        target_host = (urlparse(target).hostname or "").lower()
+        if not target_host:
+            return True
+
+        if target_host in FILECRYPT_HOSTS:
+            return True
+
+        if self.is_filecrypt_link_url(current_source):
+            if is_meaningful_external_url(target):
+                self.capture_filecrypt_link_target(current_source, target)
+                return False
+            return False
+
+        return False
+
     def on_load_finished(self, ok=True):
         try:
             if self.current_index >= len(self.urls):
@@ -178,6 +271,10 @@ class UniversalDownloader(QWebEngineView):
             self.close()
             return
         url, path = self.urls[self.current_index]
+        self._filecrypt_wait_attempts = 0
+        self._filecrypt_link_wait_attempts = 0
+        self._interactive_wait_attempts = 0
+        self._interactive_download_path = ""
         if self.is_direct_file_url(url):
             self.handle_direct_file(url, path)
             return
@@ -197,10 +294,14 @@ class UniversalDownloader(QWebEngineView):
             url, path = self.urls[self.current_index]
             if "mediafire.com" in url:
                 self.handle_mediafire(url, path)
+            elif self.is_filecrypt_url(url):
+                self.handle_filecrypt(url, path)
             elif "4shared.com" in url:
                 self.page().toHtml(lambda html: self.handle_4shared(html, path))
             elif "drive.google.com" in url:
                 self.handle_gdrive(url, path)
+            elif is_interactive_download_host(url):
+                self.handle_interactive_download_host(url, path)
             elif self.is_direct_file_url(url):
                 self.handle_direct_file(url, path)
             else:
@@ -210,6 +311,175 @@ class UniversalDownloader(QWebEngineView):
         except Exception:
             print("❌ Error en route_url_handling:")
             print(traceback.format_exc())
+
+    def is_filecrypt_url(self, url):
+        return (urlparse(url).hostname or "").lower() in FILECRYPT_HOSTS
+
+    def is_filecrypt_link_url(self, url):
+        parsed = urlparse(url)
+        return self.is_filecrypt_url(url) and parsed.path.lower().startswith("/link/")
+
+    def handle_filecrypt(self, url, current_path):
+        if self.is_filecrypt_link_url(url):
+            self.handle_filecrypt_link_url(url, current_path)
+            return
+
+        js = (
+            "(() => {"
+            "  const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();"
+            "  const rows = Array.from(document.querySelectorAll('table tr.kwj3, table tbody tr'));"
+            "  const results = [];"
+            "  for (const row of rows) {"
+            "    const cells = row.querySelectorAll('td');"
+            "    const titleCell = cells.length > 1 ? cells[1] : null;"
+            "    const hostAnchor = row.querySelector('a.external_link');"
+            "    const button = row.querySelector('button.download');"
+            "    if (!titleCell || !hostAnchor || !button) { continue; }"
+            "    let code = '';"
+            "    for (const attr of Array.from(button.attributes)) {"
+            "      if (!attr.name.startsWith('data-')) { continue; }"
+            "      const value = normalize(attr.value);"
+            "      if (/^[A-Z0-9]{6,}$/.test(value)) { code = value; break; }"
+            "    }"
+            "    if (!code) { continue; }"
+            "    const rawNode = titleCell.childNodes.length ? titleCell.childNodes[0] : null;"
+            "    const rawTitle = rawNode ? rawNode.textContent : '';"
+            "    const title = normalize(titleCell.getAttribute('title') || rawTitle || titleCell.textContent);"
+            "    const host = normalize(hostAnchor.textContent || hostAnchor.href || '');"
+            "    results.push({"
+            "      title,"
+            "      host,"
+            "      link_url: `${location.origin}/Link/${code}.html`,"
+            "    });"
+            "  }"
+            "  return { ready: results.length > 0, results };"
+            "})()"
+        )
+        self.page().runJavaScript(js, lambda result: self.on_filecrypt_container_scanned(result, url, current_path))
+
+    def on_filecrypt_container_scanned(self, result, source_url, current_path):
+        rows = result.get("results") if isinstance(result, dict) else None
+        if rows:
+            if source_url in self._filecrypt_pending_batches:
+                return
+            print(f"✅ Filecrypt resuelto: {len(rows)} enlaces encontrados.")
+            self.resolve_filecrypt_batch(source_url, current_path, rows)
+            return
+
+        self._filecrypt_wait_attempts += 1
+        self.setWindowTitle("Filecrypt: resolvé el captcha para continuar")
+        if self._filecrypt_wait_attempts % 10 == 1:
+            print("⏳ Esperando resolución manual del captcha de Filecrypt...")
+        QTimer.singleShot(1500, self.route_url_handling)
+
+    def resolve_filecrypt_batch(self, source_url, current_path, rows):
+        batch = {
+            "rows": rows,
+            "resolved_urls": [],
+            "source_url": source_url,
+            "path": current_path,
+        }
+        self._filecrypt_pending_batches[source_url] = batch
+        insert_position = self.current_index + 1
+        for row in reversed(rows):
+            self.urls.insert(insert_position, (row["link_url"], current_path))
+        self.proceed_to_next()
+
+    def handle_filecrypt_link_url(self, url, current_path):
+        resolved_url = self._filecrypt_link_targets.pop(url, "")
+        if resolved_url:
+            print(f"✅ Filecrypt redirigió a: {resolved_url}")
+            self.urls.insert(self.current_index + 1, (resolved_url, current_path))
+            self.proceed_to_next()
+            return
+
+        self.page().toHtml(lambda html: self.handle_filecrypt_link_html(url, current_path, html))
+
+    def capture_filecrypt_link_target(self, link_url, target_url):
+        if is_meaningful_external_url(target_url):
+            self._filecrypt_link_targets[link_url] = target_url
+
+    def handle_filecrypt_link_html(self, link_url, current_path, html):
+        resolved_url = self.extract_external_url_from_html(html)
+        if resolved_url:
+            self.capture_filecrypt_link_target(link_url, resolved_url)
+            print(f"✅ Filecrypt redirigió a: {resolved_url}")
+            self.urls.insert(self.current_index + 1, (resolved_url, current_path))
+            self.proceed_to_next()
+            return
+
+        self._filecrypt_link_wait_attempts += 1
+        if self._filecrypt_link_wait_attempts % 10 == 1:
+            print("⏳ Esperando redirección del mirror de Filecrypt...")
+        if self._filecrypt_link_wait_attempts >= 40:
+            print("❌ No se pudo resolver el enlace de Filecrypt.")
+            self.proceed_to_next()
+            return
+        QTimer.singleShot(1000, self.route_url_handling)
+
+    def extract_external_url_from_html(self, html):
+        if not html:
+            return ""
+
+        specific_patterns = [
+            r"""location(?:\.href)?\s*=\s*['"](https?://[^'"]+)['"]""",
+            r"""window\.open\(['"](https?://[^'"]+)['"]""",
+            r"""content=['"][^'"]*url=(https?://[^'">]+)""",
+        ]
+
+        for pattern in specific_patterns:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if not match:
+                continue
+            candidate = match.group(1)
+            if is_meaningful_external_url(candidate):
+                return candidate
+
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup.find_all(["a", "form", "iframe", "meta"]):
+            candidate = (
+                tag.get("href")
+                or tag.get("action")
+                or tag.get("src")
+                or tag.get("content")
+                or ""
+            )
+            if "url=" in candidate.lower():
+                parts = re.split(r"url=", candidate, flags=re.IGNORECASE)
+                candidate = parts[-1] if parts else candidate
+            if is_meaningful_external_url(candidate):
+                return candidate
+        return ""
+
+    def handle_interactive_download_host(self, url, current_path):
+        self._interactive_download_path = current_path
+        self._interactive_wait_attempts += 1
+        host = (urlparse(url).hostname or url)
+        if "rapidgator.net" in host:
+            self.try_click_rapidgator_free()
+        self.setWindowTitle(f"Continuá manualmente en {host}")
+        if self._interactive_wait_attempts % 10 == 1:
+            print(f"⏳ Esperando acción manual en {host}...")
+        QTimer.singleShot(1500, self.route_url_handling)
+
+    def try_click_rapidgator_free(self):
+        js = (
+            "(() => {"
+            "  const btn = document.querySelector('a.link.act-link.btn-free');"
+            "  if (!btn) { return { clicked: false, reason: 'missing' }; }"
+            "  const style = window.getComputedStyle(btn);"
+            "  if (style.display === 'none' || style.visibility === 'hidden') {"
+            "    return { clicked: false, reason: 'hidden' };"
+            "  }"
+            "  btn.click();"
+            "  return { clicked: true, text: (btn.innerText || btn.textContent || '').trim() };"
+            "})()"
+        )
+        self.page().runJavaScript(js, self.on_rapidgator_free_clicked)
+
+    def on_rapidgator_free_clicked(self, result):
+        if isinstance(result, dict) and result.get("clicked"):
+            print(f"✅ Click automático en Rapidgator free: {result.get('text', '')}")
 
     def handle_4shared(self, html, current_path):
         soup = BeautifulSoup(html, "html.parser")
@@ -369,6 +639,21 @@ class UniversalDownloader(QWebEngineView):
                     "cookies": self.cookies_for_url(download_url),
                 })
                 self._gdrive_waiting_download = False
+                download.cancel()
+                self.proceed_to_next()
+                return
+
+            current_url = self.current_source_url()
+            if is_interactive_download_host(current_url):
+                save_target = build_download_path(self._interactive_download_path, filename)
+                print(f"✅ Descarga capturada desde navegador: {download_url}")
+                self.results.append({
+                    "type": "direct",
+                    "path": save_target,
+                    "url": download_url,
+                    "headers": {"User-Agent": "Mozilla/5.0", "Referer": current_url},
+                    "cookies": self.cookies_for_url(download_url),
+                })
                 download.cancel()
                 self.proceed_to_next()
                 return
@@ -655,6 +940,8 @@ class UniversalDownloader(QWebEngineView):
 
     def is_direct_file_url(self, url):
         parsed = urlparse(url)
+        if is_interactive_download_host(url):
+            return False
         path = parsed.path or ""
         ext = os.path.splitext(path)[1].lower()
         direct_exts = {

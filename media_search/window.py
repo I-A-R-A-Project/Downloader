@@ -11,7 +11,7 @@ from PyQt5.QtCore import Qt, QTimer, QSize, QThreadPool, pyqtSignal
 from media_search.aniteca import search_aniteca
 from config import DEFAULT_CONFIG, load_config, save_config
 from media_search.dialogs import TrailerWindow
-from media_search.sources import RAWG_API_KEY, normalize_trailer_url, search_1337x, search_nyaa
+from media_search.sources import RAWG_API_KEY, normalize_trailer_url, search_1337x, search_elamigos, search_nyaa
 from media_search.workers import (
     GameSearchWorker, GameDetailsWorker, ImageLoaderWorker,
     AnimeSearchWorker, SiteSearchWorker, TrailerLaunchWorker, URLWorker
@@ -67,8 +67,8 @@ class MultiChoiceDownloader(QWidget):
                 subgroup_text = ""
                 subgroup_item = None
 
-                if not result['url_type'] == "torrent":
-                    subgroup_text += f"{result['url_type']} - {result['title']}"
+                if result["url_type"] != "torrent":
+                    item_text += f"[{result['url_type']}] "
 
                 item_text += f"{result['title']}"
 
@@ -328,6 +328,8 @@ class MediaSearchUI(QWidget):
         self.results_list = QListWidget()
         self.results_list.setIconSize(QSize(80, 120))
         self.results_list.itemClicked.connect(self.show_details)
+        self.results_list.currentItemChanged.connect(self.on_current_item_changed)
+        self.results_list.verticalScrollBar().valueChanged.connect(self.on_scroll)
         layout.addWidget(self.results_list)
 
         details_layout = QHBoxLayout()
@@ -389,6 +391,19 @@ class MediaSearchUI(QWidget):
         self.setLayout(layout)
         self.current_item = None
         self.trailer_request_id = None
+        self.current_query = ""
+        self.current_page = 1
+        self.last_page = None
+        self.total_found = None
+        self.is_loading = False
+        self.pending_load = False
+        self.image_cache = {}
+        self.current_image_url = ""
+        self.preload_queue = []
+        self.preload_inflight = False
+        self.game_details_cache = {}
+        self.game_details_inflight = set()
+        self.game_details_queue = []
 
     def set_category(self, value):
         self.category = value
@@ -400,53 +415,100 @@ class MediaSearchUI(QWidget):
 
     def perform_search(self):
         term = self.search_bar.text().strip()
+        if not term:
+            return
+
+        self.current_query = term
+        self.current_page = 1
+        self.last_page = None
+        self.total_found = None
+        self.pending_load = False
+        self.preload_queue = []
+        self.preload_inflight = False
+        self.game_details_queue = []
         self.results_list.clear()
         self.details.clear()
         self.image_label.clear()
         self.download_button.setEnabled(False)
         self.mods_button.setEnabled(False)
-
-        if not term:
-            return
+        self.current_item = None
 
         self.search_button.setHidden(True)
         self.spinner_search_bar.show()
         self.spinner_movie.start()
         self.search_bar.setDisabled(True)
         self.search_bar.setPlaceholderText("Buscando...")
+        self.is_loading = True
 
+        self.start_search(page=1, append=False)
+
+    def start_search(self, page, append):
         pool = QThreadPool.globalInstance()
-
         if self.category == "games":
-            worker = GameSearchWorker(term, RAWG_API_KEY)
-            worker.signals.finished.connect(self.populate_results)
-            pool.start(worker)
-        elif self.category == "anime":
-            worker = AnimeSearchWorker(term, self.category)
-            worker.signals.finished.connect(self.populate_results)
-            pool.start(worker)
+            worker = GameSearchWorker(self.current_query, RAWG_API_KEY, page=page)
+        elif self.category in ("anime", "manga"):
+            worker = AnimeSearchWorker(self.current_query, self.category, page=page)
+        else:
+            self.finish_search({"items": [], "page": page, "last_page": page, "total": 0}, append)
+            return
 
-    def populate_results(self, results):
+        worker.signals.finished.connect(lambda payload, append=append: self.finish_search(payload, append))
+        pool.start(worker)
+
+    def finish_search(self, payload, append):
         self.search_bar.setDisabled(False)
         self.search_bar.setPlaceholderText("Buscar anime, película o serie...")
         self.spinner_movie.stop()
         self.spinner_search_bar.setHidden(True)
         self.search_button.show()
+        self.is_loading = False
+        self.pending_load = False
 
-        self.results_list.clear()
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        self.current_page = payload.get("page", self.current_page) if isinstance(payload, dict) else self.current_page
+        self.last_page = payload.get("last_page", self.last_page) if isinstance(payload, dict) else self.last_page
+        self.total_found = payload.get("total", self.total_found) if isinstance(payload, dict) else self.total_found
 
-        for item in results:
-            source = item.get('source', '')
-            if source == "RAWG":
-                title = item['title']
-                lw_item = QListWidgetItem(f"[{source}] {title}")
-            elif source == "MyAnimeList":
-                lw_item = QListWidgetItem(f"[{source}] - {item['title']}")
-            else:
-                lw_item = QListWidgetItem(item['title'])
+        if not append:
+            self.results_list.clear()
 
-            lw_item.setData(Qt.UserRole, item)
-            self.results_list.addItem(lw_item)
+        existing_keys = set()
+        if append:
+            for i in range(self.results_list.count()):
+                data = self.results_list.item(i).data(Qt.UserRole) or {}
+                existing_keys.add((data.get("source"), data.get("id"), data.get("url"), data.get("title")))
+
+        for item in items:
+            item_key = (item.get("source"), item.get("id"), item.get("url"), item.get("title"))
+            if item_key in existing_keys:
+                continue
+            existing_keys.add(item_key)
+            self.add_result_item(item)
+
+        if self.results_list.count() > 0 and not self.results_list.currentItem():
+            self.results_list.setCurrentRow(0)
+
+        self.start_preload_images()
+        self.start_preload_game_details()
+
+    def add_result_item(self, item):
+        source = item.get('source', '')
+        if source == "RAWG":
+            lw_item = QListWidgetItem(f"[{source}] {item['title']}")
+        elif source == "MyAnimeList":
+            lw_item = QListWidgetItem(f"[{source}] - {item['title']}")
+        else:
+            lw_item = QListWidgetItem(item['title'])
+
+        lw_item.setData(Qt.UserRole, item)
+        self.results_list.addItem(lw_item)
+        image_url = item.get("image")
+        if image_url and image_url not in self.image_cache:
+            self.preload_queue.append(image_url)
+        if item.get("source") == "RAWG":
+            game_id = item.get("id")
+            if game_id and game_id not in self.game_details_cache and game_id not in self.game_details_inflight:
+                self.game_details_queue.append(game_id)
 
     def show_details(self, item):
         def score_to_color(score):
@@ -471,6 +533,7 @@ class MediaSearchUI(QWidget):
         self.trailer_button.setEnabled(False)
         data = item.data(Qt.UserRole)
         self.current_item = item
+        self.current_image_url = data.get("image") or ""
 
         desc = data.get("description", "Sin descripción.")
         self.details.setPlainText(desc)
@@ -486,9 +549,7 @@ class MediaSearchUI(QWidget):
             self.image_label.setMovie(self.spinner_movie)
 
             if data.get("image"):
-                worker = ImageLoaderWorker(data["image"])
-                worker.signals.finished.connect(self.set_detail_image)
-                QThreadPool.globalInstance().start(worker)
+                self.load_detail_image(data["image"])
             else:
                 self.spinner_movie.stop()
                 self.image_label.clear()
@@ -510,36 +571,79 @@ class MediaSearchUI(QWidget):
             self.image_label.setMovie(self.spinner_movie)
 
             if data.get("image"):
-                worker = ImageLoaderWorker(data["image"])
-                worker.signals.finished.connect(self.set_detail_image)
-                QThreadPool.globalInstance().start(worker)
+                self.load_detail_image(data["image"])
             else:
                 self.spinner_movie.stop()
                 self.image_label.clear()
 
             game_id = data.get("id")
             if game_id:
-                self.details.setPlainText("Cargando descripción...")
-                details_worker = GameDetailsWorker(game_id, RAWG_API_KEY)
-                details_worker.signals.finished.connect(self.apply_game_details)
-                QThreadPool.globalInstance().start(details_worker)
+                cached_details = self.game_details_cache.get(game_id)
+                if cached_details:
+                    self.apply_game_details_to_current(
+                        game_id,
+                        cached_details.get("description"),
+                        cached_details.get("trailer"),
+                    )
+                else:
+                    self.details.setPlainText("Cargando descripción...")
+                    self.queue_game_details(game_id, priority=True)
 
-            self.download_button.setText("Descargar (próximamente)")
-            self.download_button.setEnabled(False)
+            self.download_button.setText("Descargar")
+            self.download_button.setEnabled(True)
             if "Factorio" in data.get("title", ""):
                 self.mods_button.setEnabled(True)
             else:
                 self.mods_button.setEnabled(False)
 
-    def set_detail_image(self, url, pixmap):
-        if url==self.current_item.data(Qt.UserRole)["image"]:
+    def load_detail_image(self, image_url):
+        self.current_image_url = image_url or ""
+        if not image_url:
             self.spinner_movie.stop()
-            if pixmap and not pixmap.isNull():
-                self.image_label.setPixmap(pixmap)
-            else:
-                self.image_label.clear()
+            self.image_label.clear()
+            return
+        if image_url in self.image_cache:
+            self.spinner_movie.stop()
+            self.image_label.setPixmap(self.image_cache[image_url])
+            return
+        worker = ImageLoaderWorker(image_url)
+        worker.signals.finished.connect(self.set_detail_image)
+        QThreadPool.globalInstance().start(worker)
+
+    def set_detail_image(self, url, pixmap):
+        if url != self.current_image_url:
+            return
+        self.spinner_movie.stop()
+        if pixmap and not pixmap.isNull():
+            scaled = pixmap.scaled(
+                self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            self.image_cache[url] = scaled
+            self.image_label.setPixmap(scaled)
+        else:
+            self.image_label.clear()
 
     def apply_game_details(self, game_id, description, trailer_url):
+        self.game_details_inflight.discard(game_id)
+        self.game_details_cache[game_id] = {
+            "description": description or "Sin descripción.",
+            "trailer": trailer_url or None,
+        }
+        self.apply_game_details_to_list(game_id, description, trailer_url)
+        self.apply_game_details_to_current(game_id, description, trailer_url)
+        self.start_preload_game_details()
+
+    def apply_game_details_to_list(self, game_id, description, trailer_url):
+        for index in range(self.results_list.count()):
+            item = self.results_list.item(index)
+            data = item.data(Qt.UserRole) or {}
+            if data.get("source") != "RAWG" or data.get("id") != game_id:
+                continue
+            data["description"] = description or "Sin descripción."
+            data["trailer"] = trailer_url or None
+            item.setData(Qt.UserRole, data)
+
+    def apply_game_details_to_current(self, game_id, description, trailer_url):
         if not self.current_item:
             return
 
@@ -595,6 +699,70 @@ class MediaSearchUI(QWidget):
         self.trailer_window.show()
         self.trailer_button.setEnabled(True)
 
+    def on_current_item_changed(self, current, _previous):
+        if current:
+            self.show_details(current)
+
+    def on_scroll(self, value):
+        if self.is_loading or self.pending_load:
+            return
+        if self.last_page is not None and self.current_page >= self.last_page:
+            return
+        bar = self.results_list.verticalScrollBar()
+        maximum = bar.maximum()
+        if maximum <= 0:
+            return
+        if value / maximum < 0.8:
+            return
+        self.pending_load = True
+        self.is_loading = True
+        self.spinner_search_bar.show()
+        self.spinner_movie.start()
+        self.search_button.setHidden(True)
+        self.start_search(page=self.current_page + 1, append=True)
+
+    def start_preload_images(self):
+        if self.preload_inflight:
+            return
+        while self.preload_queue:
+            image_url = self.preload_queue.pop(0)
+            if image_url in self.image_cache:
+                continue
+            self.preload_inflight = True
+            worker = ImageLoaderWorker(image_url)
+            worker.signals.finished.connect(self.on_preload_image_ready)
+            QThreadPool.globalInstance().start(worker)
+            break
+
+    def on_preload_image_ready(self, url, pixmap):
+        self.preload_inflight = False
+        if pixmap and not pixmap.isNull() and url not in self.image_cache:
+            self.image_cache[url] = pixmap.scaled(
+                self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+        self.start_preload_images()
+
+    def queue_game_details(self, game_id, priority=False):
+        if not game_id or game_id in self.game_details_cache or game_id in self.game_details_inflight:
+            return
+        if priority:
+            self.game_details_queue = [queued for queued in self.game_details_queue if queued != game_id]
+            self.game_details_queue.insert(0, game_id)
+        elif game_id not in self.game_details_queue:
+            self.game_details_queue.append(game_id)
+        self.start_preload_game_details()
+
+    def start_preload_game_details(self):
+        while self.game_details_queue:
+            game_id = self.game_details_queue.pop(0)
+            if game_id in self.game_details_cache or game_id in self.game_details_inflight:
+                continue
+            self.game_details_inflight.add(game_id)
+            worker = GameDetailsWorker(game_id, RAWG_API_KEY)
+            worker.signals.finished.connect(self.apply_game_details)
+            QThreadPool.globalInstance().start(worker)
+            break
+
     def download_item(self):
         if not self.current_item:
             return
@@ -611,7 +779,6 @@ class MediaSearchUI(QWidget):
         self.download_button.setText(f"Buscando y cargando enlaces...")
         
         self.results_dict = {}
-        self.pending_sites = {"Aniteca", "Nyaa", "1337x"}
         self.total_links_found[title] = 0
         self.update_download_label()
 
@@ -630,7 +797,6 @@ class MediaSearchUI(QWidget):
                 self.results_dict[site_name] = sorted_results
                 self.total_links_found[title] += len(sorted_results)
 
-            self.download_label.setText(f"Cargando: {self.total_links_found} enlaces encontrados")
             self.pending_sites.discard(site_name)
             self.update_download_label()
 
@@ -658,7 +824,13 @@ class MediaSearchUI(QWidget):
                     QMessageBox.information(self, "Sin resultados", f"No se encontraron descargas para: {title}")
 
         pool = QThreadPool.globalInstance()
-        for name, func in [("Aniteca", search_aniteca), ("Nyaa", search_nyaa), ("1337x", search_1337x)]:
+        sources = [("Aniteca", search_aniteca), ("Nyaa", search_nyaa), ("1337x", search_1337x)]
+        current_source = (self.current_item.data(Qt.UserRole) or {}).get("source", "")
+        if current_source == "RAWG":
+            sources = [("ElAmigos", search_elamigos)]
+        self.pending_sites = {name for name, _ in sources}
+
+        for name, func in sources:
             worker = SiteSearchWorker(name, func, title)
             worker.signals.result_ready.connect(update_results)
             pool.start(worker)

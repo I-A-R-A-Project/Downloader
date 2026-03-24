@@ -1,4 +1,3 @@
 *.exe
 *.pyc
-*/__init__.py
 AGENTS.md

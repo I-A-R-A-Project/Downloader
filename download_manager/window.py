@@ -131,6 +131,8 @@ class DownloadWindow(QWidget):
                 continue
 
             relative_path, link = item
+            if not relative_path or not link:
+                continue
             index = base_index + offset
             offset += 1
             self._start_direct_download(relative_path, link, index, None, None)
@@ -138,9 +140,9 @@ class DownloadWindow(QWidget):
         self.show()
 
     def _start_direct_download(self, relative_path, link, index, headers, cookies, on_finished=None):
-        full_path = os.path.normpath(os.path.join(self.folder_path, relative_path))
-        if not link:
+        if not relative_path or not link:
             return
+        full_path = os.path.normpath(os.path.join(self.folder_path, relative_path))
 
         # Los torrents ya fueron procesados en paralelo, solo manejar archivos regulares
         if link.startswith("magnet:?") or link.endswith(".torrent"):

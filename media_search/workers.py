@@ -1,9 +1,16 @@
+import hashlib
+import math
+import os
 import shutil
 import subprocess
 import requests
 from bs4 import BeautifulSoup
 from PyQt5.QtCore import QObject, QRunnable, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QImage, QPixmap
+from config import CONFIG_PATH
+
+
+IMAGE_CACHE_DIR = os.path.join(os.path.dirname(CONFIG_PATH), "image_cache")
 
 
 class URLWorkerSignals(QObject):
@@ -40,9 +47,36 @@ class ImageLoaderWorker(QRunnable):
 
     def run(self):
         try:
-            img_data = requests.get(self.image_url, timeout=10).content
+            if not self.image_url:
+                self.signals.finished.emit(self.image_url, QPixmap())
+                return
+
+            os.makedirs(IMAGE_CACHE_DIR, exist_ok=True)
+            cache_path = os.path.join(
+                IMAGE_CACHE_DIR,
+                hashlib.sha1(self.image_url.encode("utf-8")).hexdigest() + ".img",
+            )
+
+            img_data = b""
+            if os.path.exists(cache_path):
+                with open(cache_path, "rb") as f:
+                    img_data = f.read()
+            else:
+                response = requests.get(self.image_url, timeout=10)
+                response.raise_for_status()
+                img_data = response.content
+                with open(cache_path, "wb") as f:
+                    f.write(img_data)
+
             image = QImage()
-            image.loadFromData(img_data)
+            if not image.loadFromData(img_data):
+                if os.path.exists(cache_path):
+                    try:
+                        os.remove(cache_path)
+                    except OSError:
+                        pass
+                self.signals.finished.emit(self.image_url, QPixmap())
+                return
             pixmap = QPixmap.fromImage(image)
             self.signals.finished.emit(self.image_url, pixmap)
         except Exception:
@@ -98,11 +132,11 @@ class SiteSearchWorker(QRunnable):
         self.signals.result_ready.emit(self.site_name, results)
 
 
-def search_jikan_mal(query, cat):
+def search_jikan_mal(query, cat, page=1):
     if cat not in ["anime", "manga"]:
         print("Categoría no válida. Usa 'anime' o 'manga'.")
-        return []
-    url = f"https://api.jikan.moe/v4/{cat}?q={query}&limit=25"
+        return {"items": [], "page": page, "last_page": 1, "total": 0}
+    url = f"https://api.jikan.moe/v4/{cat}?q={query}&limit=25&page={page}"
 
     try:
         response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -110,7 +144,7 @@ def search_jikan_mal(query, cat):
         data = response.json()
     except Exception as exc:
         print("[MyAnimeList/Jikan] Error:", exc)
-        return []
+        return {"items": [], "page": page, "last_page": 1, "total": 0}
 
     results = []
     for item in data.get("data", []):
@@ -132,52 +166,73 @@ def search_jikan_mal(query, cat):
             })
         except Exception as exc:
             print("Error procesando un resultado:", exc)
-    return results
+    pagination = data.get("pagination") or {}
+    return {
+        "items": results,
+        "page": pagination.get("current_page", page),
+        "last_page": pagination.get("last_visible_page", page),
+        "total": ((pagination.get("items") or {}).get("total")),
+    }
 
 
 class AnimeSearchWorkerSignals(QObject):
-    finished = pyqtSignal(list)
+    finished = pyqtSignal(dict)
 
 
 class AnimeSearchWorker(QRunnable):
-    def __init__(self, term, cat):
+    def __init__(self, term, cat, page=1):
         super().__init__()
         self.term = term
         self.cat = cat
+        self.page = page
         self.signals = AnimeSearchWorkerSignals()
 
     def run(self):
-        results = search_jikan_mal(self.term, self.cat) if self.cat in ("anime", "manga") else []
+        results = search_jikan_mal(self.term, self.cat, self.page) if self.cat in ("anime", "manga") else {
+            "items": [],
+            "page": self.page,
+            "last_page": self.page,
+            "total": 0,
+        }
         self.signals.finished.emit(results)
 
 
 class GameSearchWorkerSignals(QObject):
-    finished = pyqtSignal(list)
+    finished = pyqtSignal(dict)
 
 
 class GameSearchWorker(QRunnable):
-    def __init__(self, query, api_key):
+    def __init__(self, query, api_key, page=1):
         super().__init__()
         self.query = query
         self.api_key = api_key
+        self.page = page
         self.signals = GameSearchWorkerSignals()
 
     def run(self):
+        page_size = 20
         url = "https://api.rawg.io/api/games"
         params = {
             "search": self.query,
             "key": self.api_key,
-            "page_size": 20,
+            "page_size": page_size,
+            "page": self.page,
             "ordering": "-rating",
         }
 
         try:
             response = requests.get(url, params=params, timeout=10)
             response.raise_for_status()
-            data = response.json().get("results", [])
+            payload = response.json()
+            data = payload.get("results", [])
         except Exception as exc:
             print("[GameSearchWorker] Error:", exc)
-            self.signals.finished.emit([])
+            self.signals.finished.emit({
+                "items": [],
+                "page": self.page,
+                "last_page": self.page,
+                "total": 0,
+            })
             return
 
         results = []
@@ -200,7 +255,14 @@ class GameSearchWorker(QRunnable):
                 })
             except Exception as exc:
                 print("[GameSearchWorker] Error procesando resultado:", exc)
-        self.signals.finished.emit(results)
+        total = payload.get("count", 0)
+        last_page = max(1, math.ceil(total / page_size)) if total else self.page
+        self.signals.finished.emit({
+            "items": results,
+            "page": self.page,
+            "last_page": last_page,
+            "total": total,
+        })
 
 
 class GameDetailsWorkerSignals(QObject):
