@@ -1,4 +1,4 @@
-import os, random, re, requests, time
+import os, random, re, requests, shutil, subprocess, time
 from PyQt5.QtCore import QObject, pyqtSignal, QRunnable, QThreadPool, pyqtSlot
 from PyQt5.QtGui import QPixmap, QImage
 from bs4 import BeautifulSoup
@@ -257,6 +257,7 @@ class GameSearchWorker(QRunnable):
         for g in data:
             try:
                 results.append({
+                    "id": g.get("id"),
                     "source": "RAWG",
                     "title": g.get("name", "Sin título"),
                     "url": f"https://rawg.io/games/{g.get('slug', '')}",
@@ -265,14 +266,124 @@ class GameSearchWorker(QRunnable):
                     "rating": g.get("rating", "N/A"),
                     "genres": [genre["name"] for genre in g.get("genres", [])],
                     "platforms": [p["platform"]["name"] for p in g.get("platforms", [])],
-                    "description": g.get("short_description", "") or "Sin descripción.",
-                    "trailer": (g.get("clip", {}) or {}).get("clip"),
+                    "description": "Cargando descripción...",
+                    "movies_count": g.get("movies_count", 0),
+                    "trailer": None,
                     "loaded": True
                 })
             except Exception as e:
                 print("[GameSearchWorker] Error procesando resultado:", e)
-        print(results)
         self.signals.finished.emit(results)
+
+class GameDetailsWorkerSignals(QObject):
+    finished = pyqtSignal(int, str, str)
+
+class GameDetailsWorker(QRunnable):
+    def __init__(self, game_id, api_key):
+        super().__init__()
+        self.game_id = game_id
+        self.api_key = api_key
+        self.signals = GameDetailsWorkerSignals()
+
+    def run(self):
+        description = "Sin descripción."
+        trailer_url = None
+
+        try:
+            details_url = f"https://api.rawg.io/api/games/{self.game_id}"
+            details_response = requests.get(
+                details_url,
+                params={"key": self.api_key},
+                timeout=10
+            )
+            details_response.raise_for_status()
+            details = details_response.json()
+
+            raw_description = details.get("description") or ""
+            if raw_description:
+                description = BeautifulSoup(raw_description, "html.parser").get_text("\n", strip=True)
+            if details.get("movies_count", 0) > 0:
+                movies_url = f"https://api.rawg.io/api/games/{self.game_id}/movies"
+                movies_response = requests.get(
+                    movies_url,
+                    params={"key": self.api_key},
+                    timeout=10
+                )
+                movies_response.raise_for_status()
+                movies = movies_response.json().get("results", [])
+                for movie in movies:
+                    movie_data = movie.get("data") or {}
+                    trailer_url = movie_data.get("480")
+                    if trailer_url:
+                        break
+        except Exception as e:
+            print("[GameDetailsWorker] Error:", e)
+
+        self.signals.finished.emit(self.game_id, description, trailer_url or "")
+
+class TrailerLaunchWorkerSignals(QObject):
+    browser_fallback = pyqtSignal(str, str)
+    finished = pyqtSignal(str)
+
+class TrailerLaunchWorker(QRunnable):
+    def __init__(self, request_id, trailer_url, window_title):
+        super().__init__()
+        self.request_id = request_id
+        self.trailer_url = trailer_url
+        self.window_title = window_title
+        self.signals = TrailerLaunchWorkerSignals()
+
+    def run(self):
+        try:
+            if any(host in self.trailer_url for host in ("youtube.com", "youtu.be", "youtube-nocookie.com")):
+                yt_dlp_path = shutil.which("yt-dlp")
+                ffplay_path = shutil.which("ffplay")
+                if not yt_dlp_path or not ffplay_path:
+                    self.signals.browser_fallback.emit(self.request_id, self.trailer_url)
+                    return
+
+                result = subprocess.run(
+                    [yt_dlp_path, "-g", self.trailer_url],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=20
+                )
+                stream_url = next(
+                    (line.strip() for line in result.stdout.splitlines() if line.strip()),
+                    ""
+                )
+                if not stream_url:
+                    self.signals.browser_fallback.emit(self.request_id, self.trailer_url)
+                    return
+
+                command = [ffplay_path, "-autoexit"]
+                if self.window_title:
+                    command.extend(["-window_title", self.window_title])
+                command.append(stream_url)
+                process = subprocess.Popen(command)
+                process.wait()
+                return
+
+            if self.trailer_url.lower().endswith(".mp4"):
+                ffplay_path = shutil.which("ffplay")
+                if not ffplay_path:
+                    self.signals.browser_fallback.emit(self.request_id, self.trailer_url)
+                    return
+
+                command = [ffplay_path, "-autoexit"]
+                if self.window_title:
+                    command.extend(["-window_title", self.window_title])
+                command.append(self.trailer_url)
+                process = subprocess.Popen(command)
+                process.wait()
+                return
+
+            self.signals.browser_fallback.emit(self.request_id, self.trailer_url)
+        except Exception:
+            self.signals.browser_fallback.emit(self.request_id, self.trailer_url)
+        finally:
+            self.signals.finished.emit(self.request_id)
 
 class FactorioSearchSignals(QObject):
     finished = pyqtSignal(object, str)  # payload, error

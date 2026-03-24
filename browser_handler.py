@@ -5,13 +5,90 @@ import uuid
 from urllib.parse import urlparse
 import requests
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineProfile
-from PyQt5.QtCore import QUrl, QTimer, pyqtSignal, Qt
+from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QUrl, QTimer, pyqtSignal, Qt
 from bs4 import BeautifulSoup
 from gdrive_handler import (
     parse_gdrive_folder_id,
     parse_gdrive_file_id,
     resolve_gdrive_file,
 )
+
+
+def build_download_path(base_path, *parts):
+    segments = [segment for segment in (base_path, *parts) if segment]
+    if not segments:
+        return ""
+    return os.path.normpath(os.path.join(*segments))
+
+
+def extract_filename_from_headers(headers):
+    content_disposition = headers.get("Content-Disposition") or headers.get("content-disposition") or ""
+    if not content_disposition:
+        return None
+
+    filename = None
+    filename_star = re.search(r"filename\*=(?:UTF-8''|)([^;]+)", content_disposition, re.IGNORECASE)
+    if filename_star:
+        filename = filename_star.group(1).strip().strip('"').strip("'")
+    else:
+        filename_match = re.search(r'filename="?([^";]+)"?', content_disposition, re.IGNORECASE)
+        if filename_match:
+            filename = filename_match.group(1).strip()
+
+    if filename:
+        filename = os.path.basename(filename)
+    return filename or None
+
+
+def resolve_direct_filename(url):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    final_url = url
+    filename = None
+
+    try:
+        response = requests.head(url, allow_redirects=True, timeout=15, headers=headers)
+        final_url = response.url or url
+        filename = extract_filename_from_headers(response.headers)
+    except Exception:
+        pass
+
+    if not filename:
+        try:
+            response = requests.get(url, stream=True, allow_redirects=True, timeout=15, headers=headers)
+            final_url = response.url or final_url
+            filename = extract_filename_from_headers(response.headers)
+            response.close()
+        except Exception:
+            pass
+
+    if not filename:
+        filename = os.path.basename(urlparse(final_url).path)
+
+    if not filename:
+        filename = "archivo_descargado"
+
+    return filename
+
+
+class DirectFileResolveSignals(QObject):
+    finished = pyqtSignal(int, str, str, str)
+
+
+class DirectFileResolveWorker(QRunnable):
+    def __init__(self, index, url, current_path):
+        super().__init__()
+        self.index = index
+        self.url = url
+        self.current_path = current_path
+        self.signals = DirectFileResolveSignals()
+
+    def run(self):
+        filename = resolve_direct_filename(self.url)
+        self.signals.finished.emit(self.index, self.url, self.current_path, filename)
+
+
+DIRECT_RESOLVE_THREAD_POOL = QThreadPool()
+DIRECT_RESOLVE_THREAD_POOL.setMaxThreadCount(4)
 
 class SilentPage(QWebEnginePage):
     def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
@@ -43,11 +120,11 @@ class UniversalDownloader(QWebEngineView):
             if url.startswith("magnet:?"):
                 print(f"🔗 Magnet detectado: {url}")
                 filename = f"{uuid.uuid4().hex[:8]}.magnet"
-                self.offscreen_results.append((os.path.join(path, filename), url))
+                self.offscreen_results.append((build_download_path(path, filename), url))
             elif url.endswith(".torrent") or "torrage" in url or "itorrents" in url:
                 print(f"🔗 Torrent detectado: {url}")
                 filename = url.split("/")[-1].split("?")[0]
-                self.offscreen_results.append((os.path.join(path, filename), url))
+                self.offscreen_results.append((build_download_path(path, filename), url))
             else:
                 self.urls.append((url, path))
 
@@ -59,6 +136,8 @@ class UniversalDownloader(QWebEngineView):
         self._gdrive_waiting_download = False
         self._gdrive_folder_id = None
         self._gdrive_folder_path = ""
+        self._active_direct_worker = None
+        self._pending_direct_resolution = None
 
         self.setWindowTitle("Universal Downloader")
         self.setAttribute(Qt.WA_DeleteOnClose, False)
@@ -139,7 +218,7 @@ class UniversalDownloader(QWebEngineView):
             direct_link = download_button["href"]
             title_tag = soup.find("title")
             filename = title_tag.text.strip().split(" - ")[0] if title_tag else os.path.basename(direct_link)
-            full_path = os.path.join(current_path, filename)
+            full_path = build_download_path(current_path, filename)
             print(f"✅ Enlace directo (4shared): {direct_link}")
             print(f"💾 Guardar como: {full_path}")
             self.results.append((full_path, direct_link))
@@ -165,7 +244,7 @@ class UniversalDownloader(QWebEngineView):
             if file_id:
                 resolved = resolve_gdrive_file(url)
                 if resolved:
-                    full_path = os.path.join(current_path, resolved["filename"])
+                    full_path = build_download_path(current_path, resolved["filename"])
                     print(f"✅ Enlace directo (Google Drive): {resolved['download_url']}")
                     print(f"💾 Guardar como: {full_path}")
                     self.results.append({
@@ -280,7 +359,7 @@ class UniversalDownloader(QWebEngineView):
                 filename = os.path.basename(filename)
 
             if self._gdrive_waiting_download:
-                save_target = os.path.join(self._gdrive_folder_path, filename) if self._gdrive_folder_path else filename
+                save_target = build_download_path(self._gdrive_folder_path, filename)
                 print(f"✅ ZIP capturado desde Google Drive: {download_url}")
                 self.results.append({
                     "type": "direct",
@@ -356,7 +435,7 @@ class UniversalDownloader(QWebEngineView):
                     all_folders.append(self.build_mediafire_folder_url(sub_key, name))
             if all_links or all_folders:
                 folder_name = self.extract_mediafire_folder_name(url)
-                subfolder_path = os.path.join(base_path, folder_name)
+                subfolder_path = build_download_path(base_path, folder_name)
                 print(f"📁 {len(all_links)} archivos encontrados en carpeta '{folder_name}'.")
                 insert_position = self.current_index + 1
                 for link in reversed(all_links + all_folders):
@@ -393,7 +472,7 @@ class UniversalDownloader(QWebEngineView):
             direct_link = links.get("normal_download") or links.get("direct_download")
             if direct_link:
                 filename = self.extract_mediafire_filename(url) or os.path.basename(direct_link)
-                full_path = os.path.join(current_path, filename)
+                full_path = build_download_path(current_path, filename)
                 print(f"✅ Enlace directo: {direct_link}")
                 print(f"💾 Guardar como: {full_path}")
                 self.results.append((full_path, direct_link))
@@ -414,7 +493,7 @@ class UniversalDownloader(QWebEngineView):
         aux = []
         title_tag = soup.find(id="folder_name")
         folder_name = title_tag["title"] if title_tag and title_tag.has_attr("title") else "Subcarpeta"
-        subfolder_path = os.path.join(base_path, folder_name)
+        subfolder_path = build_download_path(base_path, folder_name)
 
         for a in soup.find_all("a", href=True):
             href = a["href"]
@@ -445,7 +524,7 @@ class UniversalDownloader(QWebEngineView):
         if button and button.has_attr("href"):
             direct_link = button["href"]
             filename = filename_tag.text.strip() if filename_tag else os.path.basename(direct_link)
-            full_path = os.path.join(current_path, filename)
+            full_path = build_download_path(current_path, filename)
             print(f"✅ Enlace directo: {direct_link}")
             print(f"💾 Guardar como: {full_path}")
             self.results.append((full_path, direct_link))
@@ -457,7 +536,7 @@ class UniversalDownloader(QWebEngineView):
     def proceed_to_next(self):
         self.current_index += 1
         if self.current_index < len(self.urls):
-            self.process_current_url()
+            QTimer.singleShot(0, self.process_current_url)
         else:
             self.direct_links_ready.emit(self.results)
             self.close()
@@ -585,56 +664,27 @@ class UniversalDownloader(QWebEngineView):
         return ext in direct_exts
 
     def handle_direct_file(self, url, current_path):
-        filename = self.resolve_direct_filename(url)
-        full_path = os.path.join(current_path, filename)
+        request = (self.current_index, url, current_path)
+        self._pending_direct_resolution = request
+        worker = DirectFileResolveWorker(*request)
+        worker.signals.finished.connect(self.on_direct_file_resolved)
+        self._active_direct_worker = worker
+        DIRECT_RESOLVE_THREAD_POOL.start(worker)
+
+    def on_direct_file_resolved(self, index, url, current_path, filename):
+        if self._pending_direct_resolution != (index, url, current_path):
+            return
+
+        self._pending_direct_resolution = None
+        self._active_direct_worker = None
+        full_path = build_download_path(current_path, filename)
         print(f"✅ Enlace directo detectado: {url}")
         print(f"💾 Guardar como: {full_path}")
         self.results.append((full_path, url))
         self.proceed_to_next()
 
     def resolve_direct_filename(self, url):
-        headers = {"User-Agent": "Mozilla/5.0"}
-        final_url = url
-        filename = None
-
-        try:
-            response = requests.head(url, allow_redirects=True, timeout=15, headers=headers)
-            final_url = response.url or url
-            filename = self.extract_filename_from_headers(response.headers)
-        except Exception:
-            pass
-
-        if not filename:
-            try:
-                response = requests.get(url, stream=True, allow_redirects=True, timeout=15, headers=headers)
-                final_url = response.url or final_url
-                filename = self.extract_filename_from_headers(response.headers)
-                response.close()
-            except Exception:
-                pass
-
-        if not filename:
-            filename = os.path.basename(urlparse(final_url).path)
-
-        if not filename:
-            filename = "archivo_descargado"
-
-        return filename
+        return resolve_direct_filename(url)
 
     def extract_filename_from_headers(self, headers):
-        content_disposition = headers.get("Content-Disposition") or headers.get("content-disposition") or ""
-        if not content_disposition:
-            return None
-
-        filename = None
-        filename_star = re.search(r"filename\*=(?:UTF-8''|)([^;]+)", content_disposition, re.IGNORECASE)
-        if filename_star:
-            filename = filename_star.group(1).strip().strip('"').strip("'")
-        else:
-            filename_match = re.search(r'filename="?([^";]+)"?', content_disposition, re.IGNORECASE)
-            if filename_match:
-                filename = filename_match.group(1).strip()
-
-        if filename:
-            filename = os.path.basename(filename)
-        return filename or None
+        return extract_filename_from_headers(headers)

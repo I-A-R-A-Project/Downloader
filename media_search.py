@@ -1,21 +1,48 @@
-import re, subprocess, sys, requests
+import json, os, re, subprocess, sys, tempfile, requests
+import webbrowser
+from urllib.parse import parse_qs, urlparse
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QRadioButton , QButtonGroup, QLineEdit, QListWidget,
     QLabel, QListWidgetItem, QTextEdit, QPushButton,
-    QMessageBox, QDialog, QTreeWidget, QTreeWidgetItem
+    QMessageBox, QDialog, QTreeWidget, QTreeWidgetItem, QFileDialog
 )
 from PyQt5.QtGui import QMovie, QKeyEvent
 from PyQt5.QtCore import Qt, QTimer, QSize, QThreadPool, pyqtSignal
 from aniteca import search_aniteca
 from bs4 import BeautifulSoup
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
+from settings_dialog import DEFAULT_CONFIG, load_config, save_config
 from workers import (
-    FullDetailsWorker, GameSearchWorker, ImageLoaderWorker,
-    AnimeSearchWorker, SiteSearchWorker, URLWorker
+    FullDetailsWorker, GameSearchWorker, GameDetailsWorker, ImageLoaderWorker,
+    AnimeSearchWorker, SiteSearchWorker, TrailerLaunchWorker, URLWorker
 )
 
 TMDB_API_KEY = 'TU_API_KEY_AQUI'
+RAWG_API_KEY = "aa29f7a40ca3431ea2b3352ac0e223cc"
+
+def normalize_trailer_url(url):
+    if not url:
+        return ""
+
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path or ""
+
+    if "youtu.be" in host:
+        video_id = path.strip("/")
+        return f"https://www.youtube.com/watch?v={video_id}" if video_id else url
+
+    if "youtube.com" in host or "youtube-nocookie.com" in host:
+        if path == "/watch":
+            video_id = parse_qs(parsed.query).get("v", [""])[0]
+            return f"https://www.youtube.com/watch?v={video_id}" if video_id else url
+        if path.startswith("/embed/"):
+            video_id = path.split("/embed/", 1)[1].split("/", 1)[0]
+            return f"https://www.youtube.com/watch?v={video_id}" if video_id else url
+
+    return url
+
 def search_tmdb(query):
     url = f'https://api.themoviedb.org/3/search/multi'
     params = {
@@ -133,6 +160,18 @@ class MultiChoiceDownloader(QWidget):
         self.layout = QVBoxLayout()
         label = QLabel("Selecciona los enlaces para descargar")
         self.layout.addWidget(label)
+        config = load_config()
+        self.default_download_path = config.get("folder_path", DEFAULT_CONFIG["folder_path"])
+        self.selected_download_path = self.default_download_path
+        path_row = QHBoxLayout()
+        path_row.addWidget(QLabel("Guardar en:"))
+        self.path_input = QLineEdit(self.default_download_path)
+        self.path_browse_button = QPushButton("📁")
+        self.path_browse_button.setFixedWidth(30)
+        self.path_browse_button.clicked.connect(self.choose_download_path)
+        path_row.addWidget(self.path_input)
+        path_row.addWidget(self.path_browse_button)
+        self.layout.addLayout(path_row)
         self.tree_widget = QTreeWidget()
         self.tree_widget.setHeaderHidden(True)
         self.tree_widget.itemChanged.connect(self.handle_item_changed)
@@ -205,6 +244,41 @@ class MultiChoiceDownloader(QWidget):
         self.layout.addWidget(self.btn_confirm)
         self.setLayout(self.layout)
 
+    def choose_download_path(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Seleccionar carpeta",
+            self.path_input.text().strip() or self.default_download_path,
+        )
+        if folder:
+            self.path_input.setText(folder)
+
+    def ensure_download_path(self):
+        folder_path = self.path_input.text().strip()
+        if not folder_path:
+            QMessageBox.warning(self, "Ruta faltante", "Elegí una carpeta de descarga.")
+            return None
+        if os.path.isdir(folder_path):
+            return folder_path
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle("Carpeta no encontrada")
+        msg.setText("La carpeta especificada no existe:\n\n" + folder_path)
+        msg.setInformativeText("¿Deseas crearla?")
+        create_btn = msg.addButton("Crear carpeta", QMessageBox.AcceptRole)
+        msg.addButton("Cancelar", QMessageBox.RejectRole)
+        msg.exec_()
+        if msg.clickedButton() != create_btn:
+            return None
+
+        try:
+            os.makedirs(folder_path, exist_ok=True)
+        except Exception as e:
+            QMessageBox.critical(self, "Error al crear carpeta", f"No se pudo crear la carpeta:\n{e}")
+            return None
+        return folder_path
+
     def parse_release_name(self,text):
         data = {
             "fansub": None,
@@ -255,6 +329,10 @@ class MultiChoiceDownloader(QWidget):
                 child.setCheckState(0, state)
 
     def confirm_selection(self):
+        self.selected_download_path = self.ensure_download_path()
+        if not self.selected_download_path:
+            return
+
         self.selected_links = []
         self.pending = 0
         self.results_temp = []
@@ -302,17 +380,24 @@ class MultiChoiceDownloader(QWidget):
             self.show_results()
 
     def show_results(self):
-        self.selected_links = [
+        selected_links = [
             (title, link) for _, title, link in sorted(filter(None, self.results_temp))
         ]
-        if self.selected_links:
+        if selected_links:
+            self.selected_links = [
+                {"url": link, "path": self.selected_download_path}
+                for _, link in selected_links
+            ]
+            config = load_config()
+            if config.get("folder_path") != self.selected_download_path:
+                config["folder_path"] = self.selected_download_path
+                save_config(config)
             links_str = "\n\n".join(
                 f"{title}\n{link}"
-                for title, link in self.selected_links
+                for title, link in selected_links
             )
             QMessageBox.information(self, "Links seleccionados", links_str)
-
-            self.selection_ready.emit([url for _, url in self.selected_links])
+            self.selection_ready.emit(self.selected_links)
 
         else:
             QMessageBox.warning(self, "Error", "No se pudieron obtener los enlaces.")
@@ -433,9 +518,14 @@ class MediaSearchUI(QWidget):
         layout.addWidget(self.download_label)
         self.setLayout(layout)
         self.current_item = None
+        self.trailer_request_id = None
 
     def set_category(self, value):
         self.category = value
+        if hasattr(self, "mods_button"):
+            self.mods_button.setVisible(self.category == "games")
+            if self.category != "games":
+                self.mods_button.setEnabled(False)
         print("Categoría seleccionada:", self.category)
 
     def perform_search(self):
@@ -458,8 +548,7 @@ class MediaSearchUI(QWidget):
         pool = QThreadPool.globalInstance()
 
         if self.category == "games":
-            API_KEY = "aa29f7a40ca3431ea2b3352ac0e223cc"
-            worker = GameSearchWorker(term, API_KEY)
+            worker = GameSearchWorker(term, RAWG_API_KEY)
             worker.signals.finished.connect(self.populate_results)
             pool.start(worker)
         elif self.category == "anime":
@@ -480,9 +569,7 @@ class MediaSearchUI(QWidget):
             source = item.get('source', '')
             if source == "RAWG":
                 title = item['title']
-                rating = item.get("rating", "N/A")
-                released = item.get("released", "Desconocido")
-                lw_item = QListWidgetItem(f"[{source}] {title} ({released}) ★{rating}")
+                lw_item = QListWidgetItem(f"[{source}] {title}")
             elif source == "MyAnimeList":
                 lw_item = QListWidgetItem(f"[{source}] - {item['title']}")
             else:
@@ -538,7 +625,8 @@ class MediaSearchUI(QWidget):
             trailer = data.get("trailer")
             if trailer:
                 self.trailer_button.setEnabled(True)
-                self.current_item.data(Qt.UserRole)["trailer"] = trailer
+                data["trailer"] = trailer
+                self.current_item.setData(Qt.UserRole, data)
             self.download_button.setEnabled(True)
             self.download_button.setText("Descargar")
             self.mods_button.setEnabled(False)
@@ -548,6 +636,23 @@ class MediaSearchUI(QWidget):
             self.labels_info[1].setText(f"<b>Géneros:<br>{', '.join(data.get('genres', []))}</b>")
             self.labels_info[2].setText(f"<b>Fecha lanzamiento:<br>{data.get('released', 'N/A')}</b>")
             self.labels_info[3].setText(f"<b>Rating:<br>{data.get('rating', 'N/A')}</b>")
+            self.spinner_movie.start()
+            self.image_label.setMovie(self.spinner_movie)
+
+            if data.get("image"):
+                worker = ImageLoaderWorker(data["image"])
+                worker.signals.finished.connect(self.set_detail_image)
+                QThreadPool.globalInstance().start(worker)
+            else:
+                self.spinner_movie.stop()
+                self.image_label.clear()
+
+            game_id = data.get("id")
+            if game_id:
+                self.details.setPlainText("Cargando descripción...")
+                details_worker = GameDetailsWorker(game_id, RAWG_API_KEY)
+                details_worker.signals.finished.connect(self.apply_game_details)
+                QThreadPool.globalInstance().start(details_worker)
 
             self.download_button.setText("Descargar (próximamente)")
             self.download_button.setEnabled(False)
@@ -564,10 +669,61 @@ class MediaSearchUI(QWidget):
             else:
                 self.image_label.clear()
 
+    def apply_game_details(self, game_id, description, trailer_url):
+        if not self.current_item:
+            return
+
+        data = self.current_item.data(Qt.UserRole) or {}
+        if data.get("source") != "RAWG" or data.get("id") != game_id:
+            return
+
+        data["description"] = description or "Sin descripción."
+        data["trailer"] = trailer_url or None
+        self.current_item.setData(Qt.UserRole, data)
+        self.details.setPlainText(data["description"])
+        self.trailer_button.setEnabled(bool(data["trailer"]))
+
+    def handle_trailer_browser_fallback(self, request_id, trailer_url):
+        if request_id != self.trailer_request_id:
+            return
+        webbrowser.open(trailer_url)
+
+    def handle_trailer_finished(self, request_id):
+        if request_id != self.trailer_request_id:
+            return
+        self.trailer_request_id = None
+        if self.current_item:
+            trailer_url = normalize_trailer_url((self.current_item.data(Qt.UserRole) or {}).get("trailer"))
+            self.trailer_button.setEnabled(bool(trailer_url))
+        else:
+            self.trailer_button.setEnabled(False)
+
     def show_trailer(self):
-        yt_url = self.current_item.data(Qt.UserRole)["trailer"]
-        self.trailer_window = TrailerWindow(yt_url, self)
+        if not self.current_item:
+            return
+
+        self.trailer_button.setEnabled(False)
+        trailer_url = normalize_trailer_url((self.current_item.data(Qt.UserRole) or {}).get("trailer"))
+        title = (self.current_item.data(Qt.UserRole) or {}).get("title", "").strip()
+        window_title = f"Trailer de {title}" if title else "Trailer"
+        if not trailer_url:
+            self.trailer_button.setEnabled(True)
+            return
+
+        if trailer_url.lower().endswith(".mp4") or any(
+            host in trailer_url for host in ("youtube.com", "youtu.be", "youtube-nocookie.com")
+        ):
+            request_id = f"{id(self.current_item)}:{trailer_url}"
+            self.trailer_request_id = request_id
+            worker = TrailerLaunchWorker(request_id, trailer_url, window_title)
+            worker.signals.browser_fallback.connect(self.handle_trailer_browser_fallback)
+            worker.signals.finished.connect(self.handle_trailer_finished)
+            QThreadPool.globalInstance().start(worker)
+            return
+
+        self.trailer_window = TrailerWindow(trailer_url, self)
         self.trailer_window.show()
+        self.trailer_button.setEnabled(True)
 
     def download_item(self):
         if not self.current_item:
@@ -619,8 +775,11 @@ class MediaSearchUI(QWidget):
                     self.selector_windows[title] = selector_window
                     selector_window.show()
 
-                    def handle_selection(links):
-                        subprocess.Popen(["python", "download_manager.py"] + links)
+                    def handle_selection(entries):
+                        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json", encoding="utf-8") as f:
+                            json.dump(entries, f, indent=2, ensure_ascii=False)
+                            json_path = f.name
+                        subprocess.Popen(["python", "download_manager.py", json_path])
                         selector_window.close()
                         del self.selector_windows[title]
 
@@ -664,7 +823,9 @@ class TrailerWindow(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Tráiler")
         self.resize(640, 360)
-
+        embed_url = embed_url or ""
+        self.web_view = None
+        layout = QVBoxLayout()
         html = f"""
         <html>
           <head>
@@ -678,10 +839,8 @@ class TrailerWindow(QDialog):
           </body>
         </html>
         """
-
-        layout = QVBoxLayout()
         self.web_view = QWebEngineView()
-        self.web_view.setPage(SilentPage(self.web_view)) 
+        self.web_view.setPage(SilentPage(self.web_view))
         self.web_view.setHtml(html)
         layout.addWidget(self.web_view)
         self.setLayout(layout)
@@ -689,14 +848,16 @@ class TrailerWindow(QDialog):
         QTimer.singleShot(2000, self.simulate_k_keypress)
 
     def simulate_k_keypress(self):
+        if not self.web_view:
+            return
         event = QKeyEvent(QKeyEvent.KeyPress, Qt.Key_K, Qt.NoModifier, 'k')
         QApplication.postEvent(self.web_view.focusProxy(), event)
         event_release = QKeyEvent(QKeyEvent.KeyRelease, Qt.Key_K, Qt.NoModifier, 'k')
         QApplication.postEvent(self.web_view.focusProxy(), event_release)
 
     def closeEvent(self, event):
-        # Esto detiene el video cargando una página en blanco
-        self.web_view.setHtml("<html><body></body></html>")
+        if self.web_view:
+            self.web_view.setHtml("<html><body></body></html>")
         super().closeEvent(event)
 
 # --- Ejecutar aplicación ---

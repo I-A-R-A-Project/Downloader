@@ -98,9 +98,15 @@ class DownloadWindow(QWidget):
         self.inner_layout = QVBoxLayout(self.inner_widget)
         self.scroll.setWidget(self.inner_widget)
         self.layout.addWidget(self.scroll)
+        self.actions_row = QHBoxLayout()
+        self.actions_row.addStretch(1)
+        self.add_links_button = QPushButton("Agregar enlaces")
+        self.add_links_button.clicked.connect(self.open_link_input)
+        self.actions_row.addWidget(self.add_links_button)
         self.settings_button = QPushButton("Configuración ⚙")
         self.settings_button.clicked.connect(self.open_settings_dialog)
-        self.layout.addWidget(self.settings_button)
+        self.actions_row.addWidget(self.settings_button)
+        self.layout.addLayout(self.actions_row)
 
         self.torrent_hashes = {}
         self.completed_torrents = set()
@@ -185,7 +191,7 @@ class DownloadWindow(QWidget):
         self.show()
 
     def _start_direct_download(self, relative_path, link, index, headers, cookies, on_finished=None):
-        full_path = os.path.join(self.folder_path, relative_path)
+        full_path = os.path.normpath(os.path.join(self.folder_path, relative_path))
         if not link:
             return
 
@@ -198,7 +204,8 @@ class DownloadWindow(QWidget):
         if dir_path:
             os.makedirs(dir_path, exist_ok=True)
 
-        label = QLabel(f"Descargando: {relative_path}")
+        display_path = os.path.normpath(relative_path) if relative_path else os.path.basename(full_path)
+        label = QLabel(f"Descargando: {display_path}")
         bar = QProgressBar()
         bar.setValue(0)
         self.inner_layout.addWidget(label)
@@ -292,11 +299,8 @@ class DownloadWindow(QWidget):
     def show_empty_state(self):
         container = QWidget()
         layout = QVBoxLayout(container)
-        label = QLabel("No se pasaron enlaces.")
-        button = QPushButton("Agregar enlaces")
-        button.clicked.connect(self.open_link_input)
+        label = QLabel("No se pasaron enlaces. Usá el botón Agregar enlaces para empezar.")
         layout.addWidget(label)
-        layout.addWidget(button)
         self.inner_layout.addWidget(container)
         self._empty_state_container = container
 
