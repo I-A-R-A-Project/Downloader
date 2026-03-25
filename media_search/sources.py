@@ -25,6 +25,9 @@ ELAMIGOS_HOST_LABELS = {
     "FILECRYPT",
     "KEEPLINKS",
 }
+FITGIRL_HOME_URL = "https://fitgirl-repacks.site/"
+FITGIRL_SEARCH_URL = FITGIRL_HOME_URL
+FITGIRL_USER_AGENT = "Mozilla/5.0"
 
 
 def normalize_trailer_url(url):
@@ -452,6 +455,320 @@ def search_elamigos(query, force_refresh=False, max_candidates=6):
             results.extend(_extract_elamigos_detail_links(detail_url, entry["title"]))
         except Exception as exc:
             print(f"[ElAmigos detail] Error con {entry.get('detail_url') or entry['title']}: {exc}")
+
+    unique = []
+    seen_urls = set()
+    for item in results:
+        if item["url"] in seen_urls:
+            continue
+        seen_urls.add(item["url"])
+        unique.append(item)
+    return unique
+
+
+def warm_elamigos_cache(force_refresh=False):
+    try:
+        _load_elamigos_raw_index(force_refresh=force_refresh)
+        return True
+    except Exception:
+        try:
+            _load_elamigos_index_html(force_refresh=force_refresh)
+            return True
+        except Exception as exc:
+            print(f"[ElAmigos preload] Error: {exc}")
+            return False
+
+
+def _fetch_fitgirl_search_page(query):
+    response = requests.get(
+        FITGIRL_SEARCH_URL,
+        params={"s": query},
+        headers={"User-Agent": FITGIRL_USER_AGENT},
+        timeout=20,
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def _extract_fitgirl_search_entries(html):
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    entries = []
+    seen = set()
+
+    for article in soup.select("article.category-lossless-repack"):
+        classes = set(article.get("class") or [])
+        if "post" not in classes:
+            continue
+
+        title_link = article.select_one("h1.entry-title a[href], h2.entry-title a[href]")
+        if not title_link:
+            continue
+
+        href = urljoin(FITGIRL_HOME_URL, title_link.get("href", "").strip())
+        title = _clean_fitgirl_title(title_link.get_text(" ", strip=True))
+        normalized_title = _normalize_search_text(title)
+        if not href or not title or not normalized_title or href in seen:
+            continue
+
+        seen.add(href)
+        entries.append({
+            "title": title,
+            "normalized_title": normalized_title,
+            "detail_url": href,
+        })
+
+    return entries
+
+
+def _clean_fitgirl_title(text):
+    cleaned = " ".join((text or "").split())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _is_fitgirl_direct_download_href(href):
+    if not href.startswith(("http://", "https://")):
+        return False
+
+    parsed = urlparse(href)
+    host = (parsed.netloc or "").lower().replace("www.", "")
+    if not host:
+        return False
+    if host.endswith("fitgirl-repacks.site") or host == "paste.fitgirl-repacks.site":
+        return False
+    if host in {"internetdownloadmanager.com", "jdownloader.org"}:
+        return False
+    return True
+
+
+def _build_fitgirl_direct_result(game_title, href, link_text):
+    link_text = re.sub(r"^Filehoster:\s*", "", link_text or "", flags=re.IGNORECASE).strip()
+    if not link_text:
+        link_text = urlparse(href).netloc.lower().replace("www.", "") or "Direct"
+
+    return {
+        "title": game_title,
+        "chapter": None,
+        "chapters": None,
+        "url_type": link_text,
+        "url": href,
+        "mirror_host": urlparse(href).netloc.lower().replace("www.", ""),
+        "resolucion": None,
+        "idioma": None,
+        "subtitulo": None,
+        "fansub": None,
+        "format": None,
+        "password": None,
+    }
+
+
+def _fitgirl_file_label(anchor, href):
+    anchor_text = _clean_fitgirl_title(anchor.get_text(" ", strip=True))
+    if anchor_text:
+        return anchor_text
+
+    filename = os.path.basename(urlparse(href).path.rstrip("/"))
+    return filename or href
+
+
+def _iter_fitgirl_section_nodes(heading):
+    node = heading.find_next_sibling()
+    while node is not None:
+        if getattr(node, "name", None) in {"h1", "h2", "h3"}:
+            break
+        yield node
+        node = node.find_next_sibling()
+
+
+def _extract_fitgirl_direct_links(soup, game_title):
+    results = []
+    seen = set()
+
+    heading = next(
+        (
+            tag for tag in soup.find_all(["h2", "h3"])
+            if "download mirrors (direct links)" in tag.get_text(" ", strip=True).lower()
+        ),
+        None,
+    )
+    if not heading:
+        return results
+
+    spoiler_results = []
+    for node in _iter_fitgirl_section_nodes(heading):
+        spoiler_blocks = node.select(".su-spoiler, .sp-wrap")
+        for spoiler in spoiler_blocks:
+            spoiler_title = spoiler.select_one(".su-spoiler-title, .sp-head")
+            spoiler_label = _clean_fitgirl_title(spoiler_title.get_text(" ", strip=True)) if spoiler_title else ""
+            spoiler_content = spoiler.select_one(".su-spoiler-content, .sp-body, .sp-content") or spoiler
+            spoiler_group = None
+            list_item = spoiler.find_parent("li")
+            if list_item:
+                paste_anchor = next(
+                    (
+                        anchor for anchor in list_item.find_all("a", href=True, recursive=False)
+                        if "paste.fitgirl-repacks.site" in (anchor.get("href", "") or "")
+                    ),
+                    None,
+                )
+                if paste_anchor:
+                    spoiler_group = _clean_fitgirl_title(paste_anchor.get_text(" ", strip=True))
+                    spoiler_group = re.sub(r"^Filehoster:\s*", "", spoiler_group, flags=re.IGNORECASE).strip()
+
+            for anchor in spoiler_content.find_all("a", href=True):
+                href = anchor.get("href", "").strip()
+                if not _is_fitgirl_direct_download_href(href):
+                    continue
+
+                anchor_text = _fitgirl_file_label(anchor, href)
+                result = _build_fitgirl_direct_result(game_title, href, spoiler_group or spoiler_label or anchor_text)
+                result["title"] = anchor_text
+                result["group"] = f"{game_title} [{result['url_type']}]"
+                dedupe_key = (result["url_type"].lower(), href)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                spoiler_results.append(result)
+
+        if spoiler_results:
+            continue
+
+        for item in node.find_all("li"):
+            anchors = item.find_all("a", href=True)
+            if not anchors:
+                continue
+
+            primary_link = anchors[0]
+            href = primary_link.get("href", "").strip()
+            if not _is_fitgirl_direct_download_href(href):
+                continue
+
+            link_text = _clean_fitgirl_title(primary_link.get_text(" ", strip=True))
+            result = _build_fitgirl_direct_result(game_title, href, link_text)
+            dedupe_key = (result["url_type"].lower(), href)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            results.append(result)
+
+    return spoiler_results or results
+
+
+def _extract_fitgirl_torrent_links(soup, game_title):
+    results = []
+    seen = set()
+
+    heading = next(
+        (
+            tag for tag in soup.find_all(["h2", "h3"])
+            if "download mirrors (torrent)" in tag.get_text(" ", strip=True).lower()
+        ),
+        None,
+    )
+    if not heading:
+        return results
+
+    for node in _iter_fitgirl_section_nodes(heading):
+        for item in node.find_all("li"):
+            anchors = item.find_all("a", href=True)
+            if not anchors:
+                continue
+
+            source_label = None
+            for anchor in anchors:
+                href = anchor.get("href", "").strip()
+                text = _clean_fitgirl_title(anchor.get_text(" ", strip=True))
+                if href.startswith(("http://", "https://")) and "torrent" not in text.lower():
+                    source_label = text or urlparse(href).netloc.lower().replace("www.", "")
+                    break
+
+            for anchor in anchors:
+                href = anchor.get("href", "").strip()
+                if not href.startswith("magnet:?"):
+                    continue
+
+                label = source_label or "magnet"
+                result_title = f"{game_title} [{label}]"
+                dedupe_key = (result_title, href)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+
+                results.append({
+                    "title": result_title,
+                    "chapter": None,
+                    "chapters": None,
+                    "url_type": "torrent",
+                    "url": href,
+                    "mirror_host": label,
+                    "resolucion": None,
+                    "idioma": None,
+                    "subtitulo": None,
+                    "fansub": None,
+                    "format": None,
+                    "password": None,
+                })
+
+    return results
+
+
+def _extract_fitgirl_detail_links(detail_url, game_title):
+    response = requests.get(
+        detail_url,
+        headers={"User-Agent": FITGIRL_USER_AGENT},
+        timeout=20,
+    )
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    results = []
+    results.extend(_extract_fitgirl_direct_links(soup, game_title))
+    results.extend(_extract_fitgirl_torrent_links(soup, game_title))
+    return results
+
+
+def search_fitgirl(query, force_refresh=False, max_candidates=6):
+    try:
+        html = _fetch_fitgirl_search_page(query)
+        entries = _extract_fitgirl_search_entries(html)
+    except Exception as exc:
+        print(f"[FitGirl] Error buscando '{query}': {exc}")
+        return []
+
+    if not entries:
+        return []
+
+    normalized_query = _normalize_search_text(query)
+    query_tokens = set(normalized_query.split())
+    scored = []
+    for entry in entries:
+        score = _score_elamigos_match(query, entry["title"], entry["normalized_title"])
+        if score >= 0.45:
+            scored.append((score, entry))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+
+    strong_candidates = []
+    for _, entry in scored:
+        normalized_title = entry["normalized_title"]
+        title_tokens = set(normalized_title.split())
+        if normalized_query and normalized_query in normalized_title:
+            strong_candidates.append(entry)
+            continue
+        if query_tokens and query_tokens.issubset(title_tokens):
+            strong_candidates.append(entry)
+
+    candidates = strong_candidates[:max_candidates] if strong_candidates else [entry for _, entry in scored[:max_candidates]]
+
+    results = []
+    for entry in candidates:
+        try:
+            results.extend(_extract_fitgirl_detail_links(entry["detail_url"], entry["title"]))
+        except Exception as exc:
+            print(f"[FitGirl detail] Error con {entry['detail_url']}: {exc}")
 
     unique = []
     seen_urls = set()

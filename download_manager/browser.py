@@ -27,6 +27,23 @@ INTERACTIVE_DOWNLOAD_HOSTS = {
     "www.ddownload.com",
     "ddl.to",
     "www.ddl.to",
+    "fuckingfast.co",
+    "www.fuckingfast.co",
+    "datanodes.to",
+    "www.datanodes.to",
+}
+
+AUTO_INTERACTIVE_DOWNLOAD_HOSTS = {
+    "rapidgator.net",
+    "www.rapidgator.net",
+    "ddownload.com",
+    "www.ddownload.com",
+    "ddl.to",
+    "www.ddl.to",
+    "fuckingfast.co",
+    "www.fuckingfast.co",
+    "datanodes.to",
+    "www.datanodes.to",
 }
 
 
@@ -73,6 +90,22 @@ def extract_filename_from_headers(headers):
     if filename:
         filename = os.path.basename(filename)
     return filename or None
+
+
+def extract_fuckingfast_download_url(html):
+    if not html:
+        return ""
+
+    patterns = [
+        r'window\.open\(\s*"(https://fuckingfast\.co/dl/[^"]+)"',
+        r"window\.open\(\s*'(https://fuckingfast\.co/dl/[^']+)'",
+        r'https://fuckingfast\.co/dl/[A-Za-z0-9._~%+\-/]+',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html, re.IGNORECASE)
+        if match:
+            return match.group(1) if match.groups() else match.group(0)
+    return ""
 
 
 def resolve_direct_filename(url):
@@ -196,6 +229,10 @@ class UniversalDownloader(QWebEngineView):
         self._filecrypt_link_wait_attempts = 0
         self._interactive_wait_attempts = 0
         self._interactive_download_path = ""
+        self._rapidgator_free_clicked_urls = set()
+        self._ddownload_regular_clicked_urls = set()
+        self._datanodes_free_clicked_urls = set()
+        self._datanodes_started_urls = set()
 
         self.setWindowTitle("Universal Downloader")
         self.setAttribute(Qt.WA_DeleteOnClose, False)
@@ -256,11 +293,12 @@ class UniversalDownloader(QWebEngineView):
         try:
             if self.current_index >= len(self.urls):
                 return
+            source_url = self.current_source_url()
             print(self.urls[self.current_index])
             print(f"[{self.current_index+1}/{len(self.urls)}] Páginas cargadas...")
             if not ok:
                 print("❌ La página no terminó de cargar correctamente.")
-            QTimer.singleShot(1500, self.route_url_handling)
+            QTimer.singleShot(1500, lambda source_url=source_url: self.route_url_handling_for(source_url))
         except Exception:
             print("❌ Error en on_load_finished:")
             print(traceback.format_exc())
@@ -300,6 +338,8 @@ class UniversalDownloader(QWebEngineView):
                 self.page().toHtml(lambda html: self.handle_4shared(html, path))
             elif "drive.google.com" in url:
                 self.handle_gdrive(url, path)
+            elif "fuckingfast.co" in (urlparse(url).hostname or "").lower():
+                self.page().toHtml(lambda html: self.handle_fuckingfast(url, path, html))
             elif is_interactive_download_host(url):
                 self.handle_interactive_download_host(url, path)
             elif self.is_direct_file_url(url):
@@ -311,6 +351,11 @@ class UniversalDownloader(QWebEngineView):
         except Exception:
             print("❌ Error en route_url_handling:")
             print(traceback.format_exc())
+
+    def route_url_handling_for(self, source_url):
+        if source_url != self.current_source_url():
+            return
+        self.route_url_handling()
 
     def is_filecrypt_url(self, url):
         return (urlparse(url).hostname or "").lower() in FILECRYPT_HOSTS
@@ -455,12 +500,16 @@ class UniversalDownloader(QWebEngineView):
         self._interactive_download_path = current_path
         self._interactive_wait_attempts += 1
         host = (urlparse(url).hostname or url)
-        if "rapidgator.net" in host:
+        if "rapidgator.net" in host and url not in self._rapidgator_free_clicked_urls:
             self.try_click_rapidgator_free()
+        if "ddownload.com" in host and url not in self._ddownload_regular_clicked_urls:
+            self.try_click_ddownload_regular()
+        if "datanodes.to" in host and url not in self._datanodes_started_urls:
+            self.try_click_datanodes_download()
         self.setWindowTitle(f"Continuá manualmente en {host}")
-        if self._interactive_wait_attempts % 10 == 1:
+        if self._interactive_wait_attempts % 10 == 1 and host not in AUTO_INTERACTIVE_DOWNLOAD_HOSTS:
             print(f"⏳ Esperando acción manual en {host}...")
-        QTimer.singleShot(1500, self.route_url_handling)
+        QTimer.singleShot(1500, lambda url=url: self.route_url_handling_for(url))
 
     def try_click_rapidgator_free(self):
         js = (
@@ -479,7 +528,71 @@ class UniversalDownloader(QWebEngineView):
 
     def on_rapidgator_free_clicked(self, result):
         if isinstance(result, dict) and result.get("clicked"):
+            self._rapidgator_free_clicked_urls.add(self.current_source_url())
             print(f"✅ Click automático en Rapidgator free: {result.get('text', '')}")
+
+    def try_click_ddownload_regular(self):
+        js = (
+            "(() => {"
+            "  const btn = document.getElementById('downloadbtn');"
+            "  if (!btn) { return { clicked: false, reason: 'missing' }; }"
+            "  if (btn.disabled || btn.classList.contains('dk2-btn-disabled')) {"
+            "    return { clicked: false, reason: 'disabled' };"
+            "  }"
+            "  if (btn.classList.contains('dk2-btn-blocked')) {"
+            "    return { clicked: false, reason: 'blocked' };"
+            "  }"
+            "  btn.click();"
+            "  return { clicked: true, text: (btn.innerText || btn.textContent || '').trim() };"
+            "})()"
+        )
+        self.page().runJavaScript(js, self.on_ddownload_regular_clicked)
+
+    def on_ddownload_regular_clicked(self, result):
+        if isinstance(result, dict) and result.get("clicked"):
+            self._ddownload_regular_clicked_urls.add(self.current_source_url())
+            print(f"✅ Click automático en DDownload regular: {result.get('text', '')}")
+
+    def try_click_datanodes_download(self):
+        current_url = self.current_source_url()
+        js = (
+            "(() => {"
+            "  const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();"
+            "  const clickable = Array.from(document.querySelectorAll('button, a, [role=\"button\"], input[type=\"button\"], input[type=\"submit\"]'));"
+            "  const visible = clickable.filter((el) => {"
+            "    const style = window.getComputedStyle(el);"
+            "    return style.display !== 'none' && style.visibility !== 'hidden' && !el.disabled;"
+            "  });"
+            "  const labels = visible.map((el) => normalize(el.innerText || el.textContent || el.value || ''));"
+            "  const pick = (matcher) => visible.find((el) => matcher(normalize(el.innerText || el.textContent || el.value || '')));"
+            "  const startBtn = pick((text) => text.includes('start download'));"
+            "  if (startBtn) {"
+            "    startBtn.click();"
+            "    return { clicked: true, phase: 'start', text: normalize(startBtn.innerText || startBtn.textContent || startBtn.value || '') };"
+            "  }"
+            f"  const allowFreeClick = {str(current_url not in self._datanodes_free_clicked_urls).lower()};"
+            "  const freeBtn = pick((text) => text.includes('free download'));"
+            "  if (allowFreeClick && freeBtn) {"
+            "    freeBtn.click();"
+            "    return { clicked: true, phase: 'free', text: normalize(freeBtn.innerText || freeBtn.textContent || freeBtn.value || '') };"
+            "  }"
+            "  return { clicked: false, labels: labels.slice(0, 30) };"
+            "})()"
+        )
+        self.page().runJavaScript(js, self.on_datanodes_download_clicked)
+
+    def on_datanodes_download_clicked(self, result):
+        if not isinstance(result, dict) or not result.get("clicked"):
+            return
+
+        phase = result.get("phase")
+        text = result.get("text", "")
+        if phase == "start":
+            self._datanodes_started_urls.add(self.current_source_url())
+            print(f"✅ Click automático en DataNodes start: {text}")
+        elif phase == "free":
+            self._datanodes_free_clicked_urls.add(self.current_source_url())
+            print(f"✅ Click automático en DataNodes free: {text}")
 
     def handle_4shared(self, html, current_path):
         soup = BeautifulSoup(html, "html.parser")
@@ -495,6 +608,34 @@ class UniversalDownloader(QWebEngineView):
         else:
             print("❌ No se encontró el enlace de descarga en 4shared.")
             self.results.append((None, None))
+        self.proceed_to_next()
+
+    def handle_fuckingfast(self, source_url, current_path, html):
+        direct_link = extract_fuckingfast_download_url(html)
+        if not direct_link:
+            print("❌ No se encontró el enlace /dl/ en FuckingFast.")
+            self.handle_interactive_download_host(source_url, current_path)
+            return
+
+        soup = BeautifulSoup(html, "html.parser")
+        title_tag = soup.find("title")
+        filename = (title_tag.get_text(" ", strip=True) if title_tag else "").strip()
+        if not filename:
+            meta_title = soup.find("meta", attrs={"name": "title"})
+            filename = (meta_title.get("content", "") if meta_title else "").strip()
+        if not filename:
+            filename = os.path.basename(urlparse(direct_link).path) or "archivo_descargado"
+
+        save_target = build_download_path(current_path, filename)
+        print(f"✅ Enlace directo (FuckingFast): {direct_link}")
+        print(f"💾 Guardar como: {save_target}")
+        self.results.append({
+            "type": "direct",
+            "path": save_target,
+            "url": direct_link,
+            "headers": {"User-Agent": "Mozilla/5.0", "Referer": source_url},
+            "cookies": self.cookies_for_url(direct_link),
+        })
         self.proceed_to_next()
 
     def handle_gdrive(self, url, current_path):

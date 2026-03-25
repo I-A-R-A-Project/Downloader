@@ -11,7 +11,15 @@ from PyQt5.QtCore import Qt, QTimer, QSize, QThreadPool, pyqtSignal
 from media_search.aniteca import search_aniteca
 from config import DEFAULT_CONFIG, load_config, save_config
 from media_search.dialogs import TrailerWindow
-from media_search.sources import RAWG_API_KEY, normalize_trailer_url, search_1337x, search_elamigos, search_nyaa
+from media_search.sources import (
+    RAWG_API_KEY,
+    normalize_trailer_url,
+    search_1337x,
+    search_elamigos,
+    search_fitgirl,
+    search_nyaa,
+    warm_elamigos_cache,
+)
 from media_search.workers import (
     GameSearchWorker, GameDetailsWorker, ImageLoaderWorker,
     AnimeSearchWorker, SiteSearchWorker, TrailerLaunchWorker, URLWorker
@@ -87,12 +95,17 @@ class MultiChoiceDownloader(QWidget):
 
                 if isinstance(resol, int):
                     subgroup_text += f" ({resol}p)"
-                    if subgroup_text not in aux:
-                        subgroup_item = QTreeWidgetItem([subgroup_text])
-                        subgroup_item.setFlags(subgroup_item.flags() | Qt.ItemIsUserCheckable)
-                        subgroup_item.setCheckState(0, Qt.Unchecked)
-                        aux[subgroup_text] = subgroup_item
-                        group_item.addChild(aux[subgroup_text])
+
+                explicit_group = result.get("group")
+                if isinstance(explicit_group, str) and explicit_group.strip():
+                    subgroup_text = explicit_group.strip()
+
+                if subgroup_text and subgroup_text not in aux:
+                    subgroup_item = QTreeWidgetItem([subgroup_text])
+                    subgroup_item.setFlags(subgroup_item.flags() | Qt.ItemIsUserCheckable)
+                    subgroup_item.setCheckState(0, Qt.Unchecked)
+                    aux[subgroup_text] = subgroup_item
+                    group_item.addChild(aux[subgroup_text])
 
                 password = result.get("password")
                 if isinstance(password, (int, str)):
@@ -404,6 +417,7 @@ class MediaSearchUI(QWidget):
         self.game_details_cache = {}
         self.game_details_inflight = set()
         self.game_details_queue = []
+        QTimer.singleShot(0, self.preload_download_sources)
 
     def set_category(self, value):
         self.category = value
@@ -412,6 +426,14 @@ class MediaSearchUI(QWidget):
             if self.category != "games":
                 self.mods_button.setEnabled(False)
         print("Categoría seleccionada:", self.category)
+
+    def preload_download_sources(self):
+        def warmup(_query):
+            warm_elamigos_cache()
+            return []
+
+        worker = SiteSearchWorker("_startup_elamigos_cache", warmup, "")
+        QThreadPool.globalInstance().start(worker)
 
     def perform_search(self):
         term = self.search_bar.text().strip()
@@ -827,7 +849,7 @@ class MediaSearchUI(QWidget):
         sources = [("Aniteca", search_aniteca), ("Nyaa", search_nyaa), ("1337x", search_1337x)]
         current_source = (self.current_item.data(Qt.UserRole) or {}).get("source", "")
         if current_source == "RAWG":
-            sources = [("ElAmigos", search_elamigos)]
+            sources = [("ElAmigos", search_elamigos), ("FitGirl", search_fitgirl)]
         self.pending_sites = {name for name, _ in sources}
 
         for name, func in sources:
