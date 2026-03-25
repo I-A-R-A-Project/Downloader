@@ -1,13 +1,13 @@
-import argparse, random, sys, subprocess, requests, re, json, tempfile
+import random, subprocess, requests, re, json, tempfile
 from PyQt5.QtCore import Qt, QThreadPool, QSize
 from PyQt5.QtGui import QMovie
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QPushButton, QComboBox,
     QTextEdit, QMessageBox, QStackedLayout, QDialog, QDialogButtonBox
 )
-from config import load_config, DEFAULT_CONFIG
-from mod_search.mod_paths_dialog import ModPathsDialog, DEFAULT_MOD_PATHS
+from config import load_config
+from mod_search.path_dialog import ModPathsDialog, DEFAULT_MOD_PATHS
 from media_search.workers import ImageLoaderWorker
 from mod_search.workers import (
     FactorioSearchWorker,
@@ -672,13 +672,4 @@ class ModSearchWindow(QWidget):
         else:
             self.status_label.setText("Dependencias ya estaban en el carrito.")
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--game", default="factorio")
-    args = parser.parse_args()
-
-    app = QApplication(sys.argv)
-    window = ModSearchWindow(game=args.game)
-    window.show()
-    sys.exit(app.exec_())
 

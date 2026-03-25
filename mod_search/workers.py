@@ -1,6 +1,4 @@
-import random
-import re
-import requests
+import random, re, requests
 from bs4 import BeautifulSoup
 from PyQt5.QtCore import QObject, QRunnable, pyqtSignal
 
