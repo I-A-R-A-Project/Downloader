@@ -3,7 +3,6 @@ from PyQt5.QtCore import QObject, QIODevice, QSharedMemory, QSystemSemaphore, QT
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 from PyQt5.QtWidgets import QApplication, QMessageBox
 from download_manager.window import DownloadWindow
-from download_manager.torrent import ensure_aria2_running
 
 SERVER_NAME = "MediaSearchPrototype.DownloadManager"
 
@@ -195,40 +194,6 @@ def parse_input(args, base_dir=None):
     else:
         return [{"url": a, "path": ""} for a in args]
 
-def check_aria2_availability():
-    try:
-        # Intentar asegurar que Aria2 esté disponible
-        if not ensure_aria2_running():
-            # Si no se pudo iniciar Aria2, mostrar advertencia
-            msg = QMessageBox()
-            msg.setIcon(QMessageBox.Warning)
-            msg.setWindowTitle("Aria2 no disponible")
-            msg.setText(
-                "No se pudo iniciar Aria2 para el manejo de torrents.\n\n"
-                "El programa funcionará normalmente para descargas HTTP, "
-                "pero no podrá manejar archivos .torrent o enlaces magnet.\n\n"
-                "Para habilitar torrents, instala Aria2:"
-            )
-            msg.setDetailedText(
-                "Pasos para instalar Aria2:\n\n"
-                "Windows:\n"
-                "1. Descarga Aria2 desde https://aria2.github.io/\n"
-                "2. Extrae aria2c.exe a una carpeta en tu PATH\n"
-                "3. O coloca aria2c.exe en la carpeta del programa\n\n"
-                "Linux/Mac:\n"
-                "sudo apt install aria2  (Ubuntu/Debian)\n"
-                "brew install aria2  (Mac con Homebrew)\n"
-                "pacman -S aria2  (Arch Linux)"
-            )
-            msg.exec_()
-            return False
-        else:
-            print("✅ Aria2 configurado correctamente para torrents")
-            return True
-    except Exception as e:
-        print(f"Error verificando Aria2: {e}")
-        return False
-
 if __name__ == '__main__':
     os.system("title Descargas")
     app = QApplication(sys.argv)
@@ -268,12 +233,11 @@ if __name__ == '__main__':
         bridge.close()
         sys.exit(1)
 
-    # Verificar disponibilidad de Aria2
-    check_aria2_availability()
-
-    window = DownloadWindow(entries)
+    window = DownloadWindow([])
     bridge.entries_received.connect(window.enqueue_external_entries)
     bridge.focus_requested.connect(window.bring_to_front)
     app.aboutToQuit.connect(bridge.close)
     window.show()
+    if entries:
+        QTimer.singleShot(0, lambda items=entries: window.load_entries(items))
     sys.exit(app.exec_())

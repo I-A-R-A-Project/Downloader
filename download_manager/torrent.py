@@ -1,13 +1,4 @@
-import os
-import threading
-import json
-import requests
-import subprocess
-import time
-import tempfile
-import zipfile
-import base64
-from urllib.parse import urlparse, parse_qs, unquote
+import os, threading, json, requests, subprocess, time, tempfile, zipfile, base64
 from PyQt5.QtCore import QRunnable, pyqtSignal, QObject
 
 ARIA2_RPC_URL = "http://localhost:6800/jsonrpc"

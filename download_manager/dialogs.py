@@ -1,24 +1,11 @@
 import os
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import (
-    QCheckBox,
-    QDialog,
-    QDialogButtonBox,
-    QFileDialog,
-    QFormLayout,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QMessageBox,
-    QPushButton,
-    QSpinBox,
-    QTextEdit,
-    QVBoxLayout,
-    QWidget,
+    QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QSpinBox, QTextEdit, QVBoxLayout, QWidget,
 )
-
-from config import DEFAULT_CONFIG, load_config
-from config import save_config
+from config import DEFAULT_CONFIG, load_config, save_config
 
 
 class SettingsDialog(QDialog):

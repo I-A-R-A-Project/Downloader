@@ -1,6 +1,5 @@
 import re
 from urllib.parse import urlparse, parse_qs
-
 import requests
 
 
@@ -42,7 +41,6 @@ def parse_gdrive_folder_id(url):
             return match.group(1)
     return None
 
-
 def _get_confirm_token(response_text, response_cookies):
     for key, value in response_cookies.items():
         if key.startswith("download_warning"):
@@ -55,7 +53,6 @@ def _get_confirm_token(response_text, response_cookies):
         return match.group(1)
     return None
 
-
 def _extract_filename_from_headers(headers):
     content_disposition = headers.get("content-disposition") or headers.get("Content-Disposition") or ""
     if not content_disposition:
@@ -67,19 +64,6 @@ def _extract_filename_from_headers(headers):
     if match:
         return match.group(1)
     return None
-
-
-def _extract_title_from_html(text):
-    if not text:
-        return None
-    match = re.search(r"<title>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
-    if not match:
-        return None
-    title = match.group(1).strip()
-    if " - Google Drive" in title:
-        title = title.replace(" - Google Drive", "").strip()
-    return title or None
-
 
 def resolve_gdrive_file(url, session=None):
     file_id = parse_gdrive_file_id(url)

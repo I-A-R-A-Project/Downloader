@@ -1,14 +1,9 @@
-import os
-import tempfile
-import requests
+import os, tempfile, requests
 from PyQt5.QtCore import QObject, QRunnable, pyqtSignal
-
 from download_manager.torrent import add_magnet_link, add_torrent_file
-
 
 class TorrentProcessorSignals(QObject):
     finished = pyqtSignal()
-
 
 class TorrentProcessor(QRunnable):
     def __init__(self, torrents, save_path):

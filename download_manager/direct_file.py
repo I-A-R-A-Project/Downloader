@@ -1,8 +1,5 @@
-import os
-import re
+import os, re, requests
 from urllib.parse import urlparse
-
-import requests
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
 
 

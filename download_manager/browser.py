@@ -1,16 +1,10 @@
-import os
-import re
-import traceback
-import uuid
+import os, re, time, traceback, uuid, requests
 from urllib.parse import urlparse
-import requests
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineProfile
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QUrl, QTimer, pyqtSignal, Qt
 from bs4 import BeautifulSoup
 from download_manager.gdrive_handler import (
-    parse_gdrive_folder_id,
-    parse_gdrive_file_id,
-    resolve_gdrive_file,
+    parse_gdrive_folder_id, parse_gdrive_file_id, resolve_gdrive_file,
 )
 
 FILECRYPT_HOSTS = {
@@ -178,8 +172,25 @@ class SilentPage(QWebEnginePage):
             return False
         return super().acceptNavigationRequest(url, navigation_type, is_main_frame)
 
+
+class ResultBuffer(list):
+    def __init__(self, on_append):
+        super().__init__()
+        self.on_append = on_append
+
+    def append(self, item):
+        super().append(item)
+        if self.on_append:
+            self.on_append(item)
+
+    def extend(self, items):
+        for item in items:
+            self.append(item)
+
+
 class UniversalDownloader(QWebEngineView):
     direct_links_ready = pyqtSignal(list)
+    direct_link_found = pyqtSignal(object)
 
     def __init__(self, urls):
         super().__init__()
@@ -213,7 +224,7 @@ class UniversalDownloader(QWebEngineView):
                 self.urls.append((url, path))
 
         self.current_index = 0
-        self.results = []
+        self.results = ResultBuffer(self._on_result_appended)
         self._cookies = {}
         self._gdrive_click_attempts = 0
         self._gdrive_click_max_attempts = 10
@@ -233,6 +244,7 @@ class UniversalDownloader(QWebEngineView):
         self._ddownload_regular_clicked_urls = set()
         self._datanodes_free_clicked_urls = set()
         self._datanodes_started_urls = set()
+        self._datanodes_free_retry_after = {}
 
         self.setWindowTitle("Universal Downloader")
         self.setAttribute(Qt.WA_DeleteOnClose, False)
@@ -253,6 +265,13 @@ class UniversalDownloader(QWebEngineView):
             self.process_current_url()
         else:
             self.close()
+
+    def _on_result_appended(self, item):
+        if not item:
+            return
+        if isinstance(item, tuple) and len(item) >= 2 and not all(item[:2]):
+            return
+        self.direct_link_found.emit(item)
 
     def current_source_url(self):
         if self.current_index >= len(self.urls):
@@ -313,6 +332,7 @@ class UniversalDownloader(QWebEngineView):
         self._filecrypt_link_wait_attempts = 0
         self._interactive_wait_attempts = 0
         self._interactive_download_path = ""
+        self._datanodes_free_retry_after[url] = time.time() + 1.5
         if self.is_direct_file_url(url):
             self.handle_direct_file(url, path)
             return
@@ -506,7 +526,10 @@ class UniversalDownloader(QWebEngineView):
             self.try_click_ddownload_regular()
         if "datanodes.to" in host and url not in self._datanodes_started_urls:
             self.try_click_datanodes_download()
-        self.setWindowTitle(f"Continuá manualmente en {host}")
+        if host in AUTO_INTERACTIVE_DOWNLOAD_HOSTS:
+            self.setWindowTitle(f"Resolviendo enlace en {host}")
+        else:
+            self.setWindowTitle(f"Continuá manualmente en {host}")
         if self._interactive_wait_attempts % 10 == 1 and host not in AUTO_INTERACTIVE_DOWNLOAD_HOSTS:
             print(f"⏳ Esperando acción manual en {host}...")
         QTimer.singleShot(1500, lambda url=url: self.route_url_handling_for(url))
@@ -555,9 +578,23 @@ class UniversalDownloader(QWebEngineView):
 
     def try_click_datanodes_download(self):
         current_url = self.current_source_url()
+        allow_free_click = (
+            current_url
+            and current_url not in self._datanodes_free_clicked_urls
+            and time.time() >= self._datanodes_free_retry_after.get(current_url, 0)
+        )
         js = (
             "(() => {"
             "  const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();"
+            "  const clickElement = (el) => {"
+            "    const rect = el.getBoundingClientRect();"
+            "    const options = { bubbles: true, cancelable: true, view: window, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };"
+            "    el.dispatchEvent(new MouseEvent('mouseover', options));"
+            "    el.dispatchEvent(new MouseEvent('mousedown', options));"
+            "    el.dispatchEvent(new MouseEvent('mouseup', options));"
+            "    el.dispatchEvent(new MouseEvent('click', options));"
+            "    if (typeof el.click === 'function') { el.click(); }"
+            "  };"
             "  const clickable = Array.from(document.querySelectorAll('button, a, [role=\"button\"], input[type=\"button\"], input[type=\"submit\"]'));"
             "  const visible = clickable.filter((el) => {"
             "    const style = window.getComputedStyle(el);"
@@ -567,13 +604,13 @@ class UniversalDownloader(QWebEngineView):
             "  const pick = (matcher) => visible.find((el) => matcher(normalize(el.innerText || el.textContent || el.value || '')));"
             "  const startBtn = pick((text) => text.includes('start download'));"
             "  if (startBtn) {"
-            "    startBtn.click();"
+            "    clickElement(startBtn);"
             "    return { clicked: true, phase: 'start', text: normalize(startBtn.innerText || startBtn.textContent || startBtn.value || '') };"
             "  }"
-            f"  const allowFreeClick = {str(current_url not in self._datanodes_free_clicked_urls).lower()};"
+            f"  const allowFreeClick = {str(bool(allow_free_click)).lower()};"
             "  const freeBtn = pick((text) => text.includes('free download'));"
             "  if (allowFreeClick && freeBtn) {"
-            "    freeBtn.click();"
+            "    clickElement(freeBtn);"
             "    return { clicked: true, phase: 'free', text: normalize(freeBtn.innerText || freeBtn.textContent || freeBtn.value || '') };"
             "  }"
             "  return { clicked: false, labels: labels.slice(0, 30) };"
@@ -585,13 +622,14 @@ class UniversalDownloader(QWebEngineView):
         if not isinstance(result, dict) or not result.get("clicked"):
             return
 
+        current_url = self.current_source_url()
         phase = result.get("phase")
         text = result.get("text", "")
         if phase == "start":
-            self._datanodes_started_urls.add(self.current_source_url())
+            self._datanodes_started_urls.add(current_url)
             print(f"✅ Click automático en DataNodes start: {text}")
         elif phase == "free":
-            self._datanodes_free_clicked_urls.add(self.current_source_url())
+            self._datanodes_free_clicked_urls.add(current_url)
             print(f"✅ Click automático en DataNodes free: {text}")
 
     def handle_4shared(self, html, current_path):

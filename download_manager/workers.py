@@ -1,8 +1,5 @@
-import os
-import requests
-import time
+import os, requests, time
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
-
 from config import DEFAULT_CONFIG, load_config
 
 
@@ -14,6 +11,7 @@ CHUNK_SIZE = 8192
 class DownloadSignals(QObject):
     progress = pyqtSignal(int, int)
     finished = pyqtSignal(int)
+    cancelled = pyqtSignal(int)
 
 
 class FileDownloader(QRunnable):
@@ -68,6 +66,7 @@ class FileDownloader(QRunnable):
                     with open(self.filename, mode) as f:
                         for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
                             if self._cancelled:
+                                self.signals.cancelled.emit(self.index)
                                 return
                             if chunk:
                                 f.write(chunk)
