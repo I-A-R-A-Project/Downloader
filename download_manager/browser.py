@@ -1,5 +1,5 @@
 import os, re, time, traceback, uuid, requests
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineProfile
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QUrl, QTimer, pyqtSignal, Qt
 from bs4 import BeautifulSoup
@@ -25,6 +25,10 @@ INTERACTIVE_DOWNLOAD_HOSTS = {
     "www.fuckingfast.co",
     "datanodes.to",
     "www.datanodes.to",
+    "megadb.net",
+    "www.megadb.net",
+    "gofile.io",
+    "www.gofile.io",
 }
 
 AUTO_INTERACTIVE_DOWNLOAD_HOSTS = {
@@ -38,7 +42,15 @@ AUTO_INTERACTIVE_DOWNLOAD_HOSTS = {
     "www.fuckingfast.co",
     "datanodes.to",
     "www.datanodes.to",
+    "megadb.net",
+    "www.megadb.net",
+    "gofile.io",
+    "www.gofile.io",
 }
+
+# VikingFile is intentionally not registered here for now.
+# The page is not loading correctly in the embedded WebEngine flow, so the
+# host remains disabled until the rendering/navigation issue is debugged.
 
 
 def build_download_path(base_path, *parts):
@@ -99,6 +111,47 @@ def extract_fuckingfast_download_url(html):
         match = re.search(pattern, html, re.IGNORECASE)
         if match:
             return match.group(1) if match.groups() else match.group(0)
+    return ""
+
+
+def extract_megadb_download_url(html):
+    if not html:
+        return ""
+
+    patterns = [
+        r'https?://[A-Za-z0-9.-]*megadb\.[A-Za-z.]+(?::\d+)?/d/[^"\'>\s]+',
+        r'https?://fs\d+\.[A-Za-z0-9.-]+/d/[^"\'>\s]+',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html, re.IGNORECASE)
+        if match:
+            return match.group(0)
+    return ""
+
+
+def extract_gofile_download_url(html):
+    if not html:
+        return ""
+
+    match = re.search(r'https?://[^"\'>\s]*gofile\.io/download/web/[^"\'>\s]+', html, re.IGNORECASE)
+    return match.group(0) if match else ""
+
+
+def extract_filename_from_url_candidate(url):
+    if not url:
+        return ""
+
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    dispositions = query.get("response-content-disposition") or query.get("response-content-disposition".lower()) or []
+    for disposition in dispositions:
+        filename = extract_filename_from_headers({"content-disposition": unquote(disposition)})
+        if filename:
+            return filename
+
+    path_name = os.path.basename(unquote(parsed.path))
+    if path_name:
+        return path_name
     return ""
 
 
@@ -245,6 +298,7 @@ class UniversalDownloader(QWebEngineView):
         self._datanodes_free_clicked_urls = set()
         self._datanodes_started_urls = set()
         self._datanodes_free_retry_after = {}
+        self._gofile_clicked_urls = set()
 
         self.setWindowTitle("Universal Downloader")
         self.setAttribute(Qt.WA_DeleteOnClose, False)
@@ -520,6 +574,16 @@ class UniversalDownloader(QWebEngineView):
         self._interactive_download_path = current_path
         self._interactive_wait_attempts += 1
         host = (urlparse(url).hostname or url)
+        actual_url = self.url().toString()
+        if self.try_capture_interactive_direct_url(url, current_path, actual_url):
+            return
+
+        if "megadb.net" in host:
+            self.page().toHtml(lambda html: self.handle_megadb(url, current_path, html))
+            return
+        if "gofile.io" in host:
+            self.page().toHtml(lambda html: self.handle_gofile(url, current_path, html))
+            return
         if "rapidgator.net" in host and url not in self._rapidgator_free_clicked_urls:
             self.try_click_rapidgator_free()
         if "ddownload.com" in host and url not in self._ddownload_regular_clicked_urls:
@@ -533,6 +597,41 @@ class UniversalDownloader(QWebEngineView):
         if self._interactive_wait_attempts % 10 == 1 and host not in AUTO_INTERACTIVE_DOWNLOAD_HOSTS:
             print(f"⏳ Esperando acción manual en {host}...")
         QTimer.singleShot(1500, lambda url=url: self.route_url_handling_for(url))
+
+    def is_likely_direct_download_url(self, url):
+        if not url:
+            return False
+        if self.is_direct_file_url(url):
+            return True
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if "cloudflarestorage.com" in host:
+            return True
+        if "gofile.io" in host and "/download/web/" in (parsed.path or "").lower():
+            return True
+        if "megadb." in host and "/d/" in (parsed.path or "").lower():
+            return True
+        return "response-content-disposition=" in (parsed.query or "").lower()
+
+    def capture_interactive_direct_link(self, source_url, current_path, direct_url, filename=""):
+        filename = filename or extract_filename_from_url_candidate(direct_url) or "archivo_descargado"
+        save_target = build_download_path(current_path, filename)
+        print(f"✅ Enlace directo ({urlparse(source_url).hostname or source_url}): {direct_url}")
+        print(f"💾 Guardar como: {save_target}")
+        self.results.append({
+            "type": "direct",
+            "path": save_target,
+            "url": direct_url,
+            "headers": {"User-Agent": "Mozilla/5.0", "Referer": source_url},
+            "cookies": self.cookies_for_url(direct_url),
+        })
+        self.proceed_to_next()
+
+    def try_capture_interactive_direct_url(self, source_url, current_path, actual_url):
+        if not self.is_likely_direct_download_url(actual_url):
+            return False
+        self.capture_interactive_direct_link(source_url, current_path, actual_url)
+        return True
 
     def try_click_rapidgator_free(self):
         js = (
@@ -631,6 +730,99 @@ class UniversalDownloader(QWebEngineView):
         elif phase == "free":
             self._datanodes_free_clicked_urls.add(current_url)
             print(f"✅ Click automático en DataNodes free: {text}")
+
+    def handle_megadb(self, source_url, current_path, html):
+        direct_link = extract_megadb_download_url(html)
+        if direct_link:
+            filename = extract_filename_from_url_candidate(direct_link)
+            if not filename:
+                soup = BeautifulSoup(html, "html.parser")
+                filename_tag = soup.find("span", class_="dfilename")
+                filename = filename_tag.get_text(" ", strip=True) if filename_tag else ""
+            self.capture_interactive_direct_link(source_url, current_path, direct_link, filename)
+            return
+
+        if self._interactive_wait_attempts % 10 == 1:
+            print("⏳ MegaDB: resolvé el captcha y hacé click en Download para continuar...")
+        self.setWindowTitle("MegaDB: resolvé el captcha y hacé click en Download")
+        QTimer.singleShot(1500, lambda url=source_url: self.route_url_handling_for(url))
+
+    def handle_gofile(self, source_url, current_path, html):
+        direct_link = extract_gofile_download_url(html)
+        if direct_link:
+            self.capture_interactive_direct_link(source_url, current_path, direct_link)
+            return
+
+        if source_url not in self._gofile_clicked_urls:
+            self.try_click_gofile_download()
+
+        if self._interactive_wait_attempts % 10 == 1:
+            print("⏳ Esperando botón o enlace final de Gofile...")
+        self.setWindowTitle("Resolviendo enlace en gofile.io")
+        QTimer.singleShot(1500, lambda url=source_url: self.route_url_handling_for(url))
+
+    def try_click_gofile_download(self):
+        js = (
+            "(() => {"
+            "  const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();"
+            "  const clickElement = (el) => {"
+            "    const rect = el.getBoundingClientRect();"
+            "    const options = { bubbles: true, cancelable: true, view: window, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };"
+            "    el.dispatchEvent(new MouseEvent('mouseover', options));"
+            "    el.dispatchEvent(new MouseEvent('mousedown', options));"
+            "    el.dispatchEvent(new MouseEvent('mouseup', options));"
+            "    el.dispatchEvent(new MouseEvent('click', options));"
+            "    if (typeof el.click === 'function') { el.click(); }"
+            "  };"
+            "  const elements = Array.from(document.querySelectorAll('a, button, [role=\"button\"]'));"
+            "  const visible = elements.filter((el) => {"
+            "    const style = window.getComputedStyle(el);"
+            "    return style.display !== 'none' && style.visibility !== 'hidden' && !el.disabled;"
+            "  });"
+            "  const anchorWithHref = visible.find((el) => {"
+            "    const href = el.getAttribute('href') || '';"
+            "    return href.includes('/download/web/');"
+            "  });"
+            "  if (anchorWithHref) {"
+            "    return { clicked: false, href: anchorWithHref.href || anchorWithHref.getAttribute('href') || '' };"
+            "  }"
+            "  const itemList = document.getElementById('filemanager_itemslist');"
+            "  const specific = itemList ? Array.from(itemList.querySelectorAll('.item_download')).find((el) => {"
+            "    const style = window.getComputedStyle(el);"
+            "    return style.display !== 'none' && style.visibility !== 'hidden' && !el.disabled;"
+            "  }) : null;"
+            "  if (specific) {"
+            "    const row = specific.closest('[data-item-id]');"
+            "    clickElement(specific);"
+            "    return {"
+            "      clicked: true,"
+            "      source: 'item_download',"
+            "      itemId: row ? row.getAttribute('data-item-id') || '' : '',"
+            "      text: normalize(specific.innerText || specific.textContent || specific.value || '')"
+            "    };"
+            "  }"
+            "  const button = visible.find((el) => normalize(el.innerText || el.textContent || el.value || '').includes('download'));"
+            "  if (!button) { return { clicked: false, reason: 'missing' }; }"
+            "  clickElement(button);"
+            "  return { clicked: true, source: 'generic', text: normalize(button.innerText || button.textContent || button.value || '') };"
+            "})()"
+        )
+        self.page().runJavaScript(js, self.on_gofile_download_clicked)
+
+    def on_gofile_download_clicked(self, result):
+        if not isinstance(result, dict):
+            return
+        if result.get("href"):
+            self.capture_interactive_direct_link(self.current_source_url(), self._interactive_download_path, result["href"])
+            return
+        if result.get("clicked"):
+            current_url = self.current_source_url()
+            self._gofile_clicked_urls.add(current_url)
+            item_id = result.get("itemId", "")
+            if item_id:
+                print(f"✅ Click automático en Gofile item {item_id}: {result.get('text', '')}")
+            else:
+                print(f"✅ Click automático en Gofile: {result.get('text', '')}")
 
     def handle_4shared(self, html, current_path):
         soup = BeautifulSoup(html, "html.parser")

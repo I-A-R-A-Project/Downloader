@@ -443,6 +443,11 @@ def _is_steamrip_external_download_href(href):
     host = (parsed.netloc or "").lower().replace("www.", "")
     if not host or host == "steamrip.com":
         return False
+    # VikingFile mirrors are intentionally hidden for now. The current page does not
+    # load correctly inside download_manager's WebEngine flow, so exposing them from
+    # media_search only creates dead-end entries until the host is debugged properly.
+    if host == "vikingfile.com":
+        return False
     if host in {
         "facebook.com",
         "x.com",

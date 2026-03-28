@@ -12,9 +12,13 @@ GUI tools for searching media and managing downloads (HTTP + torrents) built wit
 - `mod_search/`: mod browser package.
 
 ## What it does
-- Search anime/manga (Jikan/MyAnimeList), games (RAWG), and collect download links from:
+- Search anime/manga (Jikan/MyAnimeList), visual novels (VNDB Kana), and games (RAWG)
+- Collect download links from:
   - Aniteca (direct links)
   - Nyaa / 1337x (magnet links)
+  - ElAmigos
+  - FitGirl
+  - SteamRIP
 - Browse game mods and queue their downloads with dependency resolution
 - Launch a download manager UI for:
   - Direct downloads (MediaFire, Google Drive, 4shared, direct file URLs)
@@ -47,6 +51,7 @@ python media_search.py
 Notes:
 - Set your TMDb key in `media_search/sources.py` at `TMDB_API_KEY`.
 - RAWG uses the API key embedded in `media_search/sources.py`. Replace it with your own if needed.
+- Visual novels use the public VNDB Kana API.
 - Supported game entries can expose a `Ver mods` button that opens the mod browser.
 
 ### 1.1) Mod browser
@@ -99,7 +104,22 @@ Config fields:
   - file links download directly
   - folder links open the embedded browser, click `Descargar todo`, capture the generated ZIP URL, and download it through the app
 - 4shared
+- FileCrypt containers and link pages
+- Rapidgator / DDownload / DDL.to / FuckingFast / DataNodes through the embedded browser flow
+- MegaDB pages can continue after the captcha, but the user currently needs to click `Download` manually once the site enables it
 - Direct file URLs with common archive/installer/document extensions (`.zip`, `.rar`, `.7z`, `.exe`, `.msi`, `.pdf`, etc.)
+
+## Download source routing
+- Anime / manga downloads search: Aniteca, Nyaa, 1337x
+- Game downloads search: ElAmigos, FitGirl, SteamRIP
+- Visual novel downloads search: Nyaa, 1337x, ElAmigos, FitGirl, SteamRIP
+
+## TODO / current limitations
+- `media_search` can surface mirrors from ElAmigos, FitGirl and SteamRIP that are not yet fully implemented by `download_manager`.
+- Known examples are host-specific pages that still need additional extraction or click automation beyond the currently supported flow.
+- If a mirror opens but no final direct link is captured, that host still needs implementation in `download_manager/browser.py`.
+- SteamRIP currently contributes outgoing mirror URLs; whether each one downloads successfully depends on the host behind that mirror and the support already present in `download_manager`.
+- VikingFile mirrors are intentionally hidden for now because the page is not loading correctly inside `download_manager`.
 
 ## Notes
 - Torrents require Aria2 RPC at `http://localhost:6800/jsonrpc`.
