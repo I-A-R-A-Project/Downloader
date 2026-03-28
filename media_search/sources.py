@@ -28,6 +28,10 @@ ELAMIGOS_HOST_LABELS = {
 FITGIRL_HOME_URL = "https://fitgirl-repacks.site/"
 FITGIRL_SEARCH_URL = FITGIRL_HOME_URL
 FITGIRL_USER_AGENT = "Mozilla/5.0"
+STEAMRIP_HOME_URL = "https://steamrip.com/"
+STEAMRIP_GAMES_LIST_URL = urljoin(STEAMRIP_HOME_URL, "games-list/")
+STEAMRIP_USER_AGENT = "Mozilla/5.0"
+STEAMRIP_GAMES_LIST_CACHE_PATH = os.path.join(ELAMIGOS_CACHE_DIR, "steamrip_games_list.html")
 
 
 def normalize_trailer_url(url):
@@ -306,6 +310,118 @@ def _score_elamigos_match(query, candidate_title, normalized_candidate=None):
     return max(overlap * 0.9, similarity)
 
 
+def _clean_steamrip_title(text):
+    cleaned = " ".join((text or "").split())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _fetch_steamrip_games_list():
+    response = requests.get(
+        STEAMRIP_GAMES_LIST_URL,
+        headers={"User-Agent": STEAMRIP_USER_AGENT},
+        timeout=20,
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def _load_steamrip_games_list(force_refresh=False):
+    os.makedirs(ELAMIGOS_CACHE_DIR, exist_ok=True)
+
+    if not force_refresh and os.path.exists(STEAMRIP_GAMES_LIST_CACHE_PATH):
+        age = time.time() - os.path.getmtime(STEAMRIP_GAMES_LIST_CACHE_PATH)
+        if age <= ELAMIGOS_CACHE_MAX_AGE_SECONDS:
+            with open(STEAMRIP_GAMES_LIST_CACHE_PATH, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+
+    try:
+        html = _fetch_steamrip_games_list()
+    except Exception:
+        if os.path.exists(STEAMRIP_GAMES_LIST_CACHE_PATH):
+            with open(STEAMRIP_GAMES_LIST_CACHE_PATH, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        raise
+
+    with open(STEAMRIP_GAMES_LIST_CACHE_PATH, "w", encoding="utf-8", errors="ignore") as f:
+        f.write(html)
+    return html
+
+
+def _extract_steamrip_index_entries(html):
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    entries = []
+    seen = set()
+
+    for anchor in soup.find_all("a", href=True):
+        href = urljoin(STEAMRIP_HOME_URL, anchor.get("href", "").strip())
+        parsed = urlparse(href)
+        host = (parsed.netloc or "").lower().replace("www.", "")
+        if host != "steamrip.com":
+            continue
+        if not parsed.path or "/games-list" in parsed.path:
+            continue
+        if "free-download" not in parsed.path:
+            continue
+
+        title = _clean_steamrip_title(anchor.get_text(" ", strip=True))
+        if not title or title.lower() in {"steamrip", "download here"}:
+            continue
+
+        normalized_title = _normalize_search_text(title)
+        if not normalized_title or href in seen:
+            continue
+
+        seen.add(href)
+        entries.append({
+            "title": title,
+            "normalized_title": normalized_title,
+            "detail_url": href,
+        })
+
+    if entries:
+        return entries
+
+    bullet_blocks = []
+    current_block = ""
+    for raw_line in html.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("*"):
+            if current_block:
+                bullet_blocks.append(current_block)
+            current_block = stripped
+        elif current_block:
+            current_block += " " + stripped
+    if current_block:
+        bullet_blocks.append(current_block)
+
+    pattern = r"^\*\s+([^<>]+?)\s*<https://steamrip\.com/([^>]*free-download[^>]*)>"
+    for block in bullet_blocks:
+        match = re.search(pattern, block, flags=re.IGNORECASE)
+        if not match:
+            continue
+        title = _clean_steamrip_title(match.group(1)).strip("* ")
+        href = "https://steamrip.com/" + re.sub(r"\s+", "", match.group(2).lstrip("/"))
+        if not title or title.lower() in {"steamrip", "download here"}:
+            continue
+        normalized_title = _normalize_search_text(title)
+        if not normalized_title or href in seen:
+            continue
+        seen.add(href)
+        entries.append({
+            "title": title,
+            "normalized_title": normalized_title,
+            "detail_url": href,
+        })
+
+    return entries
+
+
 def _extract_external_url_from_internal_link(href):
     parsed = urlparse(href)
     if ELAMIGOS_HOST not in (parsed.netloc or "").lower():
@@ -317,6 +433,146 @@ def _extract_external_url_from_internal_link(href):
         if value and value.startswith(("http://", "https://")):
             return value
     return None
+
+
+def _is_steamrip_external_download_href(href):
+    if not href.startswith(("http://", "https://")):
+        return False
+
+    parsed = urlparse(href)
+    host = (parsed.netloc or "").lower().replace("www.", "")
+    if not host or host == "steamrip.com":
+        return False
+    if host in {
+        "facebook.com",
+        "x.com",
+        "twitter.com",
+        "pinterest.com",
+        "reddit.com",
+        "api.whatsapp.com",
+        "telegram.me",
+        "discord.gg",
+    }:
+        return False
+    if href.startswith("mailto:"):
+        return False
+    if any(token in href.lower() for token in (".png", ".jpg", ".jpeg", ".gif", ".webp")):
+        return False
+    return True
+
+
+def _steamrip_label_from_anchor(anchor, href):
+    prev_text = ""
+    for previous in anchor.previous_siblings:
+        text = previous.get_text(" ", strip=True) if hasattr(previous, "get_text") else str(previous).strip()
+        text = _clean_steamrip_title(text)
+        if text:
+            prev_text = re.sub(r"download here", "", text, flags=re.IGNORECASE).strip(" :-|*")
+            break
+    if prev_text:
+        return prev_text
+
+    for previous in anchor.parents:
+        sibling = previous.previous_sibling
+        while sibling is not None:
+            text = sibling.get_text(" ", strip=True) if hasattr(sibling, "get_text") else str(sibling).strip()
+            text = _clean_steamrip_title(text)
+            text = re.sub(r"download here", "", text, flags=re.IGNORECASE).strip(" :-|*")
+            if text and 1 <= len(text.split()) <= 4:
+                return text
+            sibling = getattr(sibling, "previous_sibling", None)
+
+    return urlparse(href).netloc.lower().replace("www.", "") or "Direct"
+
+
+def _extract_steamrip_detail_links(detail_url, game_title):
+    response = requests.get(
+        detail_url,
+        headers={"User-Agent": STEAMRIP_USER_AGENT},
+        timeout=20,
+    )
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    article = soup.select_one("article") or soup
+    results = []
+    seen = set()
+
+    for anchor in article.find_all("a", href=True):
+        href = anchor.get("href", "").strip()
+        href = _extract_external_url_from_internal_link(href) or urljoin(detail_url, href)
+        if not _is_steamrip_external_download_href(href):
+            continue
+
+        label = _steamrip_label_from_anchor(anchor, href)
+        dedupe_key = (label.lower(), href)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        results.append({
+            "title": game_title,
+            "chapter": None,
+            "chapters": None,
+            "url_type": label,
+            "url": href,
+            "mirror_host": urlparse(href).netloc.lower().replace("www.", ""),
+            "resolucion": None,
+            "idioma": None,
+            "subtitulo": None,
+            "fansub": None,
+            "format": None,
+            "password": None,
+        })
+
+    if results:
+        return results
+
+    lines = [line.strip() for line in response.text.splitlines()]
+    current_label = None
+    for raw_line in lines:
+        line = _clean_steamrip_title(raw_line).strip("* ")
+        if not line:
+            continue
+        url_match = re.search(r"<(https?://[^>]+)>", line)
+        upper_line = line.upper()
+
+        if not url_match and 1 <= len(line.split()) <= 4 and any(ch.isalpha() for ch in line):
+            if line.lower() not in {"download here", "related games", "popular games"}:
+                current_label = line
+            continue
+
+        if not url_match:
+            continue
+
+        href = url_match.group(1).strip()
+        if not _is_steamrip_external_download_href(href):
+            continue
+
+        label = current_label or _steamrip_label_from_anchor(anchor=soup.new_tag("a", href=href), href=href)
+        if "DOWNLOAD HERE" in upper_line and current_label:
+            label = current_label
+        dedupe_key = (label.lower(), href)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        results.append({
+            "title": game_title,
+            "chapter": None,
+            "chapters": None,
+            "url_type": label,
+            "url": href,
+            "mirror_host": urlparse(href).netloc.lower().replace("www.", ""),
+            "resolucion": None,
+            "idioma": None,
+            "subtitulo": None,
+            "fansub": None,
+            "format": None,
+            "password": None,
+        })
+
+    return results
 
 
 def _is_elamigos_host_heading(text):
@@ -477,6 +733,66 @@ def warm_elamigos_cache(force_refresh=False):
         except Exception as exc:
             print(f"[ElAmigos preload] Error: {exc}")
             return False
+
+
+def search_steamrip(query, force_refresh=False, max_candidates=6):
+    try:
+        html = _load_steamrip_games_list(force_refresh=force_refresh)
+        entries = _extract_steamrip_index_entries(html)
+    except Exception as exc:
+        print(f"[SteamRIP] Error cargando índice: {exc}")
+        return []
+
+    if not entries:
+        print("[SteamRIP] Índice remoto/caché vacío.")
+        return []
+
+    normalized_query = _normalize_search_text(query)
+    query_tokens = set(normalized_query.split())
+    scored = []
+    for entry in entries:
+        score = _score_elamigos_match(query, entry["title"], entry["normalized_title"])
+        if score >= 0.45:
+            scored.append((score, entry))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+
+    strong_candidates = []
+    for _, entry in scored:
+        normalized_title = entry["normalized_title"]
+        title_tokens = set(normalized_title.split())
+        if normalized_query and normalized_query in normalized_title:
+            strong_candidates.append(entry)
+            continue
+        if query_tokens and query_tokens.issubset(title_tokens):
+            strong_candidates.append(entry)
+
+    candidates = strong_candidates[:max_candidates] if strong_candidates else [entry for _, entry in scored[:max_candidates]]
+
+    results = []
+    for entry in candidates:
+        try:
+            results.extend(_extract_steamrip_detail_links(entry["detail_url"], entry["title"]))
+        except Exception as exc:
+            print(f"[SteamRIP detail] Error con {entry['detail_url']}: {exc}")
+
+    unique = []
+    seen_urls = set()
+    for item in results:
+        if item["url"] in seen_urls:
+            continue
+        seen_urls.add(item["url"])
+        unique.append(item)
+    return unique
+
+
+def warm_steamrip_cache(force_refresh=False):
+    try:
+        _load_steamrip_games_list(force_refresh=force_refresh)
+        return True
+    except Exception as exc:
+        print(f"[SteamRIP preload] Error: {exc}")
+        return False
 
 
 def _fetch_fitgirl_search_page(query):

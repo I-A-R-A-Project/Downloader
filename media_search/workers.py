@@ -1,6 +1,8 @@
 import hashlib
+import html
 import math
 import os
+import re
 import shutil
 import subprocess
 import requests
@@ -11,6 +13,8 @@ from config import CONFIG_PATH
 
 
 IMAGE_CACHE_DIR = os.path.join(os.path.dirname(CONFIG_PATH), "image_cache")
+VNDB_API_URL = "https://api.vndb.org/kana/vn"
+VNDB_RESULTS_PER_PAGE = 20
 
 
 class URLWorkerSignals(QObject):
@@ -54,10 +58,10 @@ class ImageLoaderWorker(QRunnable):
             os.makedirs(IMAGE_CACHE_DIR, exist_ok=True)
             cache_path = os.path.join(
                 IMAGE_CACHE_DIR,
-                hashlib.sha1(self.image_url.encode("utf-8")).hexdigest() + ".img",
+                hashlib.sha1(self.image_url.encode("utf-8")).hexdigest() + ".jpg",
             )
 
-            img_data = b""
+            img_data = ""
             if os.path.exists(cache_path):
                 with open(cache_path, "rb") as f:
                     img_data = f.read()
@@ -132,6 +136,115 @@ class SiteSearchWorker(QRunnable):
         self.signals.result_ready.emit(self.site_name, results)
 
 
+def _format_vndb_rating(value):
+    if value in (None, ""):
+        return ""
+    try:
+        return f"{float(value) / 10:.1f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _format_vndb_length(minutes, fallback_length):
+    if isinstance(minutes, int) and minutes > 0:
+        hours = minutes // 60
+        rem_minutes = minutes % 60
+        if hours and rem_minutes:
+            return f"{hours}h {rem_minutes}m"
+        if hours:
+            return f"{hours}h"
+        return f"{rem_minutes}m"
+
+    fallback_map = {
+        1: "Muy corta",
+        2: "Corta",
+        3: "Media",
+        4: "Larga",
+        5: "Muy larga",
+    }
+    return fallback_map.get(fallback_length, "")
+
+
+def _strip_vndb_markup(text):
+    if not text:
+        return "Sin descripción."
+
+    cleaned = html.unescape(text)
+    cleaned = re.sub(r"\[url=[^\]]+\](.*?)\[/url\]", r"\1", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"\[raw\](.*?)\[/raw\]", r"\1", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"\[quote\](.*?)\[/quote\]", r"\1", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"\[(/?)(b|i|u|s|code|spoiler|quote|raw|url|list|\*)[^\]]*\]", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = BeautifulSoup(cleaned, "html.parser").get_text("\n", strip=True)
+    return cleaned.strip() or "Sin descripción."
+
+
+def search_vndb_visual_novels(query, page=1):
+    payload = {
+        "filters": ["search", "=", query],
+        "fields": (
+            "title, alttitle, image.url, description, released, rating, "
+            "length_minutes, length, platforms, languages, developers{name}"
+        ),
+        "sort": "searchrank",
+        "results": VNDB_RESULTS_PER_PAGE,
+        "page": page,
+        "count": True,
+    }
+
+    try:
+        response = requests.post(
+            VNDB_API_URL,
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "MediaSearchPrototype/1.0",
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        print("[VNDB] Error:", exc)
+        return {"items": [], "page": page, "last_page": page, "total": 0}
+
+    total = data.get("count", 0) or 0
+    last_page = max(1, math.ceil(total / VNDB_RESULTS_PER_PAGE)) if total else page + (1 if data.get("more") else 0)
+    results = []
+
+    for item in data.get("results", []):
+        developers = [
+            developer.get("name", "").strip()
+            for developer in item.get("developers", [])
+            if developer.get("name")
+        ]
+        alttitle = (item.get("alttitle") or "").strip()
+        results.append({
+            "id": item.get("id"),
+            "source": "VNDB",
+            "title": item.get("title") or "Sin título",
+            "other_titles": [alttitle] if alttitle and alttitle != item.get("title") else [],
+            "url": f"https://vndb.org/{item.get('id', '')}",
+            "image": ((item.get("image") or {}).get("url")),
+            "description": _strip_vndb_markup(item.get("description")),
+            "released": item.get("released") or "Desconocido",
+            "rating": _format_vndb_rating(item.get("rating")),
+            "languages": item.get("languages", []),
+            "platforms": item.get("platforms", []),
+            "developers": developers,
+            "length_label": _format_vndb_length(item.get("length_minutes"), item.get("length")),
+            "trailer": None,
+            "loaded": True,
+        })
+
+    return {
+        "items": results,
+        "page": page,
+        "last_page": last_page,
+        "total": total,
+    }
+
+
 def search_jikan_mal(query, cat, page=1):
     if cat not in ["anime", "manga"]:
         print("Categoría no válida. Usa 'anime' o 'manga'.")
@@ -195,6 +308,21 @@ class AnimeSearchWorker(QRunnable):
             "total": 0,
         }
         self.signals.finished.emit(results)
+
+
+class VisualNovelSearchWorkerSignals(QObject):
+    finished = pyqtSignal(dict)
+
+
+class VisualNovelSearchWorker(QRunnable):
+    def __init__(self, query, page=1):
+        super().__init__()
+        self.query = query
+        self.page = page
+        self.signals = VisualNovelSearchWorkerSignals()
+
+    def run(self):
+        self.signals.finished.emit(search_vndb_visual_novels(self.query, self.page))
 
 
 class GameSearchWorkerSignals(QObject):

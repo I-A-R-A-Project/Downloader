@@ -18,11 +18,14 @@ from media_search.sources import (
     search_elamigos,
     search_fitgirl,
     search_nyaa,
+    search_steamrip,
     warm_elamigos_cache,
+    warm_steamrip_cache,
 )
 from media_search.workers import (
     GameSearchWorker, GameDetailsWorker, ImageLoaderWorker,
-    AnimeSearchWorker, SiteSearchWorker, TrailerLaunchWorker, URLWorker
+    AnimeSearchWorker, SiteSearchWorker, TrailerLaunchWorker, URLWorker,
+    VisualNovelSearchWorker,
 )
 
 class MultiChoiceDownloader(QWidget):
@@ -417,6 +420,14 @@ class MediaSearchUI(QWidget):
         self.game_details_cache = {}
         self.game_details_inflight = set()
         self.game_details_queue = []
+        self.search_placeholders = {
+            "general": "Buscar...",
+            "anime": "Buscar anime...",
+            "manga": "Buscar manga...",
+            "VN": "Buscar visual novels...",
+            "games": "Buscar juegos...",
+        }
+        self.update_search_placeholder()
         QTimer.singleShot(0, self.preload_download_sources)
 
     def set_category(self, value):
@@ -425,11 +436,21 @@ class MediaSearchUI(QWidget):
             self.mods_button.setVisible(self.category == "games")
             if self.category != "games":
                 self.mods_button.setEnabled(False)
+        self.update_search_placeholder()
         print("Categoría seleccionada:", self.category)
+
+    def update_search_placeholder(self):
+        if hasattr(self, "search_bar") and not self.search_bar.isEnabled():
+            self.search_bar.setPlaceholderText("Buscando...")
+            return
+        placeholder = getattr(self, "search_placeholders", {}).get(self.category, "Buscar...")
+        if hasattr(self, "search_bar"):
+            self.search_bar.setPlaceholderText(placeholder)
 
     def preload_download_sources(self):
         def warmup(_query):
             warm_elamigos_cache()
+            warm_steamrip_cache()
             return []
 
         worker = SiteSearchWorker("_startup_elamigos_cache", warmup, "")
@@ -459,7 +480,7 @@ class MediaSearchUI(QWidget):
         self.spinner_search_bar.show()
         self.spinner_movie.start()
         self.search_bar.setDisabled(True)
-        self.search_bar.setPlaceholderText("Buscando...")
+        self.update_search_placeholder()
         self.is_loading = True
 
         self.start_search(page=1, append=False)
@@ -470,6 +491,8 @@ class MediaSearchUI(QWidget):
             worker = GameSearchWorker(self.current_query, RAWG_API_KEY, page=page)
         elif self.category in ("anime", "manga"):
             worker = AnimeSearchWorker(self.current_query, self.category, page=page)
+        elif self.category == "VN":
+            worker = VisualNovelSearchWorker(self.current_query, page=page)
         else:
             self.finish_search({"items": [], "page": page, "last_page": page, "total": 0}, append)
             return
@@ -479,7 +502,7 @@ class MediaSearchUI(QWidget):
 
     def finish_search(self, payload, append):
         self.search_bar.setDisabled(False)
-        self.search_bar.setPlaceholderText("Buscar anime, película o serie...")
+        self.update_search_placeholder()
         self.spinner_movie.stop()
         self.spinner_search_bar.setHidden(True)
         self.search_button.show()
@@ -519,6 +542,8 @@ class MediaSearchUI(QWidget):
             lw_item = QListWidgetItem(f"[{source}] {item['title']}")
         elif source == "MyAnimeList":
             lw_item = QListWidgetItem(f"[{source}] - {item['title']}")
+        elif source == "VNDB":
+            lw_item = QListWidgetItem(f"[{source}] {item['title']}")
         else:
             lw_item = QListWidgetItem(item['title'])
 
@@ -617,6 +642,39 @@ class MediaSearchUI(QWidget):
                 self.mods_button.setEnabled(True)
             else:
                 self.mods_button.setEnabled(False)
+
+        if source == "VNDB":
+            languages = ", ".join(data.get("languages", [])) or "N/A"
+            platforms = ", ".join(data.get("platforms", [])) or "N/A"
+            released = data.get("released", "N/A")
+            rating = data.get("rating", "N/A") or "N/A"
+            self.labels_info[0].setText(f"<b>Idiomas:<br>{languages}</b>")
+            self.labels_info[1].setText(f"<b>Plataformas:<br>{platforms}</b>")
+            self.labels_info[2].setText(f"<b>Lanzamiento:<br>{released}</b>")
+            self.labels_info[3].setText(f"<b>Rating:<br>{score_to_color(rating)}</b>")
+            self.spinner_movie.start()
+            self.image_label.setMovie(self.spinner_movie)
+
+            if data.get("image"):
+                self.load_detail_image(data["image"])
+            else:
+                self.spinner_movie.stop()
+                self.image_label.clear()
+
+            extras = []
+            if data.get("developers"):
+                extras.append("Desarrolladores: " + ", ".join(data.get("developers", [])))
+            if data.get("length_label"):
+                extras.append("Duración: " + data.get("length_label"))
+            if data.get("other_titles"):
+                extras.append("Título alternativo: " + ", ".join(data.get("other_titles", [])))
+            if extras:
+                self.details.setPlainText(desc + "\n\n" + "\n".join(extras))
+
+            self.trailer_button.setEnabled(False)
+            self.download_button.setText("Descargar")
+            self.download_button.setEnabled(True)
+            self.mods_button.setEnabled(False)
 
     def load_detail_image(self, image_url):
         self.current_image_url = image_url or ""
@@ -849,7 +907,15 @@ class MediaSearchUI(QWidget):
         sources = [("Aniteca", search_aniteca), ("Nyaa", search_nyaa), ("1337x", search_1337x)]
         current_source = (self.current_item.data(Qt.UserRole) or {}).get("source", "")
         if current_source == "RAWG":
-            sources = [("ElAmigos", search_elamigos), ("FitGirl", search_fitgirl)]
+            sources = [("ElAmigos", search_elamigos), ("FitGirl", search_fitgirl), ("SteamRIP", search_steamrip)]
+        elif current_source == "VNDB":
+            sources = [
+                ("Nyaa", search_nyaa),
+                ("1337x", search_1337x),
+                ("ElAmigos", search_elamigos),
+                ("FitGirl", search_fitgirl),
+                ("SteamRIP", search_steamrip),
+            ]
         self.pending_sites = {name for name, _ in sources}
 
         for name, func in sources:
