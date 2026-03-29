@@ -50,7 +50,9 @@ python media_search.py
 ```
 Notes:
 - Set your TMDb key in `media_search/sources.py` at `TMDB_API_KEY`.
-- RAWG uses the API key embedded in `media_search/sources.py`. Replace it with your own if needed.
+- RAWG uses the API key embedded in `media_search/game_sources.py`. Replace it with your own if needed.
+- Anime download sources live in `media_search/anime_sources.py` and the Aniteca client in `media_search/aniteca.py`.
+- Game download sources live in `media_search/game_sources.py`.
 - Visual novels use the public VNDB Kana API.
 - Supported game entries can expose a `Ver mods` button that opens the mod browser.
 

@@ -16,7 +16,7 @@ class TrailerWindow(QDialog):
         self.resize(640, 360)
         embed_url = embed_url or ""
         self.web_view = None
-        layout = QVBoxLayout()
+        layout = QVBoxLayout(self)
         html = f"""
         <html>
           <head>
@@ -34,7 +34,6 @@ class TrailerWindow(QDialog):
         self.web_view.setPage(SilentPage(self.web_view))
         self.web_view.setHtml(html)
         layout.addWidget(self.web_view)
-        self.setLayout(layout)
         QTimer.singleShot(2000, self.simulate_k_keypress)
 
     def simulate_k_keypress(self):
