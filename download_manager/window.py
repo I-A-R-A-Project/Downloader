@@ -340,7 +340,7 @@ class DownloadWindow(QWidget):
         box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         layout = QVBoxLayout(box)
         layout.setContentsMargins(2, 5, 2, 5)
-        layout.setSpacing(8)
+        layout.setSpacing(5)
         self._insert_content_widget(box)
         group = {"box": box, "layout": layout}
         self.download_groups[group_key] = group
@@ -353,8 +353,7 @@ class DownloadWindow(QWidget):
 
         container = QFrame()
         container.setFrameShape(QFrame.StyledPanel)
-        container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        container.setMinimumHeight(78)
+        container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 
         layout = QVBoxLayout(container)
         layout.setContentsMargins(5, 5, 5, 5)

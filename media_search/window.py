@@ -2,9 +2,9 @@ import json, logging, os, re, subprocess, tempfile
 import webbrowser
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
-    QRadioButton , QButtonGroup, QLineEdit, QListWidget,
+    QComboBox, QLineEdit, QListWidget,
     QLabel, QListWidgetItem, QTextEdit, QPushButton,
-    QMessageBox, QTreeWidget, QTreeWidgetItem, QFileDialog
+    QMessageBox, QTreeWidget, QTreeWidgetItem
 )
 from PyQt5.QtGui import QMovie, QPixmap
 from PyQt5.QtCore import Qt, QTimer, QSize, QThreadPool, pyqtSignal
@@ -17,8 +17,8 @@ from media_search.game_sources import (
     warm_elamigos_cache,
     warm_steamrip_cache,
 )
-from config import DEFAULT_CONFIG, load_config, save_config
-from media_search.dialogs import TrailerWindow
+from config import DEFAULT_CONFIG, load_config
+from media_search.dialogs import MEDIA_CATEGORY_PATHS, MediaPathsDialog, TrailerWindow
 from media_search.sources import (
     normalize_trailer_url,
 )
@@ -31,30 +31,20 @@ from media_search.workers import (
 logger = logging.getLogger("media_search")
 
 class MultiChoiceDownloader(QWidget):
-    selection_ready = pyqtSignal(list)  
-    def __init__(self, results_dict,title):
+    selection_ready = pyqtSignal(list)
+
+    def __init__(self, results_dict, title, download_path):
         super().__init__()
         self.setWindowTitle(title)
         self.setGeometry(300, 300, 600, 400)
         self.results_dict = results_dict
+        self.download_path = download_path
         self.selected_links = []
         self.thread_pool = QThreadPool()
 
         self.layout = QVBoxLayout()
         label = QLabel("Selecciona los enlaces para descargar")
         self.layout.addWidget(label)
-        config = load_config()
-        self.default_download_path = config.get("folder_path", DEFAULT_CONFIG["folder_path"])
-        self.selected_download_path = self.default_download_path
-        path_row = QHBoxLayout()
-        path_row.addWidget(QLabel("Guardar en:"))
-        self.path_input = QLineEdit(self.default_download_path)
-        self.path_browse_button = QPushButton("📁")
-        self.path_browse_button.setFixedWidth(30)
-        self.path_browse_button.clicked.connect(self.choose_download_path)
-        path_row.addWidget(self.path_input)
-        path_row.addWidget(self.path_browse_button)
-        self.layout.addLayout(path_row)
         self.tree_widget = QTreeWidget()
         self.tree_widget.setHeaderHidden(True)
         self.tree_widget.itemChanged.connect(self.handle_item_changed)
@@ -132,41 +122,6 @@ class MultiChoiceDownloader(QWidget):
         self.layout.addWidget(self.btn_confirm)
         self.setLayout(self.layout)
 
-    def choose_download_path(self):
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "Seleccionar carpeta",
-            self.path_input.text().strip() or self.default_download_path,
-        )
-        if folder:
-            self.path_input.setText(folder)
-
-    def ensure_download_path(self):
-        folder_path = self.path_input.text().strip()
-        if not folder_path:
-            QMessageBox.warning(self, "Ruta faltante", "Elegí una carpeta de descarga.")
-            return None
-        if os.path.isdir(folder_path):
-            return folder_path
-
-        msg = QMessageBox(self)
-        msg.setIcon(QMessageBox.Warning)
-        msg.setWindowTitle("Carpeta no encontrada")
-        msg.setText("La carpeta especificada no existe:\n\n" + folder_path)
-        msg.setInformativeText("¿Deseas crearla?")
-        create_btn = msg.addButton("Crear carpeta", QMessageBox.AcceptRole)
-        msg.addButton("Cancelar", QMessageBox.RejectRole)
-        msg.exec_()
-        if msg.clickedButton() != create_btn:
-            return None
-
-        try:
-            os.makedirs(folder_path, exist_ok=True)
-        except Exception as e:
-            QMessageBox.critical(self, "Error al crear carpeta", f"No se pudo crear la carpeta:\n{e}")
-            return None
-        return folder_path
-
     def parse_release_name(self,text):
         data = {
             "fansub": None,
@@ -217,10 +172,6 @@ class MultiChoiceDownloader(QWidget):
                 child.setCheckState(0, state)
 
     def confirm_selection(self):
-        self.selected_download_path = self.ensure_download_path()
-        if not self.selected_download_path:
-            return
-
         self.selected_links = []
         self.pending = 0
         self.results_temp = []
@@ -273,13 +224,9 @@ class MultiChoiceDownloader(QWidget):
         ]
         if selected_links:
             self.selected_links = [
-                {"url": link, "path": self.selected_download_path}
+                {"url": link, "path": self.download_path}
                 for _, link in selected_links
             ]
-            config = load_config()
-            if config.get("folder_path") != self.selected_download_path:
-                config["folder_path"] = self.selected_download_path
-                save_config(config)
             links_str = "\n\n".join(
                 f"{title}\n{link}"
                 for title, link in selected_links
@@ -298,33 +245,33 @@ class MediaSearchUI(QWidget):
         self.resize(800, 500)
         layout = QVBoxLayout()
         self.spinner_movie = QMovie("spinner.gif")
-        self.spinner_movie.setScaledSize(QSize(20, 20)) 
+        self.spinner_movie.setScaledSize(QSize(20, 20))
 
-        types_layout = QHBoxLayout()
-        category_group = QButtonGroup()
-        self.gen_rbutton = QRadioButton("General")
-        self.anime_rbutton = QRadioButton("Anime")
-        self.manga_rbutton = QRadioButton("Manga")
-        self.vn_rbutton = QRadioButton("Visual Novel")
-        self.games_rbutton = QRadioButton("Games")
-        self.radio_map = [
-            (self.gen_rbutton, "general"),
-            (self.anime_rbutton, "anime"),
-            (self.manga_rbutton, "manga"),
-            (self.vn_rbutton, "VN"),
-            (self.games_rbutton, "games"),
+        config = load_config()
+        self.category_path_keys = {category: config_key for category, (config_key, _label) in MEDIA_CATEGORY_PATHS.items()}
+        self.download_paths = self.load_download_paths(config)
+
+        top_layout = QHBoxLayout()
+        top_layout.addWidget(QLabel("Categoría:"))
+        self.category_combo = QComboBox()
+        self.category_options = [
+            ("General", "general"),
+            ("Anime", "anime"),
+            ("Manga", "manga"),
+            ("Visual Novel", "VN"),
+            ("Games", "games"),
         ]
-        for rbutton, category_value in self.radio_map:
-            category_group.addButton(rbutton)
-            rbutton.setStyleSheet("font-weight: bold;")
-            rbutton.toggled.connect(lambda checked,
-                value=category_value: self.set_category(value) if checked else None
-            )
-            rbutton.setEnabled(True)
-            types_layout.addWidget(rbutton)
-        self.games_rbutton.toggle()
+        for label, value in self.category_options:
+            self.category_combo.addItem(label, value)
+        self.category_combo.currentIndexChanged.connect(self.on_category_changed)
+        top_layout.addWidget(self.category_combo)
+        self.paths_button = QPushButton("Carpetas de Descarga ⚙")
+        self.paths_button.clicked.connect(self.open_paths_dialog)
+        top_layout.addWidget(self.paths_button)
+        top_layout.addStretch(1)
         self.category = "games"
-        layout.addLayout(types_layout)
+        self.category_combo.setCurrentIndex(next(index for index, (_label, value) in enumerate(self.category_options) if value == self.category))
+        layout.addLayout(top_layout)
 
         search_layout = QHBoxLayout()
         self.search_bar = QLineEdit()
@@ -429,8 +376,21 @@ class MediaSearchUI(QWidget):
             "VN": "Buscar visual novels...",
             "games": "Buscar juegos...",
         }
+        self.settings_dialog = None
         self.update_search_placeholder()
         QTimer.singleShot(0, self.preload_download_sources)
+
+    def load_download_paths(self, config):
+        legacy_path = config.get("folder_path", DEFAULT_CONFIG["folder_path"])
+        return {
+            category: config.get(config_key) or legacy_path or DEFAULT_CONFIG[config_key]
+            for category, (config_key, _label) in MEDIA_CATEGORY_PATHS.items()
+        }
+
+    def on_category_changed(self, _index=None):
+        value = self.category_combo.currentData()
+        if value:
+            self.set_category(value)
 
     def set_category(self, value):
         self.category = value
@@ -457,6 +417,48 @@ class MediaSearchUI(QWidget):
 
         worker = SiteSearchWorker("_startup_elamigos_cache", warmup, "")
         QThreadPool.globalInstance().start(worker)
+
+    def current_download_path(self):
+        return self.download_paths.get(self.category) or DEFAULT_CONFIG[self.category_path_keys[self.category]]
+
+    def ensure_download_path(self, folder_path, label):
+        if os.path.isdir(folder_path):
+            return True
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle("Carpeta no encontrada")
+        msg.setText(f"{label} no existe:\n\n{folder_path}")
+        msg.setInformativeText("¿Deseas crearla?")
+        create_btn = msg.addButton("Crear carpeta", QMessageBox.AcceptRole)
+        msg.addButton("Cancelar", QMessageBox.RejectRole)
+        msg.exec_()
+        if msg.clickedButton() != create_btn:
+            return False
+
+        try:
+            os.makedirs(folder_path, exist_ok=True)
+            return True
+        except Exception as exc:
+            QMessageBox.critical(self, "Error al crear carpeta", f"No se pudo crear la carpeta:\n{exc}")
+            return False
+
+    def category_for_item(self, item_data):
+        source = (item_data or {}).get("source")
+        if source == "RAWG":
+            return "games"
+        if source == "VNDB":
+            return "VN"
+        if source == "MyAnimeList":
+            media_type = (item_data or {}).get("type", "")
+            return "manga" if media_type == "manga" else "anime"
+        return self.category
+
+    def open_paths_dialog(self):
+        dialog = MediaPathsDialog(self)
+        if dialog.exec_() == dialog.Accepted:
+            config = load_config()
+            self.download_paths = self.load_download_paths(config)
 
     def perform_search(self):
         term = self.search_bar.text().strip()
@@ -922,7 +924,14 @@ class MediaSearchUI(QWidget):
                 self.active_downloads.discard(title)
 
                 if self.results_dict:
-                    selector_window = MultiChoiceDownloader(self.results_dict, title)
+                    item_category = self.category_for_item(self.current_item.data(Qt.UserRole) or {})
+                    config_key, label = MEDIA_CATEGORY_PATHS[item_category]
+                    download_path = self.download_paths.get(item_category) or DEFAULT_CONFIG[config_key]
+                    if not self.ensure_download_path(download_path, f"Carpeta de descarga ({label})"):
+                        self.download_button.setEnabled(True)
+                        return
+
+                    selector_window = MultiChoiceDownloader(self.results_dict, title, download_path)
                     self.selector_windows[title] = selector_window
                     selector_window.show()
 

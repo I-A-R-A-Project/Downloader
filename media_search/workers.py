@@ -1,5 +1,6 @@
 import hashlib
 import html
+import logging
 import math
 import os
 import re
@@ -15,6 +16,7 @@ from config import CONFIG_PATH
 IMAGE_CACHE_DIR = os.path.join(os.path.dirname(CONFIG_PATH), "image_cache")
 VNDB_API_URL = "https://api.vndb.org/kana/vn"
 VNDB_RESULTS_PER_PAGE = 20
+logger = logging.getLogger("media_search")
 
 
 class URLWorkerSignals(QObject):
@@ -40,7 +42,7 @@ class URLWorker(QRunnable):
 
 
 class ImageLoadedSignal(QObject):
-    finished = pyqtSignal(str, QPixmap)
+    finished = pyqtSignal(str, QImage)
 
 
 class ImageLoaderWorker(QRunnable):
@@ -52,7 +54,8 @@ class ImageLoaderWorker(QRunnable):
     def run(self):
         try:
             if not self.image_url:
-                self.signals.finished.emit(self.image_url, QPixmap())
+                logger.debug("ImageLoaderWorker: empty image URL")
+                self.signals.finished.emit(self.image_url, QImage())
                 return
 
             os.makedirs(IMAGE_CACHE_DIR, exist_ok=True)
@@ -63,9 +66,11 @@ class ImageLoaderWorker(QRunnable):
 
             img_data = ""
             if os.path.exists(cache_path):
+                logger.debug("ImageLoaderWorker: cache hit for %s", self.image_url)
                 with open(cache_path, "rb") as f:
                     img_data = f.read()
             else:
+                logger.debug("ImageLoaderWorker: downloading %s", self.image_url)
                 response = requests.get(self.image_url, timeout=10)
                 response.raise_for_status()
                 img_data = response.content
@@ -79,12 +84,13 @@ class ImageLoaderWorker(QRunnable):
                         os.remove(cache_path)
                     except OSError:
                         pass
-                self.signals.finished.emit(self.image_url, QPixmap())
+                self.signals.finished.emit(self.image_url, QImage())
                 return
-            pixmap = QPixmap.fromImage(image)
-            self.signals.finished.emit(self.image_url, pixmap)
+            logger.debug("ImageLoaderWorker: loaded image for %s", self.image_url)
+            self.signals.finished.emit(self.image_url, image)
         except Exception:
-            self.signals.finished.emit(self.image_url, QPixmap())
+            logger.exception("ImageLoaderWorker: failed for %s", self.image_url)
+            self.signals.finished.emit(self.image_url, QImage())
 
 
 class FullDetailsWorkerSignals(QObject):
@@ -132,7 +138,9 @@ class SiteSearchWorker(QRunnable):
         self.signals = SiteSearchWorkerSignals()
 
     def run(self):
+        logger.debug("SiteSearchWorker: %s query=%r", self.site_name, self.query)
         results = self.search_func(self.query)
+        logger.debug("SiteSearchWorker: %s results=%s", self.site_name, len(results) if isinstance(results, list) else "n/a")
         self.signals.result_ready.emit(self.site_name, results)
 
 
@@ -193,6 +201,7 @@ def search_vndb_visual_novels(query, page=1):
     }
 
     try:
+        logger.info("VNDB search start: query=%r page=%s", query, page)
         response = requests.post(
             VNDB_API_URL,
             json=payload,
@@ -205,6 +214,7 @@ def search_vndb_visual_novels(query, page=1):
         response.raise_for_status()
         data = response.json()
     except Exception as exc:
+        logger.exception("VNDB search failed: query=%r page=%s", query, page)
         print("[VNDB] Error:", exc)
         return {"items": [], "page": page, "last_page": page, "total": 0}
 
@@ -237,6 +247,7 @@ def search_vndb_visual_novels(query, page=1):
             "loaded": True,
         })
 
+    logger.info("VNDB search end: query=%r page=%s items=%s total=%s", query, page, len(results), total)
     return {
         "items": results,
         "page": page,
@@ -252,10 +263,12 @@ def search_jikan_mal(query, cat, page=1):
     url = f"https://api.jikan.moe/v4/{cat}?q={query}&limit=25&page={page}"
 
     try:
+        logger.info("Jikan search start: category=%s query=%r page=%s", cat, query, page)
         response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
         response.raise_for_status()
         data = response.json()
     except Exception as exc:
+        logger.exception("Jikan search failed: category=%s query=%r page=%s", cat, query, page)
         print("[MyAnimeList/Jikan] Error:", exc)
         return {"items": [], "page": page, "last_page": 1, "total": 0}
 
@@ -280,6 +293,7 @@ def search_jikan_mal(query, cat, page=1):
         except Exception as exc:
             print("Error procesando un resultado:", exc)
     pagination = data.get("pagination") or {}
+    logger.info("Jikan search end: category=%s query=%r page=%s items=%s total=%s", cat, query, page, len(results), ((pagination.get("items") or {}).get("total")))
     return {
         "items": results,
         "page": pagination.get("current_page", page),
@@ -349,11 +363,13 @@ class GameSearchWorker(QRunnable):
         }
 
         try:
+            logger.info("RAWG search start: query=%r page=%s", self.query, self.page)
             response = requests.get(url, params=params, timeout=10)
             response.raise_for_status()
             payload = response.json()
             data = payload.get("results", [])
         except Exception as exc:
+            logger.exception("RAWG search failed: query=%r page=%s", self.query, self.page)
             print("[GameSearchWorker] Error:", exc)
             self.signals.finished.emit({
                 "items": [],
@@ -385,6 +401,7 @@ class GameSearchWorker(QRunnable):
                 print("[GameSearchWorker] Error procesando resultado:", exc)
         total = payload.get("count", 0)
         last_page = max(1, math.ceil(total / page_size)) if total else self.page
+        logger.info("RAWG search end: query=%r page=%s items=%s total=%s", self.query, self.page, len(results), total)
         self.signals.finished.emit({
             "items": results,
             "page": self.page,
@@ -409,6 +426,7 @@ class GameDetailsWorker(QRunnable):
         trailer_url = None
 
         try:
+            logger.debug("RAWG details start: game_id=%s", self.game_id)
             details_url = f"https://api.rawg.io/api/games/{self.game_id}"
             details_response = requests.get(details_url, params={"key": self.api_key}, timeout=10)
             details_response.raise_for_status()
@@ -428,8 +446,10 @@ class GameDetailsWorker(QRunnable):
                     if trailer_url:
                         break
         except Exception as exc:
+            logger.exception("RAWG details failed: game_id=%s", self.game_id)
             print("[GameDetailsWorker] Error:", exc)
 
+        logger.debug("RAWG details end: game_id=%s trailer=%s", self.game_id, bool(trailer_url))
         self.signals.finished.emit(self.game_id, description, trailer_url or "")
 
 

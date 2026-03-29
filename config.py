@@ -8,6 +8,11 @@ USERPROFILE = os.environ.get("USERPROFILE", os.path.expanduser("~"))
 CONFIG_PATH = os.path.join(APPDATA, "MediaSearchPrototype", "config.json")
 DEFAULT_CONFIG = {
     "folder_path": os.path.join(USERPROFILE, "Downloads"),
+    "general_folder_path": os.path.join(USERPROFILE, "Downloads"),
+    "anime_folder_path": os.path.join(USERPROFILE, "Downloads", "Anime"),
+    "manga_folder_path": os.path.join(USERPROFILE, "Downloads", "Manga"),
+    "vn_folder_path": os.path.join(USERPROFILE, "Downloads", "Visual Novels"),
+    "games_folder_path": os.path.join(USERPROFILE, "Downloads", "Games"),
     "open_on_finish": False,
     "max_parallel_downloads": 2,
     "factorio_mods_path": os.path.join(APPDATA, "Factorio", "mods"),
