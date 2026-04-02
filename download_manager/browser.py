@@ -205,6 +205,197 @@ class DirectFileResolveWorker(QRunnable):
 DIRECT_RESOLVE_THREAD_POOL = QThreadPool()
 DIRECT_RESOLVE_THREAD_POOL.setMaxThreadCount(4)
 
+
+class HostResolveSignals(QObject):
+    finished = pyqtSignal(object, object)
+    error = pyqtSignal(object, str)
+
+
+class GDriveResolveWorker(QRunnable):
+    def __init__(self, request_id, url):
+        super().__init__()
+        self.request_id = request_id
+        self.url = url
+        self.signals = HostResolveSignals()
+
+    def run(self):
+        try:
+            resolved = resolve_gdrive_file(self.url)
+            self.signals.finished.emit(self.request_id, resolved)
+        except Exception:
+            self.signals.error.emit(self.request_id, traceback.format_exc())
+
+
+class MediaFireResolveWorker(QRunnable):
+    def __init__(self, request_id, mode, url):
+        super().__init__()
+        self.request_id = request_id
+        self.mode = mode
+        self.url = url
+        self.signals = HostResolveSignals()
+
+    def run(self):
+        try:
+            if self.mode == "folder":
+                result = self.resolve_folder(self.url)
+            else:
+                result = self.resolve_file(self.url)
+            self.signals.finished.emit(self.request_id, result)
+        except Exception:
+            self.signals.error.emit(self.request_id, traceback.format_exc())
+
+    def resolve_folder(self, url):
+        folder_key = self.extract_mediafire_folder_key(url)
+        if not folder_key:
+            return {"ok": False, "reason": "missing-folder-key"}
+
+        all_links = []
+        all_folders = []
+        files = self.fetch_mediafire_folder_items(folder_key, "files")
+        folders = self.fetch_mediafire_folder_items(folder_key, "folders")
+
+        for file_item in files:
+            quickkey = file_item.get("quickkey")
+            filename = file_item.get("filename") or "archivo"
+            if quickkey:
+                all_links.append(self.build_mediafire_file_url(quickkey, filename))
+
+        for folder_item in folders:
+            sub_key = folder_item.get("folderkey")
+            name = (folder_item.get("name") or "Subcarpeta").replace(" ", "_")
+            if sub_key:
+                all_folders.append(self.build_mediafire_folder_url(sub_key, name))
+
+        return {
+            "ok": True,
+            "folder_name": self.extract_mediafire_folder_name(url),
+            "links": all_links,
+            "folders": all_folders,
+        }
+
+    def resolve_file(self, url):
+        quickkey = self.extract_mediafire_quickkey(url)
+        if not quickkey:
+            return {"ok": False, "reason": "missing-quickkey"}
+
+        headers = {"User-Agent": "Mozilla/5.0"}
+        params = {"quick_key": quickkey, "response_format": "json"}
+
+        try:
+            response = requests.get(
+                "https://www.mediafire.com/api/1.5/file/get_links.php",
+                params=params,
+                timeout=30,
+                headers=headers,
+            )
+            response.raise_for_status()
+            data = response.json()
+            links = data.get("response", {}).get("links", {})
+            direct_link = links.get("normal_download") or links.get("direct_download")
+            if direct_link:
+                return {
+                    "ok": True,
+                    "direct_link": direct_link,
+                    "filename": self.extract_mediafire_filename(url) or os.path.basename(direct_link),
+                }
+        except Exception:
+            pass
+
+        html = self.fetch_mediafire_html(url)
+        if not html:
+            return {"ok": False, "reason": "html-unavailable"}
+
+        soup = BeautifulSoup(html, "html.parser")
+        button = soup.find("a", {"id": "downloadButton"})
+        filename_tag = soup.find("div", class_="filename")
+        if button and button.has_attr("href"):
+            direct_link = button["href"]
+            filename = filename_tag.text.strip() if filename_tag else os.path.basename(direct_link)
+            return {"ok": True, "direct_link": direct_link, "filename": filename}
+
+        return {"ok": False, "reason": "download-link-not-found"}
+
+    def extract_mediafire_folder_key(self, url):
+        match = re.search(r"/folder/([^/]+)", url)
+        return match.group(1) if match else None
+
+    def extract_mediafire_folder_name(self, url):
+        match = re.search(r"/folder/[^/]+/([^/]+)", url)
+        if match:
+            return match.group(1).replace("_", " ")
+        return "Subcarpeta"
+
+    def extract_mediafire_quickkey(self, url):
+        match = re.search(r"/file/([^/]+)", url)
+        if match:
+            return match.group(1)
+        match = re.search(r"/download/([^/]+)", url)
+        return match.group(1) if match else None
+
+    def extract_mediafire_filename(self, url):
+        match = re.search(r"/file/[^/]+/([^/]+)/", url)
+        return match.group(1) if match else None
+
+    def build_mediafire_file_url(self, quickkey, filename):
+        safe_name = filename.replace(" ", "_")
+        return f"https://www.mediafire.com/file/{quickkey}/{safe_name}/file"
+
+    def build_mediafire_folder_url(self, folder_key, folder_name):
+        safe_name = folder_name.replace(" ", "_")
+        return f"https://www.mediafire.com/folder/{folder_key}/{safe_name}"
+
+    def normalize_mediafire_items(self, value, key):
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = value.get(key)
+            if isinstance(nested, list):
+                return nested
+            if isinstance(nested, dict):
+                return [nested]
+        return []
+
+    def fetch_mediafire_folder_items(self, folder_key, content_type):
+        headers = {"User-Agent": "Mozilla/5.0"}
+        items = []
+        chunk = 1
+        more_chunks = True
+        while more_chunks:
+            params = {
+                "folder_key": folder_key,
+                "content_type": content_type,
+                "filter": "all",
+                "response_format": "json",
+                "chunk": chunk,
+            }
+            response = requests.get(
+                "https://www.mediafire.com/api/1.5/folder/get_content.php",
+                params=params,
+                timeout=30,
+                headers=headers,
+            )
+            response.raise_for_status()
+            data = response.json()
+            content = data.get("response", {}).get("folder_content", {})
+            raw = content.get(content_type)
+            if content_type == "files":
+                items.extend(self.normalize_mediafire_items(raw, "file"))
+            else:
+                items.extend(self.normalize_mediafire_items(raw, "folder"))
+            more_chunks = str(content.get("more_chunks", "")).lower() == "yes"
+            chunk += 1
+        return items
+
+    def fetch_mediafire_html(self, url):
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, timeout=30, headers=headers)
+        response.raise_for_status()
+        return response.text
+
+
+HOST_RESOLVE_THREAD_POOL = QThreadPool()
+HOST_RESOLVE_THREAD_POOL.setMaxThreadCount(4)
+
 class SilentPage(QWebEnginePage):
     def __init__(self, profile, owner):
         super().__init__(profile, owner)
@@ -286,6 +477,8 @@ class UniversalDownloader(QWebEngineView):
         self._gdrive_folder_path = ""
         self._active_direct_worker = None
         self._pending_direct_resolution = None
+        self._pending_gdrive_resolution = None
+        self._pending_mediafire_resolution = None
         self._filecrypt_wait_attempts = 0
         self._filecrypt_pending_batches = {}
         self._filecrypt_active_workers = []
@@ -883,23 +1076,12 @@ class UniversalDownloader(QWebEngineView):
                 return
 
             if file_id:
-                resolved = resolve_gdrive_file(url)
-                if resolved:
-                    full_path = build_download_path(current_path, resolved["filename"])
-                    print(f"✅ Enlace directo (Google Drive): {resolved['download_url']}")
-                    print(f"💾 Guardar como: {full_path}")
-                    self.results.append({
-                        "type": "direct",
-                        "path": full_path,
-                        "url": resolved["download_url"],
-                        "headers": resolved["headers"],
-                        "cookies": resolved["cookies"],
-                    })
-                else:
-                    print("❌ No se pudo resolver el archivo de Google Drive.")
-                    self.results.append((None, None))
-
-                self.proceed_to_next()
+                request_id = (self.current_index, url, current_path)
+                self._pending_gdrive_resolution = request_id
+                worker = GDriveResolveWorker(request_id, url)
+                worker.signals.finished.connect(self.on_gdrive_resolved)
+                worker.signals.error.connect(self.on_gdrive_resolution_error)
+                HOST_RESOLVE_THREAD_POOL.start(worker)
                 return
 
             print("❌ No se pudo extraer el ID del archivo de Google Drive.")
@@ -954,6 +1136,39 @@ class UniversalDownloader(QWebEngineView):
             self._gdrive_waiting_download = False
             self.results.append((None, None))
             self.proceed_to_next()
+
+    def on_gdrive_resolved(self, request_id, resolved):
+        if self._pending_gdrive_resolution != request_id:
+            return
+
+        self._pending_gdrive_resolution = None
+        _, _, current_path = request_id
+        if resolved:
+            full_path = build_download_path(current_path, resolved["filename"])
+            print(f"✅ Enlace directo (Google Drive): {resolved['download_url']}")
+            print(f"💾 Guardar como: {full_path}")
+            self.results.append({
+                "type": "direct",
+                "path": full_path,
+                "url": resolved["download_url"],
+                "headers": resolved["headers"],
+                "cookies": resolved["cookies"],
+            })
+        else:
+            print("❌ No se pudo resolver el archivo de Google Drive.")
+            self.results.append((None, None))
+
+        self.proceed_to_next()
+
+    def on_gdrive_resolution_error(self, request_id, error_text):
+        if self._pending_gdrive_resolution != request_id:
+            return
+
+        self._pending_gdrive_resolution = None
+        print("❌ Error en handle_gdrive:")
+        print(error_text)
+        self.results.append((None, None))
+        self.proceed_to_next()
 
     def on_cookie_added(self, cookie):
         try:
@@ -1051,9 +1266,9 @@ class UniversalDownloader(QWebEngineView):
 
     def handle_mediafire(self, url, path):
         if "/folder/" in url:
-            self.handle_mediafire_folder_api(url, path)
+            self.resolve_mediafire_folder_async(url, path)
         elif "/file/" in url or "/download/" in url:
-            self.handle_mediafire_file_requests(url, path)
+            self.resolve_mediafire_file_async(url, path)
         else:
             print("❌ URL de MediaFire no reconocida.")
             self.results.append((None, None))
@@ -1104,6 +1319,90 @@ class UniversalDownloader(QWebEngineView):
             print(f"❌ Error procesando carpeta MediaFire (API): {e}")
             self.results.append((None, None))
             self.proceed_to_next()
+
+    def resolve_mediafire_folder_async(self, url, base_path):
+        request_id = (self.current_index, "folder", url, base_path)
+        self._pending_mediafire_resolution = request_id
+        worker = MediaFireResolveWorker(request_id, "folder", url)
+        worker.signals.finished.connect(self.on_mediafire_resolved)
+        worker.signals.error.connect(self.on_mediafire_resolution_error)
+        HOST_RESOLVE_THREAD_POOL.start(worker)
+
+    def resolve_mediafire_file_async(self, url, current_path):
+        request_id = (self.current_index, "file", url, current_path)
+        self._pending_mediafire_resolution = request_id
+        worker = MediaFireResolveWorker(request_id, "file", url)
+        worker.signals.finished.connect(self.on_mediafire_resolved)
+        worker.signals.error.connect(self.on_mediafire_resolution_error)
+        HOST_RESOLVE_THREAD_POOL.start(worker)
+
+    def on_mediafire_resolved(self, request_id, result):
+        if self._pending_mediafire_resolution != request_id:
+            return
+
+        self._pending_mediafire_resolution = None
+        _, mode, url, current_path = request_id
+
+        if mode == "folder":
+            if not result or not result.get("ok"):
+                reason = result.get("reason") if isinstance(result, dict) else None
+                if reason == "missing-folder-key":
+                    print("❌ No se pudo extraer el folder_key de MediaFire.")
+                    self.results.append((None, None))
+                    self.proceed_to_next()
+                    return
+                print("❌ Error procesando carpeta MediaFire (API).")
+                self.results.append((None, None))
+                self.proceed_to_next()
+                return
+
+            all_links = result.get("links", [])
+            all_folders = result.get("folders", [])
+            if all_links or all_folders:
+                folder_name = result.get("folder_name") or self.extract_mediafire_folder_name(url)
+                subfolder_path = build_download_path(current_path, folder_name)
+                print(f"📁 {len(all_links)} archivos encontrados en carpeta '{folder_name}'.")
+                insert_position = self.current_index + 1
+                for link in reversed(all_links + all_folders):
+                    self.urls.insert(insert_position, (link, subfolder_path))
+                self.proceed_to_next()
+                return
+
+            print("❌ No se encontraron archivos en la carpeta (API). Probando HTML...")
+            self.page().toHtml(lambda html: self.safe_handle_mediafire_folder(html, url, current_path))
+            return
+
+        if not result or not result.get("ok"):
+            reason = result.get("reason") if isinstance(result, dict) else None
+            if reason == "missing-quickkey":
+                print("❌ No se pudo extraer el quickkey de MediaFire.")
+            else:
+                print("❌ No se encontró el enlace de descarga (HTML).")
+            self.results.append((None, None))
+            self.proceed_to_next()
+            return
+
+        direct_link = result["direct_link"]
+        filename = result["filename"]
+        full_path = build_download_path(current_path, filename)
+        print(f"✅ Enlace directo: {direct_link}")
+        print(f"💾 Guardar como: {full_path}")
+        self.results.append((full_path, direct_link))
+        self.proceed_to_next()
+
+    def on_mediafire_resolution_error(self, request_id, error_text):
+        if self._pending_mediafire_resolution != request_id:
+            return
+
+        self._pending_mediafire_resolution = None
+        _, mode, _, _ = request_id
+        if mode == "folder":
+            print("❌ Error procesando carpeta MediaFire (API):")
+        else:
+            print("❌ Error procesando archivo MediaFire:")
+        print(error_text)
+        self.results.append((None, None))
+        self.proceed_to_next()
 
     def handle_mediafire_file_api(self, url, current_path):
         quickkey = self.extract_mediafire_quickkey(url)
@@ -1303,11 +1602,7 @@ class UniversalDownloader(QWebEngineView):
             return None
 
     def handle_mediafire_file_requests(self, url, current_path):
-        if self.try_mediafire_file_html(url, current_path):
-            return
-        print("❌ No se encontró el enlace de descarga (HTML).")
-        self.results.append((None, None))
-        self.proceed_to_next()
+        self.resolve_mediafire_file_async(url, current_path)
 
     def is_direct_file_url(self, url):
         parsed = urlparse(url)

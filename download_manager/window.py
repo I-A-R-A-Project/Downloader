@@ -1,22 +1,29 @@
+import json
 import os
-from PyQt5.QtWidgets import (
-    QApplication, QDialog, QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
-    QPushButton, QProgressBar, QMessageBox, QGroupBox, QFrame, QSizePolicy
-)
-from PyQt5.QtCore import QObject, QRunnable, QTimer, QThreadPool, pyqtSignal
-from download_manager.browser import UniversalDownloader
-from download_manager.torrent import TorrentUpdater, ensure_aria2_running, Aria2Client
-from download_manager.dialogs import LinkInputWindow, SettingsDialog, apply_settings
-from download_manager.workers import DownloadSignals, FileDownloader
-from config import DEFAULT_CONFIG, load_config
-from download_manager.torrent_queue import TorrentProcessor
+import tempfile
+import uuid
 from enum import Enum
+
+from PyQt5.QtCore import QObject, QRunnable, QTimer, QThreadPool, pyqtSignal
+from PyQt5.QtWidgets import (
+    QApplication, QDialog, QFrame, QGroupBox, QHBoxLayout, QLabel, QMessageBox,
+    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
+)
+
+from config import APPDATA, DEFAULT_CONFIG, load_config
+from download_manager.browser import UniversalDownloader
+from download_manager.dialogs import LinkInputWindow, SettingsDialog, apply_settings
+from download_manager.torrent import Aria2Client, TorrentUpdater, ensure_aria2_running
+from download_manager.torrent_queue import TorrentProcessor
+from download_manager.workers import DownloadSignals, FileDownloader
+
+
+SESSION_PATH = os.path.join(APPDATA, "MediaSearchPrototype", "download_state.json")
 
 
 class DownloadType(Enum):
     NORMAL = 0
     TORRENT = 1
-    TEMPORAL = 2
 
 
 class TorrentCancelSignals(QObject):
@@ -36,6 +43,7 @@ class TorrentCancelWorker(QRunnable):
         except Exception as exc:
             self.signals.finished.emit(self.gid, False, str(exc))
 
+
 class DownloadWindow(QWidget):
     def __init__(self, download_entries):
         super().__init__()
@@ -47,15 +55,25 @@ class DownloadWindow(QWidget):
         self.folder_path = self.config.get("folder_path", DEFAULT_CONFIG["folder_path"])
         self.open_on_finish = self.config.get("open_on_finish", DEFAULT_CONFIG["open_on_finish"])
         self.max_parallel_downloads = self.config.get("max_parallel_downloads", DEFAULT_CONFIG["max_parallel_downloads"])
-        
-        # Separar torrents de otras descargas
-        self.torrent_entries = []
-        self.regular_entries = []
+        QThreadPool.globalInstance().setMaxThreadCount(self.max_parallel_downloads)
+
         self.downloaders = []
+        self.active_resolutions = {}
         self.active_file_downloads = {}
+        self.worker_context = {}
+        self.pending_torrent_entries = set()
+        self.saved_password_hints = set()
         self._aria2_checked = False
         self._empty_state_container = None
         self._closing = False
+        self._scheduler_queued = False
+        self._next_worker_index = 0
+
+        self.entries = {}
+        self.entry_order = []
+        self.entry_items = {}
+        self.torrent_gid_to_entry = {}
+        self.download_groups = {}
 
         self.scroll = QScrollArea(self)
         self.scroll.setWidgetResizable(True)
@@ -66,6 +84,7 @@ class DownloadWindow(QWidget):
         self.scroll.setWidget(self.inner_widget)
         self.layout.addWidget(self.scroll)
         self.inner_layout.addStretch(1)
+
         self.actions_row = QHBoxLayout()
         self.actions_row.addStretch(1)
         self.add_links_button = QPushButton("Agregar enlaces")
@@ -76,161 +95,391 @@ class DownloadWindow(QWidget):
         self.actions_row.addWidget(self.settings_button)
         self.layout.addLayout(self.actions_row)
 
-        self.torrent_hashes = {}
-        self.completed_torrents = set()
         self.torrent_timer = QTimer()
         self.torrent_timer.timeout.connect(self.start_torrent_update)
         self.external_entries_timer = QTimer(self)
         self.external_entries_timer.setSingleShot(True)
         self.external_entries_timer.timeout.connect(self.process_external_entries)
         self.pending_external_entries = []
+        self.session_save_timer = QTimer(self)
+        self.session_save_timer.setSingleShot(True)
+        self.session_save_timer.timeout.connect(self.save_session_to_disk)
 
-        self.download_groups = {}
-        self.file_items = {}
-        self.torrent_items = {}
-        self.temp_progress_bars = []
-        self.temp_labels = []
-        self.saved_password_hints = set()
-        
+        self.load_session()
         if download_entries:
             self.load_entries(download_entries)
-        else:
+
+        if not self.entry_order:
             self.show_empty_state()
-        
-    def cleanup_previous_downloads(self):
+        else:
+            self.clear_empty_state()
+            self.reconcile_saved_torrents()
+            self.queue_scheduler()
+
+    def load_session(self):
+        if not os.path.exists(SESSION_PATH):
+            return
+
         try:
-            from torrent import Aria2Client
-            client = Aria2Client()
-            if client.is_running():
-                stopped = client.get_stopped_downloads(50)
-                removed_count = 0
-                for download in stopped:
-                    if download.state == "complete" or download.progress >= 1.0:
-                        client.remove_download(download.gid, force=True)
-                        removed_count += 1
-                
-                if removed_count > 0:
-                    print(f"🧹 Limpiadas {removed_count} descargas de sesiones anteriores")
-        except Exception as e:
-            pass
-            
-    def process_torrents_parallel(self, torrents=None):
+            with open(SESSION_PATH, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception as exc:
+            print(f"No se pudo cargar la sesión de descargas: {exc}")
+            return
+
+        raw_entries = payload.get("entries", []) if isinstance(payload, dict) else []
+        for raw_entry in raw_entries:
+            entry = self.normalize_entry(raw_entry, from_session=True)
+            self.entries[entry["id"]] = entry
+            self.entry_order.append(entry["id"])
+            self.store_password_hint(entry.get("path", ""), entry.get("password"), entry.get("title"))
+            self.ensure_entry_widget(entry)
+            self.update_entry_visual(entry)
+
+    def normalize_entry(self, raw_entry, from_session=False):
+        entry_id = raw_entry.get("id") or uuid.uuid4().hex
+        url_original = (raw_entry.get("url_original") or raw_entry.get("url") or "").strip()
+        path = (raw_entry.get("path") or "").strip()
+        title = (raw_entry.get("title") or "").strip() or self.default_entry_title(raw_entry, url_original, path)
+        kind = raw_entry.get("download_type")
+        if kind not in {"regular", "torrent"}:
+            kind = "torrent" if self.is_torrent_url(url_original) else "regular"
+
+        direct_links = []
+        raw_direct_links = raw_entry.get("direct_links") or []
+        if raw_entry.get("direct_url") and not raw_direct_links:
+            raw_direct_links = [{
+                "path": raw_entry.get("resolved_path") or path,
+                "url": raw_entry.get("direct_url"),
+                "headers": raw_entry.get("headers") or {},
+                "cookies": raw_entry.get("cookies") or {},
+                "status": raw_entry.get("status") or "waiting",
+                "progress": raw_entry.get("progress", 0),
+            }]
+
+        for link in raw_direct_links:
+            child_status = link.get("status", "waiting")
+            if from_session and child_status in {"downloading", "resolving"}:
+                child_status = "waiting"
+            direct_links.append({
+                "path": link.get("path") or path,
+                "url": (link.get("url") or "").strip(),
+                "headers": link.get("headers") or {},
+                "cookies": link.get("cookies") or {},
+                "status": child_status,
+                "progress": int(link.get("progress", 0) or 0),
+            })
+
+        status = raw_entry.get("status") or "waiting"
+        if from_session and kind == "regular" and status in {"downloading", "resolving"}:
+            status = "waiting"
+
+        entry = {
+            "id": entry_id,
+            "title": title,
+            "path": path,
+            "url_original": url_original,
+            "password": raw_entry.get("password", "") or "",
+            "download_type": kind,
+            "status": status,
+            "progress": int(raw_entry.get("progress", 0) or 0),
+            "direct_url": raw_entry.get("direct_url", "") or "",
+            "direct_links": direct_links,
+            "torrent_gid": raw_entry.get("torrent_gid", "") or "",
+            "torrent_hash": raw_entry.get("torrent_hash", "") or "",
+            "speed_text": raw_entry.get("speed_text", "") or "",
+            "error_text": raw_entry.get("error_text", "") or "",
+        }
+        if from_session:
+            self.recompute_regular_status(entry)
+        return entry
+
+    def save_session_to_disk(self):
+        payload = {
+            "version": 1,
+            "entries": [self.serialize_entry(self.entries[entry_id]) for entry_id in self.entry_order],
+        }
+
+        session_dir = os.path.dirname(SESSION_PATH)
+        os.makedirs(session_dir, exist_ok=True)
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                delete=False,
+                suffix=".json",
+                dir=session_dir,
+                encoding="utf-8",
+            ) as tmp:
+                json.dump(payload, tmp, indent=2, ensure_ascii=False)
+                tmp_path = tmp.name
+            os.replace(tmp_path, SESSION_PATH)
+        except Exception as exc:
+            print(f"No se pudo guardar la sesión de descargas: {exc}")
+
+    def serialize_entry(self, entry):
+        return {
+            "id": entry["id"],
+            "title": entry["title"],
+            "path": entry["path"],
+            "url_original": entry["url_original"],
+            "password": entry["password"],
+            "download_type": entry["download_type"],
+            "status": entry["status"],
+            "progress": entry.get("progress", 0),
+            "direct_url": entry.get("direct_url", ""),
+            "direct_links": [
+                {
+                    "path": link.get("path", ""),
+                    "url": link.get("url", ""),
+                    "headers": link.get("headers") or {},
+                    "cookies": link.get("cookies") or {},
+                    "status": link.get("status", "waiting"),
+                    "progress": link.get("progress", 0),
+                }
+                for link in entry.get("direct_links", [])
+            ],
+            "torrent_gid": entry.get("torrent_gid", ""),
+            "torrent_hash": entry.get("torrent_hash", ""),
+            "speed_text": entry.get("speed_text", ""),
+            "error_text": entry.get("error_text", ""),
+        }
+
+    def request_session_save(self):
+        self.session_save_timer.start(150)
+
+    def queue_scheduler(self):
+        if self._scheduler_queued or self._closing:
+            return
+        self._scheduler_queued = True
+        QTimer.singleShot(0, self.run_scheduler)
+
+    def run_scheduler(self):
+        self._scheduler_queued = False
         if self._closing:
             return
-        target = torrents or self.torrent_entries
-        if not target:
-            return
-            
-        print(f"⚡ Procesando {len(target)} torrents en paralelo...")
-        self.ensure_torrent_timer_running()
-        
-        # Crear un procesador de torrents en un hilo separado
-        processor = TorrentProcessor(target, self.folder_path)
-        processor.signals.finished.connect(self.on_torrents_processed)
-        QThreadPool.globalInstance().start(processor)
-    
-    def on_torrents_processed(self):
-        print("✅ Todos los torrents han sido agregados a Aria2")
 
-    def start_downloads(self, direct_links):
-        if self._closing:
-            return
-        base_index = len(self.file_items)
-        offset = 0
-        for item in direct_links:
-            if not item:
+        for entry_id in self.entry_order:
+            entry = self.entries.get(entry_id)
+            if not entry or entry["download_type"] != "torrent":
                 continue
-            if isinstance(item, dict):
-                if item.get("type") == "direct":
-                    relative_path = item["path"]
-                    link = item["url"]
-                    headers = item.get("headers")
-                    cookies = item.get("cookies")
-                    self.store_password_hint(relative_path, item.get("password"), item.get("title"))
-                    index = base_index + offset
-                    offset += 1
-                    self._start_direct_download(relative_path, link, index, headers, cookies)
+            if entry["status"] == "waiting" and not entry.get("torrent_gid") and entry_id not in self.pending_torrent_entries:
+                self.enqueue_torrent_entry(entry)
+
+        while self.count_regular_slots_in_use() < self.max_parallel_downloads:
+            if not self.start_next_regular_work():
+                break
+
+    def count_regular_slots_in_use(self):
+        return len(self.active_resolutions) + len(self.active_file_downloads)
+
+    def start_next_regular_work(self):
+        for entry_id in self.entry_order:
+            entry = self.entries.get(entry_id)
+            if not entry or entry["download_type"] != "regular":
+                continue
+            if entry["status"] in {"finished", "cancelled", "error"}:
+                continue
+            if entry_id in self.active_resolutions:
                 continue
 
-            relative_path, link = item
-            if not relative_path or not link:
-                continue
-            index = base_index + offset
-            offset += 1
-            self._start_direct_download(relative_path, link, index, None, None)
+            link_index = self.next_waiting_direct_link(entry)
+            if link_index is not None:
+                self.start_direct_download(entry, link_index)
+                return True
 
-        self.show()
+            if not entry.get("direct_links"):
+                self.start_resolution(entry)
+                return True
 
-    def _start_direct_download(self, relative_path, link, index, headers, cookies, on_finished=None):
-        if not relative_path or not link:
-            return
-        full_path = os.path.normpath(os.path.join(self.folder_path, relative_path))
+        return False
 
-        # Los torrents ya fueron procesados en paralelo, solo manejar archivos regulares
-        if link.startswith("magnet:?") or link.endswith(".torrent"):
-            return  # Skip torrents, ya fueron procesados
+    def start_resolution(self, entry):
+        entry["status"] = "resolving"
+        entry["error_text"] = ""
+        self.update_entry_visual(entry)
+        self.request_session_save()
 
-        # Solo procesar descargas regulares
-        dir_path = os.path.dirname(full_path)
-        if dir_path:
-            os.makedirs(dir_path, exist_ok=True)
-
-        _, item_display_name = self._split_grouped_path(relative_path)
-        self.file_items[index] = self._create_download_item(
-            relative_path,
-            item_display_name,
-            f"Descargando: {item_display_name}",
-            lambda checked=False, idx=index: self.cancel_direct_download(idx),
+        downloader = UniversalDownloader([{
+            "url": entry["url_original"],
+            "path": entry["path"],
+            "password": entry["password"],
+            "title": entry["title"],
+        }])
+        downloader.direct_links_ready.connect(
+            lambda results, entry_id=entry["id"], instance=downloader: self.on_resolution_finished(entry_id, results, instance)
         )
+        self.active_resolutions[entry["id"]] = downloader
+        self.downloaders.append(downloader)
+        downloader.start()
+
+    def on_resolution_finished(self, entry_id, results, downloader):
+        active_downloader = self.active_resolutions.pop(entry_id, None)
+        entry = self.entries.get(entry_id)
+
+        if downloader in self.downloaders:
+            self.downloaders.remove(downloader)
+        try:
+            downloader.close()
+            downloader.deleteLater()
+        except Exception:
+            pass
+
+        if not entry or entry["status"] == "cancelled":
+            self.queue_scheduler()
+            return
+        if active_downloader is None and entry["status"] != "resolving":
+            self.queue_scheduler()
+            return
+
+        direct_links = self.convert_resolved_results(results)
+        if not direct_links:
+            entry["status"] = "error"
+            entry["error_text"] = "No se pudieron obtener los enlaces directos."
+            self.update_entry_visual(entry)
+            self.request_session_save()
+            self.queue_scheduler()
+            return
+
+        entry["direct_links"] = direct_links
+        entry["direct_url"] = direct_links[0]["url"] if len(direct_links) == 1 else ""
+        entry["status"] = "waiting"
+        entry["progress"] = 0
+        entry["error_text"] = ""
+        self.recompute_regular_status(entry)
+        self.update_entry_visual(entry)
+        self.request_session_save()
+        self.queue_scheduler()
+
+    def convert_resolved_results(self, results):
+        direct_links = []
+        for item in results or []:
+            if isinstance(item, dict) and item.get("type") == "direct":
+                path = item.get("path", "")
+                url = item.get("url", "")
+                if path and url:
+                    direct_links.append({
+                        "path": path,
+                        "url": url,
+                        "headers": item.get("headers") or {},
+                        "cookies": item.get("cookies") or {},
+                        "status": "waiting",
+                        "progress": 0,
+                    })
+            elif isinstance(item, (tuple, list)) and len(item) >= 2:
+                path, url = item[0], item[1]
+                if path and url:
+                    direct_links.append({
+                        "path": path,
+                        "url": url,
+                        "headers": {},
+                        "cookies": {},
+                        "status": "waiting",
+                        "progress": 0,
+                    })
+        return direct_links
+
+    def next_waiting_direct_link(self, entry):
+        for index, link in enumerate(entry.get("direct_links", [])):
+            if link.get("status") == "waiting":
+                return index
+        return None
+
+    def start_direct_download(self, entry, link_index):
+        link = entry["direct_links"][link_index]
+        full_path = self.absolute_download_path(link.get("path") or entry["path"])
+        if not full_path or not link.get("url"):
+            link["status"] = "error"
+            self.recompute_regular_status(entry)
+            self.update_entry_visual(entry)
+            self.request_session_save()
+            return
+
+        worker_index = self._next_worker_index
+        self._next_worker_index += 1
+
+        link["status"] = "downloading"
+        entry["status"] = "downloading"
+        entry["error_text"] = ""
+        self.update_entry_visual(entry)
+        self.request_session_save()
 
         signals = DownloadSignals()
         signals.progress.connect(self.update_progress)
         signals.cancelled.connect(self.on_direct_download_cancelled)
-        if on_finished:
-            signals.finished.connect(lambda idx=index, cb=on_finished: self.on_direct_download_finished(idx, cb))
-        else:
-            signals.finished.connect(lambda idx=index: self.on_direct_download_finished(idx))
+        signals.finished.connect(self.on_direct_download_finished)
 
-        thread = FileDownloader(link, full_path, index, signals, headers=headers, cookies=cookies)
-        self.active_file_downloads[index] = thread
+        thread = FileDownloader(
+            link["url"],
+            full_path,
+            worker_index,
+            signals,
+            headers=link.get("headers") or {},
+            cookies=link.get("cookies") or {},
+        )
+        self.active_file_downloads[worker_index] = thread
+        self.worker_context[worker_index] = (entry["id"], link_index)
         QThreadPool.globalInstance().start(thread)
 
-    def load_entries(self, entries):
-        if self._closing:
-            return
-        if not entries:
-            return
+    def enqueue_torrent_entry(self, entry):
         self.clear_empty_state()
-        new_torrents = []
-        new_regular = []
-        for entry in entries:
-            url = entry.get("url", "")
-            if url.startswith("magnet:?") or url.endswith(".torrent"):
-                new_torrents.append(entry)
-            else:
-                new_regular.append(entry)
-            self.store_password_hint(entry.get("path", ""), entry.get("password"), entry.get("title") or url)
+        if not self._aria2_checked:
+            ensure_aria2_running(self.folder_path, background=True)
+            self._aria2_checked = True
 
-        if new_torrents:
-            if not self._aria2_checked:
-                ensure_aria2_running(self.folder_path, background=True)
-                self._aria2_checked = True
-            self.torrent_entries.extend(new_torrents)
-            self.process_torrents_parallel(new_torrents)
+        self.pending_torrent_entries.add(entry["id"])
+        processor = TorrentProcessor([{
+            "id": entry["id"],
+            "url": entry["url_original"],
+            "path": entry["path"] or self.folder_path,
+        }], self.folder_path)
+        processor.signals.item_processed.connect(self.on_torrent_processed)
+        processor.signals.finished.connect(self.on_torrents_processed)
+        QThreadPool.globalInstance().start(processor)
 
-        if new_regular:
-            self.regular_entries.extend(new_regular)
-            downloader = UniversalDownloader(new_regular)
-            downloader.direct_link_found.connect(lambda item: self.start_downloads([item]))
-            self.downloaders.append(downloader)
-            downloader.start()
+    def on_torrent_processed(self, entry_id, gid, error_text):
+        self.pending_torrent_entries.discard(entry_id)
+        entry = self.entries.get(entry_id)
+        if not entry or entry["status"] == "cancelled":
+            return
+
+        if not gid:
+            entry["status"] = "error"
+            entry["error_text"] = error_text or "No se pudo agregar el torrent."
+            self.update_entry_visual(entry)
+            self.request_session_save()
+            return
+
+        entry["torrent_gid"] = gid
+        entry["status"] = "waiting"
+        entry["error_text"] = ""
+        self.torrent_gid_to_entry[gid] = entry_id
+        self.update_entry_visual(entry)
+        self.request_session_save()
+        self.ensure_torrent_timer_running()
+
+    def on_torrents_processed(self):
+        print("✅ Todos los torrents han sido agregados a Aria2")
+
+    def load_entries(self, entries):
+        if self._closing or not entries:
+            return
+
+        self.clear_empty_state()
+        for raw_entry in entries:
+            entry = self.normalize_entry(raw_entry, from_session=False)
+            self.entries[entry["id"]] = entry
+            self.entry_order.append(entry["id"])
+            self.store_password_hint(entry.get("path", ""), entry.get("password"), entry.get("title"))
+            self.ensure_entry_widget(entry)
+            self.update_entry_visual(entry)
+        self.request_session_save()
+        self.queue_scheduler()
 
     def enqueue_external_entries(self, entries):
         if self._closing or not entries:
             return
         self.pending_external_entries.extend(entries)
         if not self.external_entries_timer.isActive():
-            # Give Qt one paint cycle to focus/redraw the existing window
             self.external_entries_timer.start(75)
 
     def process_external_entries(self):
@@ -240,57 +489,195 @@ class DownloadWindow(QWidget):
         self.pending_external_entries = []
         self.load_entries(entries)
 
-    def ensure_torrent_timer_running(self):
-        if not self.torrent_timer.isActive():
-            self.torrent_timer.start(3000)
+    def update_progress(self, worker_index, percent):
+        context = self.worker_context.get(worker_index)
+        if not context:
+            return
+        entry_id, link_index = context
+        entry = self.entries.get(entry_id)
+        if not entry:
+            return
+        try:
+            entry["direct_links"][link_index]["progress"] = percent
+        except IndexError:
+            return
+        self.recompute_regular_status(entry)
+        self.update_entry_visual(entry)
+        self.request_session_save()
 
-    def on_direct_download_finished(self, index, on_finished=None):
-        self.active_file_downloads.pop(index, None)
-        item = self.file_items.get(index)
-        if not item or item.get("status") == "cancelled":
+    def on_direct_download_finished(self, worker_index, success):
+        thread = self.active_file_downloads.pop(worker_index, None)
+        context = self.worker_context.pop(worker_index, None)
+        if thread is None or context is None:
+            self.queue_scheduler()
             return
-        if on_finished:
-            self.mark_finished(index)
-            on_finished()
-            return
-        self.mark_finished(index)
 
-    def on_direct_download_cancelled(self, index):
-        item = self.file_items.get(index)
-        if not item or item.get("status") == "cancelled":
+        entry_id, link_index = context
+        entry = self.entries.get(entry_id)
+        if not entry:
+            self.queue_scheduler()
             return
-        self.active_file_downloads.pop(index, None)
-        item["status"] = "cancelled"
-        item["label"].setText(f"⏹ Cancelado: {item['name']}")
-        self._finalize_item(item)
 
-    def cancel_direct_download(self, index):
-        downloader = self.active_file_downloads.pop(index, None)
-        item = self.file_items.get(index)
-        if not item or item.get("status") in ("finished", "cancelled"):
+        try:
+            link = entry["direct_links"][link_index]
+        except IndexError:
+            self.queue_scheduler()
             return
-        item["status"] = "cancelled"
+
+        if success:
+            link["status"] = "finished"
+            link["progress"] = 100
+        else:
+            link["status"] = "error"
+            entry["error_text"] = "La descarga no se pudo completar."
+
+        self.recompute_regular_status(entry)
+        self.update_entry_visual(entry)
+        self.request_session_save()
+        self.queue_scheduler()
+
+    def on_direct_download_cancelled(self, worker_index):
+        self.active_file_downloads.pop(worker_index, None)
+        context = self.worker_context.pop(worker_index, None)
+        if not context:
+            self.queue_scheduler()
+            return
+
+        entry_id, link_index = context
+        entry = self.entries.get(entry_id)
+        if not entry:
+            self.queue_scheduler()
+            return
+
+        try:
+            entry["direct_links"][link_index]["status"] = "cancelled"
+        except IndexError:
+            self.queue_scheduler()
+            return
+
+        self.recompute_regular_status(entry)
+        self.update_entry_visual(entry)
+        self.request_session_save()
+        self.queue_scheduler()
+
+    def cancel_entry(self, entry_id):
+        entry = self.entries.get(entry_id)
+        if not entry or entry["status"] in {"finished", "cancelled"}:
+            return
+
+        downloader = self.active_resolutions.pop(entry_id, None)
         if downloader is not None:
+            if downloader in self.downloaders:
+                self.downloaders.remove(downloader)
             try:
-                downloader.cancel()
+                downloader.close()
+                downloader.deleteLater()
             except Exception:
                 pass
-        item["label"].setText(f"⏹ Cancelado: {item['name']}")
-        self._finalize_item(item)
 
-    def cancel_torrent_download(self, gid):
-        item = self.torrent_items.get(gid)
-        if item and item.get("status") not in ("finished", "cancelled"):
-            item["status"] = "cancelled"
-            item["label"].setText(f"⏹ Torrent cancelado: {item['name']}")
-            self._finalize_item(item)
-        self.torrent_hashes.pop(gid, None)
+        worker_ids = [
+            worker_index
+            for worker_index, context in self.worker_context.items()
+            if context[0] == entry_id
+        ]
+        for worker_index in worker_ids:
+            downloader_thread = self.active_file_downloads.get(worker_index)
+            if downloader_thread is not None:
+                try:
+                    downloader_thread.cancel()
+                except Exception:
+                    pass
 
-        worker = TorrentCancelWorker(gid)
-        worker.signals.finished.connect(self.on_torrent_cancel_finished)
-        QThreadPool.globalInstance().start(worker)
+        if entry["download_type"] == "torrent":
+            entry["status"] = "cancelled"
+            if entry.get("torrent_gid"):
+                worker = TorrentCancelWorker(entry["torrent_gid"])
+                worker.signals.finished.connect(self.on_torrent_cancel_finished)
+                QThreadPool.globalInstance().start(worker)
+            else:
+                self.update_entry_visual(entry)
+                self.request_session_save()
+            return
+
+        for link in entry.get("direct_links", []):
+            if link.get("status") not in {"finished", "cancelled"}:
+                link["status"] = "cancelled"
+        entry["status"] = "cancelled"
+        self.recompute_regular_status(entry)
+        self.update_entry_visual(entry)
+        self.request_session_save()
+        self.queue_scheduler()
+
+    def resume_entry(self, entry_id):
+        entry = self.entries.get(entry_id)
+        if not entry or entry["status"] != "cancelled":
+            return
+
+        entry["error_text"] = ""
+        entry["progress"] = 0
+
+        if entry["download_type"] == "torrent":
+            entry["torrent_gid"] = ""
+            entry["torrent_hash"] = ""
+            entry["speed_text"] = ""
+            entry["status"] = "waiting"
+        else:
+            if entry.get("direct_links"):
+                for link in entry["direct_links"]:
+                    if link.get("status") == "finished":
+                        continue
+                    link["status"] = "waiting"
+                    link["progress"] = 0
+            entry["status"] = "waiting"
+            self.recompute_regular_status(entry)
+
+        self.update_entry_visual(entry)
+        self.request_session_save()
+        self.queue_scheduler()
+
+    def delete_entry(self, entry_id):
+        entry = self.entries.pop(entry_id, None)
+        if not entry:
+            return
+
+        if entry_id in self.entry_order:
+            self.entry_order.remove(entry_id)
+
+        item = self.entry_items.pop(entry_id, None)
+        if item:
+            group_box = item["container"].parentWidget()
+            layout = item["container"].parentWidget().layout() if group_box else None
+            if layout:
+                layout.removeWidget(item["container"])
+            item["container"].deleteLater()
+            if group_box and layout and layout.count() == 0:
+                group_key_to_remove = None
+                for group_key, group in self.download_groups.items():
+                    if group.get("box") is group_box:
+                        group_key_to_remove = group_key
+                        break
+                if group_key_to_remove is not None:
+                    self.inner_layout.removeWidget(group_box)
+                    group_box.deleteLater()
+                    del self.download_groups[group_key_to_remove]
+
+        gid = entry.get("torrent_gid")
+        if gid:
+            self.torrent_gid_to_entry.pop(gid, None)
+
+        if not self.entry_order:
+            self.show_empty_state()
+
+        self.request_session_save()
 
     def on_torrent_cancel_finished(self, gid, ok, error_text):
+        entry_id = self.torrent_gid_to_entry.pop(gid, "")
+        entry = self.entries.get(entry_id)
+        if entry:
+            entry["status"] = "cancelled"
+            entry["error_text"] = "" if ok else error_text
+            self.update_entry_visual(entry)
+            self.request_session_save()
         if ok:
             return
         if error_text:
@@ -342,33 +729,20 @@ class DownloadWindow(QWidget):
         except Exception as exc:
             print(f"No se pudo guardar la contrasena para {title or path_hint}: {exc}")
 
-    def _normalize_relative_path(self, relative_path):
-        if not relative_path:
+    def _normalize_group_path(self, group_path):
+        if not group_path:
             return ""
-        normalized = os.path.normpath(relative_path)
+        normalized = os.path.normpath(group_path)
         folder_base = os.path.normpath(self.folder_path)
-
         try:
             rel_to_base = os.path.relpath(normalized, folder_base)
-            if rel_to_base != "." and not rel_to_base.startswith(".."):
-                return rel_to_base
             if rel_to_base == ".":
                 return ""
+            if not rel_to_base.startswith(".."):
+                return rel_to_base
         except ValueError:
             pass
-
-        return "" if normalized == "." else normalized
-
-    def _split_grouped_path(self, relative_path):
-        normalized = self._normalize_relative_path(relative_path)
-        if not normalized:
-            return "", ""
-        if not os.path.isabs(normalized):
-            return "", normalized
-
-        absolute_dir = os.path.dirname(normalized)
-        absolute_name = os.path.basename(normalized)
-        return absolute_dir, absolute_name
+        return normalized
 
     def _group_title(self, group_key):
         if not group_key:
@@ -392,9 +766,9 @@ class DownloadWindow(QWidget):
         self.download_groups[group_key] = group
         return group
 
-    def _create_download_item(self, relative_path, display_name, initial_text, cancel_callback):
-        group_key, fallback_display_name = self._split_grouped_path(relative_path)
-        item_name = display_name or fallback_display_name or os.path.basename(relative_path) or "Archivo"
+    def _create_download_item(self, group_path, display_name, initial_text, cancel_callback):
+        group_key = self._normalize_group_path(group_path)
+        item_name = display_name or "Archivo"
         group = self._get_or_create_group(group_key)
 
         container = QFrame()
@@ -410,7 +784,13 @@ class DownloadWindow(QWidget):
         label.setWordWrap(True)
         cancel_button = QPushButton("Cancelar")
         cancel_button.clicked.connect(cancel_callback)
+        resume_button = QPushButton("Reanudar")
+        resume_button.clicked.connect(lambda checked=False: None)
+        delete_button = QPushButton("Eliminar")
+        delete_button.clicked.connect(lambda checked=False: None)
         header.addWidget(label, 1)
+        header.addWidget(resume_button)
+        header.addWidget(delete_button)
         header.addWidget(cancel_button)
 
         progress = QProgressBar()
@@ -425,16 +805,153 @@ class DownloadWindow(QWidget):
             "label": label,
             "bar": progress,
             "cancel_button": cancel_button,
+            "resume_button": resume_button,
+            "delete_button": delete_button,
             "name": item_name,
-            "status": "active",
+            "status": "waiting",
         }
 
-    def _finalize_item(self, item, keep_progress=False, disable_cancel=True):
-        if disable_cancel:
+    def ensure_entry_widget(self, entry):
+        item = self.entry_items.get(entry["id"])
+        if item:
+            return item
+
+        item = self._create_download_item(
+            entry.get("path", ""),
+            entry.get("title", ""),
+            self.entry_label_text(entry),
+            lambda checked=False, entry_id=entry["id"]: self.cancel_entry(entry_id),
+        )
+        try:
+            item["resume_button"].clicked.disconnect()
+        except Exception:
+            pass
+        item["resume_button"].clicked.connect(lambda checked=False, entry_id=entry["id"]: self.resume_entry(entry_id))
+        try:
+            item["delete_button"].clicked.disconnect()
+        except Exception:
+            pass
+        item["delete_button"].clicked.connect(lambda checked=False, entry_id=entry["id"]: self.delete_entry(entry_id))
+        self.entry_items[entry["id"]] = item
+        return item
+
+    def update_entry_visual(self, entry):
+        item = self.ensure_entry_widget(entry)
+        item["name"] = entry["title"]
+        item["status"] = entry["status"]
+        item["label"].setText(self.entry_label_text(entry))
+
+        progress = self.entry_progress(entry)
+        entry["progress"] = progress
+        item["bar"].setValue(progress)
+
+        if entry["status"] == "cancelled":
             item["cancel_button"].setEnabled(False)
             item["cancel_button"].hide()
-        if not keep_progress and item["bar"] is not None:
+            item["resume_button"].setEnabled(True)
+            item["resume_button"].show()
+            item["delete_button"].setEnabled(True)
+            item["delete_button"].show()
             item["bar"].hide()
+        elif entry["status"] in {"finished", "error"}:
+            item["cancel_button"].setEnabled(False)
+            item["cancel_button"].hide()
+            item["resume_button"].setEnabled(False)
+            item["resume_button"].hide()
+            item["delete_button"].setEnabled(False)
+            item["delete_button"].hide()
+            item["bar"].setVisible(entry["status"] == "finished")
+        else:
+            item["cancel_button"].setEnabled(True)
+            item["cancel_button"].show()
+            item["resume_button"].setEnabled(False)
+            item["resume_button"].hide()
+            item["delete_button"].setEnabled(False)
+            item["delete_button"].hide()
+            item["bar"].setVisible(entry["status"] not in {"waiting"})
+
+    def entry_label_text(self, entry):
+        status = entry.get("status", "waiting")
+        title = entry.get("title", "Archivo")
+        speed_text = entry.get("speed_text", "")
+
+        if entry["download_type"] == "torrent":
+            if status == "finished":
+                return f"✅ Torrent completado: {title}"
+            if status == "cancelled":
+                return f"⏹ Torrent cancelado: {title}"
+            if status == "error":
+                return f"❌ Error: {title}"
+            if status == "downloading":
+                return f"Descargando torrent: {title}{speed_text}"
+            return f"En espera: {title}"
+
+        if status == "finished":
+            return f"✅ Completado: {title}"
+        if status == "cancelled":
+            return f"⏹ Cancelado: {title}"
+        if status == "error":
+            return f"❌ Error: {title}"
+        if status == "resolving":
+            return f"Resolviendo: {title}"
+        if status == "downloading":
+            return f"Descargando: {title}"
+        return f"En espera: {title}"
+
+    def entry_progress(self, entry):
+        if entry["download_type"] == "torrent":
+            return int(entry.get("progress", 0) or 0)
+
+        direct_links = entry.get("direct_links", [])
+        if not direct_links:
+            return 0
+        total = sum(int(link.get("progress", 0) or 0) for link in direct_links)
+        return int(total / len(direct_links))
+
+    def recompute_regular_status(self, entry):
+        if entry["download_type"] != "regular":
+            return
+
+        if entry["id"] in self.active_resolutions:
+            entry["status"] = "resolving"
+            return
+
+        direct_links = entry.get("direct_links", [])
+        if not direct_links:
+            if entry["status"] not in {"finished", "cancelled", "error"}:
+                entry["status"] = "waiting"
+            return
+
+        statuses = {link.get("status", "waiting") for link in direct_links}
+        if "downloading" in statuses:
+            entry["status"] = "downloading"
+        elif statuses == {"finished"}:
+            entry["status"] = "finished"
+        elif statuses <= {"cancelled"}:
+            entry["status"] = "cancelled"
+        elif "waiting" in statuses:
+            entry["status"] = "waiting"
+        elif "error" in statuses:
+            entry["status"] = "error"
+        else:
+            entry["status"] = "waiting"
+
+    def absolute_download_path(self, relative_path):
+        if not relative_path:
+            return ""
+        if os.path.isabs(relative_path):
+            return os.path.normpath(relative_path)
+        return os.path.normpath(os.path.join(self.folder_path, relative_path))
+
+    def default_entry_title(self, raw_entry, url, path):
+        if path:
+            return os.path.basename(os.path.normpath(path))
+        if url:
+            return os.path.basename(url.rstrip("/").split("?")[0]) or url
+        return "Archivo"
+
+    def is_torrent_url(self, url):
+        return bool(url) and (url.startswith("magnet:?") or url.endswith(".torrent"))
 
     def open_link_input(self):
         self._link_input = LinkInputWindow()
@@ -452,6 +969,12 @@ class DownloadWindow(QWidget):
         dialog = SettingsDialog(self)
         if dialog.exec_() == QDialog.Accepted:
             self.folder_path, self.open_on_finish, self.max_parallel_downloads = apply_settings()
+            QThreadPool.globalInstance().setMaxThreadCount(self.max_parallel_downloads)
+            self.queue_scheduler()
+
+    def ensure_torrent_timer_running(self):
+        if not self.torrent_timer.isActive():
+            self.torrent_timer.start(3000)
 
     def start_torrent_update(self):
         if self._closing:
@@ -464,221 +987,116 @@ class DownloadWindow(QWidget):
     def on_torrent_update_error(self, message):
         if self._closing:
             return
-        # Manejar errores específicos de Aria2
         if "No se pudo conectar a Aria2" in message:
             print("⚠️ Aria2 no está disponible - reintentando inicio...")
-            # Intentar reiniciar Aria2
             if ensure_aria2_running(self.folder_path, background=True):
                 print("✅ Aria2 reiniciado exitosamente")
         elif "Connection refused" not in message and "timeout" not in message:
             print(f"Error al actualizar progreso de torrents: {message}")
 
-    def get_clean_torrent_name(self, name):
-        """Limpia el nombre del torrent removiendo [METADATA] y otros prefijos"""
-        if not name:
-            return "Torrent desconocido"
-        
-        # Remover [METADATA] al inicio
-        clean_name = name
-        if clean_name.startswith("[METADATA]"):
-            clean_name = clean_name[10:]
-        
-        # Remover espacios extra
-        clean_name = clean_name.strip()
-        
-        # Si queda vacío después de limpiar, usar nombre original
-        if not clean_name:
-            clean_name = name
-            
-        return clean_name
+    def reconcile_saved_torrents(self):
+        pending = [
+            entry for entry in self.entries.values()
+            if entry["download_type"] == "torrent" and entry["status"] not in {"finished", "cancelled"}
+        ]
+        if not pending:
+            return
 
-    def is_duplicate_torrent(self, torrent):
-        """Verifica si un torrent es duplicado basándose en el nombre limpio"""
-        clean_name = self.get_clean_torrent_name(torrent.name)
-        
-        # Verificar si ya existe un torrent con el mismo nombre limpio
-        for existing_hash, (index, stored_name, completed) in self.torrent_hashes.items():
-            if existing_hash != torrent.hash:
-                existing_clean_name = self.get_clean_torrent_name(stored_name)
-                if clean_name == existing_clean_name:
-                    return True
-        return False
+        if not self._aria2_checked:
+            ensure_aria2_running(self.folder_path, background=True)
+            self._aria2_checked = True
+        self.ensure_torrent_timer_running()
+
+        client = Aria2Client()
+        try:
+            downloads = client.get_active_downloads() + client.get_stopped_downloads(100)
+        except Exception as exc:
+            print(f"No se pudo reconciliar torrents guardados: {exc}")
+            self.queue_scheduler()
+            return
+
+        by_gid = {download.gid: download for download in downloads}
+        for entry in pending:
+            gid = entry.get("torrent_gid")
+            if gid and gid in by_gid:
+                self.apply_torrent_update(entry, by_gid[gid])
+            else:
+                entry["torrent_gid"] = ""
+                entry["torrent_hash"] = ""
+                if entry["status"] != "error":
+                    entry["status"] = "waiting"
+                entry["progress"] = 0
+                entry["speed_text"] = ""
+                self.update_entry_visual(entry)
+
+        self.request_session_save()
+        self.queue_scheduler()
 
     def on_torrent_data_received(self, torrents):
         if self._closing:
             return
-        for t in torrents:
-            # Mapear estados de Aria2 - omitir descargas pausadas o en cola
-            if t.state in ("pausedDL", "pausedUP", "checkingUP", "checkingDL", "queuedDL", "waiting", "paused"):
+
+        current_by_gid = {torrent.gid: torrent for torrent in torrents}
+        for entry_id in self.entry_order:
+            entry = self.entries.get(entry_id)
+            if not entry or entry["download_type"] != "torrent":
                 continue
-            
-            # Omitir descargas con error
-            if t.state == "error":
-                if t.hash in self.torrent_hashes:
-                    _, name, _ = self.torrent_hashes[t.hash]
-                    item = self.torrent_items.get(t.hash)
-                    if item:
-                        clean_name = self.get_clean_torrent_name(name)
-                        item["label"].setText(f"❌ Error: {clean_name}")
-                        item["status"] = "error"
-                        self._finalize_item(item)
-                    self.torrent_hashes.pop(t.hash, None)
-                continue
-            
-            # Verificar si ya se completó este torrent para evitar spam
-            if (t.state == "complete" or t.progress >= 1.0) and t.hash in self.completed_torrents:
-                continue
-                
-            # Verificar duplicados por nombre (para manejar [METADATA] vs nombre real)
-            if t.hash not in self.torrent_hashes and self.is_duplicate_torrent(t):
-                continue
-                
-            if t.hash in self.torrent_hashes:
-                _, stored_name, completed = self.torrent_hashes[t.hash]
-                item = self.torrent_items.get(t.hash)
-                if item:
-                    percent = int(t.progress * 100)
-                    item["bar"].setValue(percent)
-                    
-                    # Actualizar nombre si cambió (de METADATA a nombre real)
-                    current_name = t.name
-                    if current_name != stored_name and not current_name.startswith("[METADATA]"):
-                        # Actualizar con el nombre real
-                        self.torrent_hashes[t.hash] = (t.hash, current_name, completed)
-                        stored_name = current_name
-                    
-                    # Usar el nombre más limpio disponible
-                    display_name = self.get_clean_torrent_name(stored_name)
-                    
-                    # Actualizar etiqueta con velocidad de descarga
-                    speed_text = ""
-                    if hasattr(t, 'dlspeed') and t.dlspeed > 0:
-                        speed_mb = t.dlspeed / (1024 * 1024)
-                        if speed_mb >= 1:
-                            speed_text = f" - {speed_mb:.1f} MB/s"
-                        else:
-                            speed_kb = t.dlspeed / 1024
-                            speed_text = f" - {speed_kb:.0f} KB/s"
-                    
-                    item["name"] = display_name
-                    item["label"].setText(f"Descargando torrent: {display_name}{speed_text}")
-                    
-                    # Marcar como completado si el progreso es 100% o el estado es 'complete'
-                    if (percent >= 100 or t.state == "complete") and not completed:
-                        # Marcar como completado y agregar al set para evitar spam
-                        self.completed_torrents.add(t.hash)
-                        self.torrent_hashes[t.hash] = (t.hash, stored_name, True)
-                        self.mark_finished(t.hash, DownloadType.TORRENT, display_name)
+            gid = entry.get("torrent_gid")
+            if gid and gid in current_by_gid:
+                self.apply_torrent_update(entry, current_by_gid[gid])
+            elif gid and entry["status"] == "downloading":
+                entry["status"] = "waiting"
+                entry["progress"] = 0
+                entry["speed_text"] = ""
+                self.update_entry_visual(entry)
+
+        self.request_session_save()
+        self.queue_scheduler()
+
+    def apply_torrent_update(self, entry, torrent):
+        entry["torrent_gid"] = torrent.gid
+        entry["torrent_hash"] = torrent.hash
+        self.torrent_gid_to_entry[torrent.gid] = entry["id"]
+
+        percent = int(torrent.progress * 100)
+        entry["progress"] = percent
+        title = self.get_clean_torrent_name(torrent.name) or entry["title"]
+        if title:
+            entry["title"] = title
+
+        speed_text = ""
+        if hasattr(torrent, "dlspeed") and torrent.dlspeed > 0:
+            speed_mb = torrent.dlspeed / (1024 * 1024)
+            if speed_mb >= 1:
+                speed_text = f" - {speed_mb:.1f} MB/s"
             else:
-                # Nueva descarga - agregar a la interfaz
-                # Omitir si ya está en torrents completados
-                if t.hash in self.completed_torrents:
-                    continue
-                    
-                clean_name = self.get_clean_torrent_name(t.name)
-                
-                speed_text = ""
-                if hasattr(t, 'dlspeed') and t.dlspeed > 0:
-                    speed_mb = t.dlspeed / (1024 * 1024)
-                    if speed_mb >= 1:
-                        speed_text = f" - {speed_mb:.1f} MB/s"
-                    else:
-                        speed_kb = t.dlspeed / 1024
-                        speed_text = f" - {speed_kb:.0f} KB/s"
-                        
-                torrent_path = ""
-                if t.save_path:
-                    try:
-                        torrent_path = os.path.relpath(t.save_path, self.folder_path)
-                    except ValueError:
-                        torrent_path = t.save_path
-                item = self._create_download_item(
-                    torrent_path,
-                    clean_name,
-                    f"Descargando torrent: {clean_name}{speed_text}",
-                    lambda checked=False, gid=t.gid: self.cancel_torrent_download(gid),
-                )
-                item["bar"].setValue(int(t.progress * 100))
-                self.torrent_items[t.hash] = item
-                self.torrent_hashes[t.hash] = (t.hash, t.name, False)
+                speed_text = f" - {torrent.dlspeed / 1024:.0f} KB/s"
+        entry["speed_text"] = speed_text
 
-    def update_progress(self, index, percent):
-        item = self.file_items.get(index)
-        if not item or item.get("status") == "cancelled":
-            return
-        item["bar"].setValue(percent)
+        state = getattr(torrent, "state", "")
+        if percent >= 100 or state in {"complete", "uploading"}:
+            entry["status"] = "finished"
+            entry["speed_text"] = ""
+        elif state == "error":
+            entry["status"] = "error"
+        else:
+            entry["status"] = "downloading"
+        self.update_entry_visual(entry)
 
-    def mark_finished(self, index, download_type=DownloadType.NORMAL, custom_name=None):
-        if download_type == DownloadType.TORRENT:
-            item = self.torrent_items.get(index)
-            if not item:
-                return
-            lb = item["label"]
-        elif download_type == DownloadType.TEMPORAL:
-            if index >= len(self.temp_labels):
-                return  # Índice inválido
-            lb = self.temp_labels[index]
-            pb = self.temp_progress_bars[index]
-            item = None
-        else:
-            item = self.file_items.get(index)
-            if not item:
-                return
-            lb = item["label"]
-
-        if download_type == DownloadType.TORRENT:
-            if custom_name:
-                done = f"✅ Torrent completado: {custom_name}"
-            else:
-                torrent_name = lb.text().replace("Descargando torrent: ", "").split(" - ")[0]
-                done = f"✅ Torrent completado: {torrent_name}"
-        elif download_type == DownloadType.TEMPORAL:
-            done = lb.text()
-        else:
-            done = f"✅ Completado: {item['name']}"
-        
-        print(done)
-        lb.setText(done)
-        if item is not None:
-            item["status"] = "finished"
-            self._finalize_item(item)
-        else:
-            self.inner_layout.removeWidget(pb)
-            pb.deleteLater()
-        
-        if download_type == DownloadType.TEMPORAL:
-            self.inner_layout.removeWidget(lb)
-            lb.deleteLater()
+    def get_clean_torrent_name(self, name):
+        if not name:
+            return "Torrent desconocido"
+        clean_name = name[10:] if name.startswith("[METADATA]") else name
+        clean_name = clean_name.strip()
+        return clean_name or name
 
     def has_active_work(self):
-        if self.active_file_downloads:
+        if self.active_file_downloads or self.active_resolutions or self.pending_torrent_entries:
             return True
-
-        if any(item.get("status") == "active" for item in self.file_items.values()):
-            return True
-
-        if any(item.get("status") == "active" for item in self.torrent_items.values()):
-            return True
-
-        if any(not completed for _, _, completed in self.torrent_hashes.values()):
-            return True
-
-        for downloader in self.downloaders:
-            if downloader is None:
-                continue
-            if getattr(downloader, "_gdrive_waiting_download", False):
-                return True
-            current_index = getattr(downloader, "current_index", 0)
-            urls = getattr(downloader, "urls", [])
-            if current_index < len(urls):
-                return True
-            try:
-                if downloader.isVisible():
-                    return True
-            except RuntimeError:
-                continue
-
-        return False
+        return any(
+            entry["status"] in {"downloading", "resolving"}
+            for entry in self.entries.values()
+        )
 
     def confirm_close_if_needed(self):
         if not self.has_active_work():
@@ -693,6 +1111,18 @@ class DownloadWindow(QWidget):
         )
         return answer == QMessageBox.Yes
 
+    def prepare_session_for_shutdown(self):
+        for entry in self.entries.values():
+            if entry["download_type"] != "regular":
+                continue
+            if entry["status"] in {"downloading", "resolving"}:
+                entry["status"] = "waiting"
+            for link in entry.get("direct_links", []):
+                if link.get("status") == "downloading":
+                    link["status"] = "waiting"
+            self.recompute_regular_status(entry)
+            self.update_entry_visual(entry)
+
     def shutdown_app(self):
         self._closing = True
         if self.torrent_timer.isActive():
@@ -704,12 +1134,17 @@ class DownloadWindow(QWidget):
             except Exception:
                 pass
         self.active_file_downloads.clear()
+        self.worker_context.clear()
 
-        for downloader in list(self.downloaders):
+        for _entry_id, downloader in list(self.active_resolutions.items()):
             try:
-                downloader.direct_link_found.disconnect()
+                downloader.close()
+                downloader.deleteLater()
             except Exception:
                 pass
+        self.active_resolutions.clear()
+
+        for downloader in list(self.downloaders):
             try:
                 downloader.close()
                 downloader.deleteLater()
@@ -723,6 +1158,8 @@ class DownloadWindow(QWidget):
             except Exception:
                 pass
 
+        self.prepare_session_for_shutdown()
+        self.save_session_to_disk()
         QThreadPool.globalInstance().clear()
 
     def closeEvent(self, event):
@@ -736,4 +1173,3 @@ class DownloadWindow(QWidget):
         app = QApplication.instance()
         if app is not None:
             app.quit()
-

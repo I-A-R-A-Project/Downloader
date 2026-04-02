@@ -20,8 +20,7 @@ class TorrentUpdater(QRunnable):
         try:
             client = Aria2Client()
             active_downloads = client.get_active_downloads()
-            stopped_downloads = [d for d in client.get_stopped_downloads() 
-                               if d.state not in ("complete", "removed") and d.progress < 1.0]
+            stopped_downloads = client.get_stopped_downloads(100)
             all_downloads = active_downloads + stopped_downloads
             
             if hasattr(self, 'signals') and self.signals:

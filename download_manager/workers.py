@@ -10,7 +10,7 @@ CHUNK_SIZE = 8192
 
 class DownloadSignals(QObject):
     progress = pyqtSignal(int, int)
-    finished = pyqtSignal(int)
+    finished = pyqtSignal(int, bool)
     cancelled = pyqtSignal(int)
 
 
@@ -75,11 +75,11 @@ class FileDownloader(QRunnable):
                                     percent = int((downloaded / total_length) * 100)
                                     self.signals.progress.emit(self.index, percent)
 
-                self.signals.finished.emit(self.index)
+                self.signals.finished.emit(self.index, True)
                 return
             except Exception as exc:
                 print(f"[{self.index}] Error en intento {attempt}: {exc}")
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_DELAY * attempt)
                 else:
-                    self.signals.finished.emit(self.index)
+                    self.signals.finished.emit(self.index, False)
