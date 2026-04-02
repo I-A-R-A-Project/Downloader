@@ -3,7 +3,7 @@ from PyQt5.QtWidgets import (
     QApplication, QDialog, QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
     QPushButton, QProgressBar, QMessageBox, QGroupBox, QFrame, QSizePolicy
 )
-from PyQt5.QtCore import QTimer, QThreadPool
+from PyQt5.QtCore import QObject, QRunnable, QTimer, QThreadPool, pyqtSignal
 from download_manager.browser import UniversalDownloader
 from download_manager.torrent import TorrentUpdater, ensure_aria2_running, Aria2Client
 from download_manager.dialogs import LinkInputWindow, SettingsDialog, apply_settings
@@ -18,6 +18,24 @@ class DownloadType(Enum):
     TORRENT = 1
     TEMPORAL = 2
 
+
+class TorrentCancelSignals(QObject):
+    finished = pyqtSignal(str, bool, str)
+
+
+class TorrentCancelWorker(QRunnable):
+    def __init__(self, gid):
+        super().__init__()
+        self.gid = gid
+        self.signals = TorrentCancelSignals()
+
+    def run(self):
+        try:
+            result = Aria2Client().remove_download(self.gid, force=True)
+            self.signals.finished.emit(self.gid, bool(result), "")
+        except Exception as exc:
+            self.signals.finished.emit(self.gid, False, str(exc))
+
 class DownloadWindow(QWidget):
     def __init__(self, download_entries):
         super().__init__()
@@ -31,7 +49,7 @@ class DownloadWindow(QWidget):
         self.max_parallel_downloads = self.config.get("max_parallel_downloads", DEFAULT_CONFIG["max_parallel_downloads"])
         
         # Separar torrents de otras descargas
-        self.torrent_urls = []
+        self.torrent_entries = []
         self.regular_entries = []
         self.downloaders = []
         self.active_file_downloads = {}
@@ -72,6 +90,7 @@ class DownloadWindow(QWidget):
         self.torrent_items = {}
         self.temp_progress_bars = []
         self.temp_labels = []
+        self.saved_password_hints = set()
         
         if download_entries:
             self.load_entries(download_entries)
@@ -98,7 +117,7 @@ class DownloadWindow(QWidget):
     def process_torrents_parallel(self, torrents=None):
         if self._closing:
             return
-        target = torrents or self.torrent_urls
+        target = torrents or self.torrent_entries
         if not target:
             return
             
@@ -127,6 +146,7 @@ class DownloadWindow(QWidget):
                     link = item["url"]
                     headers = item.get("headers")
                     cookies = item.get("cookies")
+                    self.store_password_hint(relative_path, item.get("password"), item.get("title"))
                     index = base_index + offset
                     offset += 1
                     self._start_direct_download(relative_path, link, index, headers, cookies)
@@ -186,15 +206,16 @@ class DownloadWindow(QWidget):
         for entry in entries:
             url = entry.get("url", "")
             if url.startswith("magnet:?") or url.endswith(".torrent"):
-                new_torrents.append(url)
+                new_torrents.append(entry)
             else:
                 new_regular.append(entry)
+            self.store_password_hint(entry.get("path", ""), entry.get("password"), entry.get("title") or url)
 
         if new_torrents:
             if not self._aria2_checked:
                 ensure_aria2_running(self.folder_path, background=True)
                 self._aria2_checked = True
-            self.torrent_urls.extend(new_torrents)
+            self.torrent_entries.extend(new_torrents)
             self.process_torrents_parallel(new_torrents)
 
         if new_regular:
@@ -258,17 +279,22 @@ class DownloadWindow(QWidget):
         self._finalize_item(item)
 
     def cancel_torrent_download(self, gid):
-        try:
-            Aria2Client().remove_download(gid, force=True)
-        except Exception as exc:
-            print(f"Error cancelando torrent {gid}: {exc}")
-
         item = self.torrent_items.get(gid)
         if item and item.get("status") not in ("finished", "cancelled"):
             item["status"] = "cancelled"
             item["label"].setText(f"⏹ Torrent cancelado: {item['name']}")
             self._finalize_item(item)
         self.torrent_hashes.pop(gid, None)
+
+        worker = TorrentCancelWorker(gid)
+        worker.signals.finished.connect(self.on_torrent_cancel_finished)
+        QThreadPool.globalInstance().start(worker)
+
+    def on_torrent_cancel_finished(self, gid, ok, error_text):
+        if ok:
+            return
+        if error_text:
+            print(f"Error cancelando torrent {gid}: {error_text}")
 
     def clear_empty_state(self):
         if not self._empty_state_container:
@@ -295,6 +321,26 @@ class DownloadWindow(QWidget):
 
     def _insert_content_widget(self, widget):
         self.inner_layout.insertWidget(self.inner_layout.count() - 1, widget)
+
+    def store_password_hint(self, path_hint, password, title=""):
+        if not password or not path_hint:
+            return
+
+        target_dir = os.path.normpath(path_hint)
+        note_key = (target_dir, password.strip(), (title or "").strip())
+        if note_key in self.saved_password_hints:
+            return
+
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            note_path = os.path.join(target_dir, "__passwords__.txt")
+            entry_title = (title or "Archivo").strip()
+            block = f"[{entry_title}]\n{password.strip()}\n\n"
+            with open(note_path, "a", encoding="utf-8") as fh:
+                fh.write(block)
+            self.saved_password_hints.add(note_key)
+        except Exception as exc:
+            print(f"No se pudo guardar la contrasena para {title or path_hint}: {exc}")
 
     def _normalize_relative_path(self, relative_path):
         if not relative_path:

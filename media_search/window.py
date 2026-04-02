@@ -30,6 +30,12 @@ from media_search.workers import (
 
 logger = logging.getLogger("media_search")
 
+
+def sanitize_folder_name(name):
+    cleaned = re.sub(r'[<>:"/\\|?*]+', " ", (name or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().rstrip(".")
+    return cleaned or "Descarga"
+
 class MultiChoiceDownloader(QWidget):
     selection_ready = pyqtSignal(list)
 
@@ -38,7 +44,7 @@ class MultiChoiceDownloader(QWidget):
         self.setWindowTitle(title)
         self.setGeometry(300, 300, 600, 400)
         self.results_dict = results_dict
-        self.download_path = download_path
+        self.download_path = os.path.join(download_path, sanitize_folder_name(title))
         self.selected_links = []
         self.thread_pool = QThreadPool()
 
@@ -66,61 +72,83 @@ class MultiChoiceDownloader(QWidget):
                         if v and not result.get(k):
                             result[k] = v
 
-                item_text = ""
-                subgroup_text = ""
-                subgroup_item = None
-
-                if result["url_type"] != "torrent":
-                    item_text += f"[{result['url_type']}] "
-
-                item_text += f"{result['title']}"
-
-                fansub = result.get("fansub")
-                resol = result.get("resolucion")
-                chapter = result.get("chapter")
-                chapters = result.get("chapters")
-
-                if isinstance(chapter, (int, str)) and isinstance(chapters, (int)):
-                    item_text += f" {chapter}/{chapters}"
-                elif isinstance(chapter, (int, str)):
-                    item_text += f" {chapter}"
-
-                if isinstance(fansub, str):
-                    subgroup_text += f" [{fansub}]"
-
-                if isinstance(resol, int):
-                    subgroup_text += f" ({resol}p)"
-
-                explicit_group = result.get("group")
-                if isinstance(explicit_group, str) and explicit_group.strip():
-                    subgroup_text = explicit_group.strip()
+                item_text = self.build_item_text(result)
+                subgroup_text = self.build_subgroup_text(result)
 
                 if subgroup_text and subgroup_text not in aux:
                     subgroup_item = QTreeWidgetItem([subgroup_text])
                     subgroup_item.setFlags(subgroup_item.flags() | Qt.ItemIsUserCheckable)
                     subgroup_item.setCheckState(0, Qt.Unchecked)
+                    subgroup_item.setExpanded(True)
                     aux[subgroup_text] = subgroup_item
                     group_item.addChild(aux[subgroup_text])
 
                 password = result.get("password")
-                if isinstance(password, (int, str)):
-                    item_text += f" - PASSWORD: {password}"
 
                 child_item = QTreeWidgetItem([item_text])
                 child_item.setFlags(child_item.flags() | Qt.ItemIsUserCheckable)
                 child_item.setCheckState(0, Qt.Unchecked)
-                child_item.setData(0, Qt.UserRole, (item_text, result["url"]))
+                child_item.setData(0, Qt.UserRole, {
+                    "title": item_text,
+                    "url": result["url"],
+                    "password": password or "",
+                    "path": self.download_path,
+                })
+                if password:
+                    child_item.setToolTip(0, f"Contrasena: {password}")
 
                 if subgroup_text in aux:
                     aux[subgroup_text].addChild(child_item)
                 else:
                     group_item.addChild(child_item)
+            group_item.setExpanded(True)
 
         self.layout.addWidget(self.tree_widget)
         self.btn_confirm = QPushButton("Descargar seleccionados")
         self.btn_confirm.clicked.connect(self.confirm_selection)
         self.layout.addWidget(self.btn_confirm)
         self.setLayout(self.layout)
+
+    def build_item_text(self, result):
+        raw_title = (result.get("title") or "").strip()
+        release_name = self.parse_release_name(raw_title)
+        item_title = (release_name.get("title") or raw_title).strip() or raw_title
+
+        chapter = result.get("chapter")
+        chapters = result.get("chapters")
+        chapter_text = ""
+        if isinstance(chapter, (int, str)) and isinstance(chapters, int):
+            chapter_text = f"{chapter}/{chapters}"
+        elif isinstance(chapter, (int, str)):
+            chapter_text = str(chapter)
+
+        if chapter_text and chapter_text not in item_title:
+            return f"{item_title} {chapter_text}".strip()
+        return item_title
+
+    def build_subgroup_text(self, result):
+        explicit_group = result.get("group")
+        if isinstance(explicit_group, str) and explicit_group.strip():
+            return explicit_group.strip()
+
+        parts = []
+        url_type = (result.get("url_type") or "").strip()
+        if url_type and url_type != "torrent":
+            parts.append(f"[{url_type}]")
+
+        fansub = result.get("fansub")
+        if isinstance(fansub, str) and fansub.strip():
+            parts.append(fansub.strip())
+
+        resol = result.get("resolucion")
+        if isinstance(resol, int):
+            parts.append(f"{resol}p")
+
+        extra = result.get("extra")
+        if isinstance(extra, str) and extra.strip():
+            parts.append(extra.strip())
+
+        return " | ".join(parts)
 
     def parse_release_name(self,text):
         data = {
@@ -200,9 +228,8 @@ class MultiChoiceDownloader(QWidget):
     def procesar_item_si_valido(self, item, index):
                 data = item.data(0, Qt.UserRole)
                 if data is not None:
-                    title, url = data
-                    self.results_temp.append((index, title, None))
-                    worker = URLWorker(index, title, url)
+                    self.results_temp.append((index, data, None))
+                    worker = URLWorker(index, data["title"], data["url"])
                     worker.signals.finished.connect(self.on_link_ready)
                     self.thread_pool.start(worker)
                     return 1
@@ -210,7 +237,8 @@ class MultiChoiceDownloader(QWidget):
 
     def on_link_ready(self, index, title, link):
         if link:
-            self.results_temp[index] = (index, title, link)
+            result_index, data, _ = self.results_temp[index]
+            self.results_temp[index] = (result_index, data, link)
         else:
             self.results_temp[index] = None
 
@@ -220,18 +248,18 @@ class MultiChoiceDownloader(QWidget):
 
     def show_results(self):
         selected_links = [
-            (title, link) for _, title, link in sorted(filter(None, self.results_temp))
+            (data, link) for _, data, link in sorted(filter(None, self.results_temp))
         ]
         if selected_links:
             self.selected_links = [
-                {"url": link, "path": self.download_path}
-                for _, link in selected_links
+                {
+                    "url": link,
+                    "path": data["path"],
+                    "password": data.get("password", ""),
+                    "title": data.get("title", ""),
+                }
+                for data, link in selected_links
             ]
-            links_str = "\n\n".join(
-                f"{title}\n{link}"
-                for title, link in selected_links
-            )
-            QMessageBox.information(self, "Links seleccionados", links_str)
             self.selection_ready.emit(self.selected_links)
 
         else:
@@ -988,4 +1016,3 @@ class MediaSearchUI(QWidget):
         if title in self.total_links_found:
             del self.total_links_found[title]
             self.update_download_label()
-
