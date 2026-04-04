@@ -1,10 +1,30 @@
-import random, re, requests
+import json
+import random
+import re
+from urllib.parse import urlencode
+
+import requests
 from bs4 import BeautifulSoup
 from PyQt5.QtCore import QObject, QRunnable, pyqtSignal
 
 
 FACTORIO_BASE = "https://mods.factorio.com"
 MODINFO_URL = "https://re146.dev/factorio/mods/modinfo"
+MODRINTH_API_BASE = "https://api.modrinth.com/v2"
+MODRINTH_SITE_BASE = "https://modrinth.com"
+MODRINTH_USER_AGENT = "MediaSearchPrototype/1.0 (Modrinth integration)"
+MODRINTH_ALLOWED_PROJECT_TYPES = {"mod"}
+MODRINTH_ALLOWED_DEPENDENCY_TYPES = {"required"}
+MODRINTH_SEARCH_PAGE_LIMIT = 20
+MODRINTH_INDEX_BY_MODE = {
+    "popular": "downloads",
+    "updated": "updated",
+    "newest": "newest",
+}
+
+
+def modrinth_headers():
+    return {"User-Agent": MODRINTH_USER_AGENT}
 
 
 class FactorioSearchSignals(QObject):
@@ -12,7 +32,7 @@ class FactorioSearchSignals(QObject):
 
 
 class FactorioSearchWorker(QRunnable):
-    def __init__(self, mode=None, query=None, page=1):
+    def __init__(self, mode=None, query=None, page=1, extra_params=None):
         super().__init__()
         self.mode = mode
         self.query = query
@@ -21,6 +41,11 @@ class FactorioSearchWorker(QRunnable):
             "factorio_version": 2.0,
             "show_deprecated": False,
         }
+        if isinstance(extra_params, dict):
+            for key, value in extra_params.items():
+                if value in (None, "", [], ()):
+                    continue
+                self.params[key] = value
         self.signals = FactorioSearchSignals()
 
     def run(self):
@@ -28,20 +53,34 @@ class FactorioSearchWorker(QRunnable):
             if self.query:
                 url = f"{FACTORIO_BASE}/search"
                 self.params["query"] = self.query
-                params = self.params
             else:
                 url = f"{FACTORIO_BASE}/browse/{self.mode}"
-                params = self.params
-            response = requests.get(url, params=params, timeout=15)
+            response = requests.get(url, params=self.params, timeout=15)
             response.raise_for_status()
             parsed = parse_mod_list(response.text)
+            parsed["request_url"] = build_factorio_request_url(url, self.params)
             self.signals.finished.emit(parsed, "")
         except Exception as exc:
             self.signals.finished.emit([], str(exc))
 
 
+def build_factorio_request_url(base_url, params):
+    clean_params = {}
+    for key, value in (params or {}).items():
+        if value in (None, ""):
+            continue
+        clean_params[key] = value
+    if not clean_params:
+        return base_url
+    return f"{base_url}?{urlencode(clean_params, doseq=True)}"
+
+
 class FactorioInfoSignals(QObject):
     finished = pyqtSignal(str, dict, str)
+
+
+class FactorioPageSignals(QObject):
+    finished = pyqtSignal(str, str, str, str, str)
 
 
 class FactorioInfoWorker(QRunnable):
@@ -58,6 +97,128 @@ class FactorioInfoWorker(QRunnable):
             self.signals.finished.emit(self.mod_id, response.json(), "")
         except Exception as exc:
             self.signals.finished.emit(self.mod_id, {}, str(exc))
+
+
+class FactorioPageWorker(QRunnable):
+    def __init__(self, mod_id, url, title):
+        super().__init__()
+        self.mod_id = mod_id
+        self.url = url
+        self.title = title
+        self.signals = FactorioPageSignals()
+
+    def run(self):
+        try:
+            response = requests.get(self.url, timeout=15)
+            response.raise_for_status()
+            html = sanitize_factorio_mod_page_html(response.text)
+            self.signals.finished.emit(self.mod_id, self.url, self.title, html, "")
+        except Exception as exc:
+            self.signals.finished.emit(self.mod_id, self.url, self.title, "", str(exc))
+
+
+def sanitize_factorio_mod_page_html(html):
+    soup = BeautifulSoup(html, "html.parser")
+    selectors = [
+        "div.top-bar",
+        "div.header",
+        "div.footer",
+        "div#tabs-header",
+        "ul.tabs",
+    ]
+    for selector in selectors:
+        for node in soup.select(selector):
+            node.decompose()
+
+    body = soup.body
+    if body is not None:
+        current_style = body.get("style", "").strip()
+        additions = [
+            "margin-top: 0",
+            "padding-top: 0",
+        ]
+        style = "; ".join(filter(None, [current_style] + additions))
+        body["style"] = style
+
+    head = soup.head
+    if head is not None:
+        style_tag = soup.new_tag("style")
+        style_tag.string = """
+body {
+    margin-top: 0 !important;
+    padding-top: 0 !important;
+}
+.top-bar,
+.header,
+.footer,
+#tabs-header,
+ul.tabs {
+    display: none !important;
+}
+"""
+        head.append(style_tag)
+    return str(soup)
+
+
+class ModrinthSearchSignals(QObject):
+    finished = pyqtSignal(object, str)
+
+
+class ModrinthSearchWorker(QRunnable):
+    def __init__(self, mode=None, query=None, page=1):
+        super().__init__()
+        self.mode = mode or "popular"
+        self.query = query or ""
+        self.page = max(page, 1)
+        self.signals = ModrinthSearchSignals()
+
+    def run(self):
+        try:
+            payload = fetch_modrinth_search_page(self.mode, self.query, self.page)
+            self.signals.finished.emit(payload, "")
+        except Exception as exc:
+            self.signals.finished.emit([], str(exc))
+
+
+class ModrinthProjectSignals(QObject):
+    finished = pyqtSignal(str, dict, str)
+
+
+class ModrinthProjectWorker(QRunnable):
+    def __init__(self, project_id):
+        super().__init__()
+        self.project_id = project_id
+        self.signals = ModrinthProjectSignals()
+
+    def run(self):
+        try:
+            response = requests.get(
+                f"{MODRINTH_API_BASE}/project/{self.project_id}",
+                headers=modrinth_headers(),
+                timeout=15,
+            )
+            response.raise_for_status()
+            self.signals.finished.emit(self.project_id, response.json(), "")
+        except Exception as exc:
+            self.signals.finished.emit(self.project_id, {}, str(exc))
+
+
+class ModrinthVersionsSignals(QObject):
+    finished = pyqtSignal(str, list, str)
+
+
+class ModrinthVersionsWorker(QRunnable):
+    def __init__(self, project_id):
+        super().__init__()
+        self.project_id = project_id
+        self.signals = ModrinthVersionsSignals()
+
+    def run(self):
+        try:
+            versions = fetch_modrinth_project_versions(self.project_id)
+            self.signals.finished.emit(self.project_id, versions, "")
+        except Exception as exc:
+            self.signals.finished.emit(self.project_id, [], str(exc))
 
 
 class DependencyResolveSignals(QObject):
@@ -181,13 +342,17 @@ def parse_mod_list(html):
             thumbnail = image_tag.get("src", "")
 
         items.append({
+            "source": "factorio",
             "id": mod_id,
+            "slug": mod_id,
             "url": mod_url,
+            "web_url": mod_url,
             "name": name_tag.get_text(strip=True) or "Sin título",
             "author": author,
             "author_url": author_url,
             "description": description,
             "category": category,
+            "categories": [category] if category else [],
             "updated_text": updated_text,
             "updated_title": updated_title,
             "versions": versions,
@@ -203,3 +368,193 @@ def parse_mod_list(html):
         "page": page_data["current_page"] or 1,
         "last_page": page_data["last_page"],
     }
+
+
+def fetch_modrinth_search_page(mode, query, page):
+    page = max(page, 1)
+    offset = (page - 1) * MODRINTH_SEARCH_PAGE_LIMIT
+    index = MODRINTH_INDEX_BY_MODE.get(mode or "", "downloads")
+    params = {
+        "query": query or "",
+        "limit": MODRINTH_SEARCH_PAGE_LIMIT,
+        "offset": offset,
+        "index": index,
+        "facets": json.dumps([["project_type:mod"]]),
+    }
+    response = requests.get(
+        f"{MODRINTH_API_BASE}/search",
+        params=params,
+        headers=modrinth_headers(),
+        timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    hits = payload.get("hits") or []
+    total = payload.get("total_hits")
+    normalized = [normalize_modrinth_search_hit(hit) for hit in hits]
+    items = [item for item in normalized if item]
+    last_page = None
+    if isinstance(total, int) and total >= 0:
+        last_page = max(1, (total + MODRINTH_SEARCH_PAGE_LIMIT - 1) // MODRINTH_SEARCH_PAGE_LIMIT)
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "last_page": last_page,
+    }
+
+
+def normalize_modrinth_search_hit(hit):
+    if not isinstance(hit, dict):
+        return None
+    project_type = (hit.get("project_type") or "").strip().lower()
+    if project_type not in MODRINTH_ALLOWED_PROJECT_TYPES:
+        return None
+
+    project_id = hit.get("project_id") or hit.get("slug") or hit.get("project_id")
+    slug = hit.get("slug") or project_id or ""
+    if not project_id and not slug:
+        return None
+
+    categories = hit.get("display_categories") or hit.get("categories") or []
+    categories = [value for value in categories if isinstance(value, str) and value.strip()]
+    loaders = hit.get("loaders") or []
+    loaders = [value for value in loaders if isinstance(value, str) and value.strip()]
+    game_versions = hit.get("versions") or []
+    game_versions = [value for value in game_versions if isinstance(value, str) and value.strip()]
+
+    category_parts = categories[:]
+    for loader in loaders:
+        if loader not in category_parts:
+            category_parts.append(loader)
+
+    updated_title = hit.get("date_modified") or ""
+    return {
+        "source": "modrinth",
+        "id": project_id or slug,
+        "project_id": project_id or slug,
+        "slug": slug or project_id,
+        "url": build_modrinth_project_url(hit),
+        "web_url": build_modrinth_project_url(hit),
+        "name": hit.get("title") or hit.get("slug") or "Sin título",
+        "author": hit.get("author") or "Desconocido",
+        "description": (hit.get("description") or "").strip(),
+        "category": ", ".join(category_parts[:3]) if category_parts else "Mod",
+        "categories": categories,
+        "loaders": loaders,
+        "game_versions": game_versions,
+        "downloads": hit.get("downloads"),
+        "downloads_text": format_download_count(hit.get("downloads")),
+        "downloads_exact": str(hit.get("downloads") or ""),
+        "updated_text": format_iso_datetime(updated_title),
+        "updated_title": updated_title,
+        "thumbnail": hit.get("icon_url") or "",
+        "project_type": project_type,
+    }
+
+
+def build_modrinth_project_url(data):
+    slug = data.get("slug") or data.get("project_id") or data.get("id") or ""
+    project_type = (data.get("project_type") or "mod").strip().lower() or "mod"
+    return f"{MODRINTH_SITE_BASE}/{project_type}/{slug}" if slug else ""
+
+
+def fetch_modrinth_project_versions(project_id):
+    response = requests.get(
+        f"{MODRINTH_API_BASE}/project/{project_id}/version",
+        headers=modrinth_headers(),
+        timeout=15,
+    )
+    response.raise_for_status()
+    versions = response.json()
+    if not isinstance(versions, list):
+        return []
+    return [version for version in versions if isinstance(version, dict)]
+
+
+def fetch_modrinth_version(version_id):
+    response = requests.get(
+        f"{MODRINTH_API_BASE}/version/{version_id}",
+        headers=modrinth_headers(),
+        timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return payload if isinstance(payload, dict) else {}
+
+
+def pick_modrinth_primary_file(version):
+    files = version.get("files") or []
+    files = [file_info for file_info in files if is_valid_modrinth_file(file_info)]
+    if not files:
+        return None
+    for file_info in files:
+        if file_info.get("primary"):
+            return file_info
+    return files[0]
+
+
+def is_valid_modrinth_file(file_info):
+    if not isinstance(file_info, dict):
+        return False
+    url = file_info.get("url")
+    filename = file_info.get("filename")
+    return bool(url and filename)
+
+
+def normalize_modrinth_version_option(version):
+    if not isinstance(version, dict):
+        return None
+    primary_file = pick_modrinth_primary_file(version)
+    if not primary_file:
+        return None
+    return {
+        "id": version.get("id") or "",
+        "name": version.get("name") or version.get("version_number") or "Versión",
+        "version_number": version.get("version_number") or "",
+        "version_type": version.get("version_type") or "",
+        "published": version.get("date_published") or "",
+        "published_text": format_iso_datetime(version.get("date_published") or ""),
+        "downloads": version.get("downloads"),
+        "downloads_text": format_download_count(version.get("downloads")),
+        "loaders": [value for value in (version.get("loaders") or []) if isinstance(value, str)],
+        "game_versions": [value for value in (version.get("game_versions") or []) if isinstance(value, str)],
+        "files": [file_info for file_info in (version.get("files") or []) if is_valid_modrinth_file(file_info)],
+        "primary_file": primary_file,
+        "dependencies": [dep for dep in (version.get("dependencies") or []) if isinstance(dep, dict)],
+        "raw": version,
+    }
+
+
+def filter_required_modrinth_dependencies(dependencies):
+    return [
+        dependency
+        for dependency in dependencies
+        if isinstance(dependency, dict)
+        and (dependency.get("dependency_type") or "").lower() in MODRINTH_ALLOWED_DEPENDENCY_TYPES
+    ]
+
+
+def format_iso_datetime(value):
+    if not value:
+        return ""
+    text = value.replace("T", " ")
+    text = text.replace("Z", " UTC")
+    if "." in text:
+        prefix, suffix = text.split(".", 1)
+        if " " in suffix:
+            suffix = suffix[suffix.find(" "):]
+        else:
+            suffix = ""
+        text = prefix + suffix
+    return text.strip()
+
+
+def format_download_count(value):
+    if not isinstance(value, int):
+        return ""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}k"
+    return str(value)
