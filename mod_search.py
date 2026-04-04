@@ -5,7 +5,7 @@ from mod_search.window import ModSearchWindow
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--game", default="factorio")
+    parser.add_argument("--game", default="factorio", choices=["factorio", "minecraft", "modrinth"])
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
