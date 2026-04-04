@@ -1,7 +1,8 @@
 import json, os, random, re, subprocess, tempfile
+from pathlib import Path
 import requests
 from PyQt5.QtCore import Qt, QThreadPool, QSize, QUrl, QUrlQuery, pyqtSignal
-from PyQt5.QtGui import QCursor, QDesktopServices, QPixmap
+from PyQt5.QtGui import QColor, QCursor, QDesktopServices, QMovie, QPainter, QPixmap
 from PyQt5.QtWebEngineWidgets import QWebEnginePage, QWebEngineProfile, QWebEngineView
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -35,6 +36,8 @@ DOWNLOAD_BASE = "https://mods-storage.re146.dev"
 LIST_THUMBNAIL_SIZE = QSize(92, 92)
 FACTORIO_MOD_HOST = "mods.factorio.com"
 MODRINTH_MOD_HOST = "modrinth.com"
+FACTORIO_BODY_BG = "https://webcdn.factorio.com/assets/img/web/bg_v4-85.jpg"
+SPINNER_PATH = "spinner.gif"
 DEFAULT_FACTORIO_FILTERS = {
     "expansion": [
         {"label": "Space Age", "value": "space-age"},
@@ -96,7 +99,7 @@ class ModWebPage(SilentPage):
         if not target:
             return True
         if nav_type == QWebEnginePage.NavigationTypeLinkClicked:
-            if self.window.handle_internal_navigation(target, current_page_key=self.page_key):
+            if self.window.handle_internal_navigation(target):
                 return False
         if nav_type == QWebEnginePage.NavigationTypeLinkClicked:
             QDesktopServices.openUrl(url)
@@ -119,6 +122,27 @@ class ClickableLabel(QLabel):
         super().mousePressEvent(event)
 
 
+class FactorioBackgroundWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.background_pixmap = QPixmap()
+
+    def set_background_path(self, path):
+        self.background_pixmap = QPixmap(path) if path else QPixmap()
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#201810"))
+        if not self.background_pixmap.isNull():
+            x = (self.width() - self.background_pixmap.width()) // 2
+            y = 0
+            while y < self.height():
+                painter.drawPixmap(x, y, self.background_pixmap)
+                y += self.background_pixmap.height()
+        super().paintEvent(event)
+
+
 class ModResultItemWidget(QFrame):
     clicked = pyqtSignal()
     open_requested = pyqtSignal(str, str, str)
@@ -127,6 +151,7 @@ class ModResultItemWidget(QFrame):
         super().__init__(parent)
         self.data = data
         self.setFrameShape(QFrame.StyledPanel)
+        self.setObjectName("modResultCard")
         self.setStyleSheet(self._build_stylesheet(False))
 
         layout = QHBoxLayout(self)
@@ -136,7 +161,11 @@ class ModResultItemWidget(QFrame):
         self.thumb_label = ClickableLabel()
         self.thumb_label.setFixedSize(LIST_THUMBNAIL_SIZE)
         self.thumb_label.setAlignment(Qt.AlignCenter)
-        self.thumb_label.setStyleSheet("background: #f3f4f6; border: 1px solid #d1d5db;")
+        self.thumb_label.setStyleSheet(
+            "background: rgba(0, 0, 0, 0.28);"
+            "border: 1px solid #2e2623;"
+            "padding: 2px;"
+        )
         self.thumb_label.clicked.connect(self._emit_open_requested)
         layout.addWidget(self.thumb_label)
 
@@ -145,7 +174,7 @@ class ModResultItemWidget(QFrame):
 
         self.name_label = ClickableLabel(data.get("name") or "Sin título")
         self.name_label.setWordWrap(True)
-        self.name_label.setStyleSheet("font-weight: 600; font-size: 14px; color: #1d4ed8;")
+        self.name_label.setStyleSheet("font-weight: 700; font-size: 15px; color: #ffe6c0;")
         self.name_label.clicked.connect(self._emit_open_requested)
         text_col.addWidget(self.name_label)
 
@@ -153,8 +182,7 @@ class ModResultItemWidget(QFrame):
         if description:
             self.description_label = QLabel(description)
             self.description_label.setWordWrap(True)
-            self.description_label.setStyleSheet("color: #4b5563;")
-            self.description_label.setMaximumHeight(42)
+            self.description_label.setStyleSheet("color: #ddd4cc; line-height: 1.2;")
             text_col.addWidget(self.description_label)
         else:
             self.description_label = None
@@ -169,11 +197,13 @@ class ModResultItemWidget(QFrame):
         self.author_label = QLabel(f"Autor: {data.get('author') or 'Desconocido'}")
         self.author_label.setWordWrap(True)
         self.author_label.setAlignment(Qt.AlignRight | Qt.AlignTop)
+        self.author_label.setStyleSheet("color: #7dcaed;")
         meta_col.addWidget(self.author_label)
 
         self.category_label = QLabel(f"Categoría: {data.get('category') or 'Sin categoría'}")
         self.category_label.setWordWrap(True)
         self.category_label.setAlignment(Qt.AlignRight | Qt.AlignTop)
+        self.category_label.setStyleSheet("color: #ffe6c0;")
         meta_col.addWidget(self.category_label)
 
         updated = data.get("updated_text") or "Desconocido"
@@ -183,6 +213,7 @@ class ModResultItemWidget(QFrame):
         self.updated_label = QLabel(f"Actualizado: {updated}")
         self.updated_label.setWordWrap(True)
         self.updated_label.setAlignment(Qt.AlignRight | Qt.AlignTop)
+        self.updated_label.setStyleSheet("color: #a6a6a6;")
         meta_col.addWidget(self.updated_label)
         meta_col.addStretch(1)
         layout.addLayout(meta_col)
@@ -219,10 +250,16 @@ class ModResultItemWidget(QFrame):
 
     @staticmethod
     def _build_stylesheet(selected):
-        background = "#eff6ff" if selected else "#ffffff"
+        background = "#414040" if selected else "#313031"
+        border_color = "#ffa200" if selected else "#2e2623"
         return (
-            "QFrame {"
+            "QFrame#modResultCard {"
             f"background: {background};"
+            f"border: 4px solid {border_color};"
+            "color: #ffffff;"
+            "}"
+            "QFrame#modResultCard:hover {"
+            "background: #3b3a3b;"
             "}"
         )
 
@@ -285,8 +322,6 @@ class CartDialog(QDialog):
         self.items = items
 
         layout = QVBoxLayout(self)
-        label = QLabel("Elementos en el carrito:")
-        layout.addWidget(label)
         self.list_widget = QListWidget()
         for item in self.items:
             title = item.get("title") or "Sin título"
@@ -349,9 +384,12 @@ class ModSearchWindow(QWidget):
         }
         self.current_request_url = ""
         self.web_cache_dir = os.path.join(tempfile.gettempdir(), "MediaSearchPrototype", "mod_search_web_cache")
+        self.factorio_theme_dir = os.path.join(tempfile.gettempdir(), "MediaSearchPrototype", "mod_search_theme")
+        self.factorio_background_path = ""
 
         root = QVBoxLayout(self)
         self.configure_web_profile()
+        self.prepare_factorio_theme_assets()
 
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
@@ -359,7 +397,10 @@ class ModSearchWindow(QWidget):
         self.tabs.currentChanged.connect(self.on_tab_changed)
         root.addWidget(self.tabs, 1)
 
-        browse_tab = QWidget()
+        browse_tab = FactorioBackgroundWidget() if self.game == "factorio" else QWidget()
+        if self.game == "factorio":
+            browse_tab.setObjectName("factorioBrowseTab")
+            browse_tab.set_background_path(self.factorio_background_path)
         browse_layout = QVBoxLayout(browse_tab)
 
         top_row = QHBoxLayout()
@@ -384,6 +425,7 @@ class ModSearchWindow(QWidget):
         browse_layout.addLayout(search_row)
 
         self.filter_url_label = QLabel("")
+        self.filter_url_label.setObjectName("factorioUrlPreview")
         self.filter_url_label.setWordWrap(True)
         self.filter_url_label.setStyleSheet("color: #6b7280; font-size: 11px;")
         self.filter_url_label.setVisible(self.game == "factorio")
@@ -392,6 +434,7 @@ class ModSearchWindow(QWidget):
         content_row = QHBoxLayout()
 
         self.results_list = QListWidget()
+        self.results_list.setObjectName("factorioResultsList")
         self.results_list.setSpacing(8)
         self.results_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.results_list.verticalScrollBar().setSingleStep(24)
@@ -411,6 +454,7 @@ class ModSearchWindow(QWidget):
 
         bottom_row = QHBoxLayout()
         self.status_label = QLabel("")
+        self.status_label.setObjectName("factorioStatusLabel")
         self.cart_button = QPushButton("Carrito (0)")
         self.cart_button.clicked.connect(self.open_cart)
         self.cart_button.setEnabled(False)
@@ -424,6 +468,7 @@ class ModSearchWindow(QWidget):
         root.addLayout(bottom_row)
 
         self.mode_combo.currentIndexChanged.connect(self.load_browse)
+        self.apply_factorio_theme()
         self.load_browse()
 
     @staticmethod
@@ -447,6 +492,152 @@ class ModSearchWindow(QWidget):
         profile.setHttpCacheType(QWebEngineProfile.DiskHttpCache)
         profile.setCachePath(self.web_cache_dir)
         profile.setPersistentStoragePath(self.web_cache_dir)
+
+    def prepare_factorio_theme_assets(self):
+        if self.game != "factorio":
+            return
+        try:
+            os.makedirs(self.factorio_theme_dir, exist_ok=True)
+        except OSError:
+            return
+        background_path = os.path.join(self.factorio_theme_dir, "bg_v4-85.jpg")
+        if not os.path.exists(background_path):
+            try:
+                response = requests.get(FACTORIO_BODY_BG, timeout=20)
+                response.raise_for_status()
+                Path(background_path).write_bytes(response.content)
+            except Exception:
+                self.factorio_background_path = ""
+                return
+        self.factorio_background_path = background_path
+
+    def apply_factorio_theme(self):
+        if self.game != "factorio":
+            return
+        self.setStyleSheet(
+            f"""
+            QWidget {{
+                color: #ffffff;
+            }}
+            QTabBar::tab {{
+                color: #000000;
+            }}
+            QTabBar::tab:selected {{
+                color: #000000;
+            }}
+            QLabel#factorioUrlPreview {{
+                color: #a6a6a6;
+                background: rgba(0, 0, 0, 0.18);
+                padding: 4px 8px;
+            }}
+            QLabel#factorioStatusLabel {{
+                color: #000000;
+            }}
+            QListWidget#factorioResultsList {{
+                background: transparent;
+                border: none;
+                outline: none;
+            }}
+            QListWidget#factorioResultsList::item {{
+                background: transparent;
+                border: none;
+            }}
+            QScrollArea#factorioFilterScroll, QScrollArea#factorioFilterScroll > QWidget > QWidget {{
+                background: transparent;
+                border: none;
+            }}
+            QFrame#factorioFilterPanel {{
+                background: rgba(32, 24, 16, 0.68);
+                border-left: 1px solid rgba(255, 230, 192, 0.18);
+            }}
+            QWidget#factorioFilterBody {{
+                background: transparent;
+            }}
+            QLabel#factorioFilterTitle, QLabel#factorioLoadingTitle {{
+                color: #ffe6c0;
+                font-weight: 700;
+                font-size: 15px;
+            }}
+            QLabel#factorioFilterHint, QLabel#factorioLoadingSubtitle {{
+                color: #d6cfc8;
+            }}
+            QFrame#factorioLoadingPanel {{
+                background-color: #313031;
+                border: 4px solid #2e2623;
+                min-width: 360px;
+                max-width: 420px;
+            }}
+            QLineEdit, QComboBox, QListWidget, QPushButton {{
+                background-color: rgba(49, 48, 49, 0.92);
+                border: 2px solid #2e2623;
+                color: #ffffff;
+                padding: 4px 6px;
+            }}
+            QPushButton:hover {{
+                border-color: #ffa200;
+            }}
+            QLabel#factorioSectionLabel {{
+                color: #ffe6c0;
+                font-weight: 700;
+            }}
+            """
+        )
+
+    def build_factorio_loading_placeholder(self, message="Cargando página...", subtitle=""):
+        holder = FactorioBackgroundWidget()
+        holder.setObjectName("factorioPagePlaceholder")
+        holder.set_background_path(self.factorio_background_path)
+        layout = QVBoxLayout(holder)
+        layout.setContentsMargins(24, 24, 24, 24)
+
+        layout.addStretch(1)
+        panel = QFrame()
+        panel.setObjectName("factorioLoadingPanel")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(24, 24, 24, 24)
+        panel_layout.setSpacing(12)
+
+        spinner_label = QLabel()
+        spinner_label.setAlignment(Qt.AlignCenter)
+        spinner_movie = QMovie(SPINNER_PATH)
+        spinner_movie.setScaledSize(QSize(40, 40))
+        spinner_label.setMovie(spinner_movie)
+        spinner_movie.start()
+        holder.spinner_movie = spinner_movie
+        holder.spinner_label = spinner_label
+        panel_layout.addWidget(spinner_label)
+
+        title_label = QLabel(message)
+        title_label.setObjectName("factorioLoadingTitle")
+        title_label.setAlignment(Qt.AlignCenter)
+        panel_layout.addWidget(title_label)
+        holder.title_label = title_label
+
+        subtitle_label = QLabel(subtitle or "Preparando la página del portal con el estilo original.")
+        subtitle_label.setObjectName("factorioLoadingSubtitle")
+        subtitle_label.setWordWrap(True)
+        subtitle_label.setAlignment(Qt.AlignCenter)
+        panel_layout.addWidget(subtitle_label)
+        holder.subtitle_label = subtitle_label
+
+        layout.addWidget(panel, alignment=Qt.AlignCenter)
+        layout.addStretch(1)
+        return holder
+
+    def build_page_loading_placeholder(self, message="Cargando página..."):
+        if self.game == "factorio":
+            return self.build_factorio_loading_placeholder(message=message)
+        holder = QWidget()
+        layout = QVBoxLayout(holder)
+        layout.setContentsMargins(24, 24, 24, 24)
+        label = QLabel(message)
+        label.setAlignment(Qt.AlignCenter)
+        layout.addStretch(1)
+        layout.addWidget(label)
+        layout.addStretch(1)
+        holder.title_label = label
+        holder.subtitle_label = None
+        return holder
 
     def default_mode(self):
         return "popular" if self.game == "minecraft" else "updated"
@@ -472,27 +663,31 @@ class ModSearchWindow(QWidget):
             return None
 
         panel = QFrame()
+        panel.setObjectName("factorioFilterPanel")
         panel.setFixedWidth(300)
-        panel.setStyleSheet("QFrame { background: #f8fafc; border-left: 1px solid #d1d5db; }")
 
         outer = QVBoxLayout(panel)
         outer.setContentsMargins(0, 0, 0, 0)
 
         scroll = QScrollArea()
+        scroll.setObjectName("factorioFilterScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         outer.addWidget(scroll)
 
         body = QWidget()
+        body.setObjectName("factorioFilterBody")
         layout = QVBoxLayout(body)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
         title = QLabel("Filtros del portal")
+        title.setObjectName("factorioFilterTitle")
         title.setStyleSheet("font-weight: 600; font-size: 14px;")
         layout.addWidget(title)
 
         hint = QLabel("Marca Incluir o Excluir para modificar la URL de Factorio.")
+        hint.setObjectName("factorioFilterHint")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #4b5563;")
         layout.addWidget(hint)
@@ -508,6 +703,7 @@ class ModSearchWindow(QWidget):
 
         for group_key, title_text in (("category", "Categorías"), ("tag", "Tags")):
             group_title = QLabel(title_text)
+            group_title.setObjectName("factorioSectionLabel")
             group_title.setStyleSheet("font-weight: 600; margin-top: 8px;")
             layout.addWidget(group_title)
             for option in self.factorio_filter_definitions.get(group_key, []):
@@ -745,7 +941,7 @@ class ModSearchWindow(QWidget):
                 return mod_id
         return ""
 
-    def handle_internal_navigation(self, target, current_page_key=""):
+    def handle_internal_navigation(self, target):
         parsed = QUrl(target)
         host = parsed.host().lower()
         if not host:
@@ -1021,14 +1217,16 @@ class ModSearchWindow(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        loading_label = QLabel("Cargando página...")
-        loading_label.setAlignment(Qt.AlignCenter)
-        loading_label.setStyleSheet("color: #4b5563; padding: 24px;")
-        layout.addWidget(loading_label)
-        tab.loading_label = loading_label
+        loading_placeholder = self.build_page_loading_placeholder()
+        layout.addWidget(loading_placeholder)
+        tab.loading_placeholder = loading_placeholder
 
         web_view = QWebEngineView()
         web_view.setPage(ModWebPage(self, page_key, mod_id, web_view))
+        web_view.page().setBackgroundColor(QColor("#201810"))
+        web_view.loadFinished.connect(
+            lambda ok, current_page_key=page_key: self.on_internal_page_loaded(current_page_key, ok)
+        )
         web_view.setVisible(False)
         layout.addWidget(web_view)
         tab.web_view = web_view
@@ -1073,41 +1271,67 @@ class ModSearchWindow(QWidget):
         if self.game != "factorio":
             tab.web_view.load(QUrl(tab.current_url))
             tab.web_view.setVisible(True)
-            if getattr(tab, "loading_label", None) is not None:
-                tab.loading_label.hide()
+            if getattr(tab, "loading_placeholder", None) is not None:
+                tab.loading_placeholder.hide()
             return
         cached_html = self.internal_page_cache.get(tab.current_url)
         if cached_html:
             tab.web_view.setHtml(cached_html, QUrl(tab.current_url))
             tab.web_view.setVisible(True)
-            if getattr(tab, "loading_label", None) is not None:
-                tab.loading_label.hide()
+            if getattr(tab, "loading_placeholder", None) is not None:
+                tab.loading_placeholder.hide()
             return
-        if getattr(tab, "loading_label", None) is not None:
-            tab.loading_label.setText("Cargando página...")
-            tab.loading_label.show()
+        self.update_loading_placeholder(
+            tab,
+            message="Cargando página...",
+            subtitle="Descargando y limpiando la página del portal antes de mostrarla.",
+        )
         tab.web_view.setVisible(False)
         worker = FactorioPageWorker(getattr(tab, "page_key", tab.mod_id), tab.current_url, tab.title)
         worker.signals.finished.connect(self.on_factorio_page_ready)
         self.thread_pool.start(worker)
+
+    def update_loading_placeholder(self, tab, message, subtitle):
+        placeholder = getattr(tab, "loading_placeholder", None)
+        if placeholder is None:
+            return
+        if hasattr(placeholder, "title_label"):
+            placeholder.title_label.setText(message)
+        if getattr(placeholder, "subtitle_label", None) is not None:
+            placeholder.subtitle_label.setText(subtitle)
+        placeholder.show()
 
     def on_factorio_page_ready(self, page_key, url, title, html, error):
         tab = self.web_tabs.get(page_key)
         if tab is None or getattr(tab, "current_url", "") != url:
             return
         if error or not html:
-            if getattr(tab, "loading_label", None) is not None:
-                tab.loading_label.setText("No se pudo sanitizar la página, cargando vista directa...")
-                tab.loading_label.show()
-            tab.web_view.setVisible(True)
+            self.update_loading_placeholder(
+                tab,
+                message="Cargando vista directa...",
+                subtitle="No se pudo preparar la plantilla local, así que se abrirá la página original.",
+            )
             tab.web_view.load(QUrl(url))
             return
 
         self.internal_page_cache[url] = html
         tab.web_view.setHtml(html, QUrl(url))
+
+    def on_internal_page_loaded(self, page_key, ok):
+        tab = self.web_tabs.get(page_key)
+        if tab is None:
+            return
+        if not ok:
+            self.update_loading_placeholder(
+                tab,
+                message="No se pudo cargar la página",
+                subtitle="La vista embebida falló al renderizar este contenido.",
+            )
+            tab.web_view.setVisible(False)
+            return
         tab.web_view.setVisible(True)
-        if getattr(tab, "loading_label", None) is not None:
-            tab.loading_label.hide()
+        if getattr(tab, "loading_placeholder", None) is not None:
+            tab.loading_placeholder.hide()
 
     def on_scroll(self, value):
         if self.is_loading or self.pending_load:
