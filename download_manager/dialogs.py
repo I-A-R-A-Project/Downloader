@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
     QSpinBox, QTextEdit, QVBoxLayout, QWidget,
 )
-from config import DEFAULT_CONFIG, load_config, save_config
+from config import DEFAULT_CONFIG, load_config, normalize_path, save_config
 
 
 class SettingsDialog(QDialog):
@@ -32,6 +32,20 @@ class SettingsDialog(QDialog):
         self.open_folder_cb = QCheckBox("Abrir carpeta al finalizar")
         self.open_folder_cb.setChecked(self.config.get("open_on_finish", DEFAULT_CONFIG["open_on_finish"]))
         layout.addWidget(self.open_folder_cb)
+
+        self.auto_extract_cb = QCheckBox("Descomprimir al finalizar")
+        self.auto_extract_cb.setChecked(
+            self.config.get("auto_extract_archives", DEFAULT_CONFIG["auto_extract_archives"])
+        )
+        layout.addWidget(self.auto_extract_cb)
+
+        self.delete_archive_cb = QCheckBox("Eliminar comprimido después de descomprimir")
+        self.delete_archive_cb.setChecked(
+            self.config.get("delete_archive_after_extract", DEFAULT_CONFIG["delete_archive_after_extract"])
+        )
+        layout.addWidget(self.delete_archive_cb)
+        self.auto_extract_cb.toggled.connect(self.sync_extract_options)
+        self.sync_extract_options(self.auto_extract_cb.isChecked())
 
         hbox = QHBoxLayout()
         hbox.addWidget(QLabel("Máx. descargas paralelas:"))
@@ -60,8 +74,13 @@ class SettingsDialog(QDialog):
         if folder:
             self.folder_path_edit.setText(folder)
 
+    def sync_extract_options(self, auto_extract_enabled):
+        self.delete_archive_cb.setEnabled(auto_extract_enabled)
+        if not auto_extract_enabled:
+            self.delete_archive_cb.setChecked(False)
+
     def save_and_close(self):
-        folder_path = self.folder_path_edit.text()
+        folder_path = normalize_path(self.folder_path_edit.text())
         if not os.path.exists(folder_path) or not os.path.isdir(folder_path):
             msg = QMessageBox(self)
             msg.setIcon(QMessageBox.Critical)
@@ -82,6 +101,10 @@ class SettingsDialog(QDialog):
 
         self.config["folder_path"] = folder_path
         self.config["open_on_finish"] = self.open_folder_cb.isChecked()
+        self.config["auto_extract_archives"] = self.auto_extract_cb.isChecked()
+        self.config["delete_archive_after_extract"] = (
+            self.delete_archive_cb.isChecked() if self.auto_extract_cb.isChecked() else False
+        )
         self.config["max_parallel_downloads"] = self.max_downloads_spin.value()
         save_config(self.config)
         self.accept()
@@ -139,7 +162,7 @@ class DownloadDetailsDialog(QDialog):
         return [{
             "url": entry["url"],
             "password": entry["password_widget"].text().strip(),
-            "path": entry["path_widget"].text().strip(),
+            "path": normalize_path(entry["path_widget"].text().strip()),
         } for entry in self.entries]
 
 
@@ -193,6 +216,8 @@ def apply_settings():
     config = load_config()
     folder_path = config.get("folder_path")
     open_on_finish = config.get("open_on_finish")
+    auto_extract_archives = config.get("auto_extract_archives")
+    delete_archive_after_extract = config.get("delete_archive_after_extract")
     max_parallel_downloads = config.get("max_parallel_downloads")
     print(f"Configuración actualizada: {config}")
-    return folder_path, open_on_finish, max_parallel_downloads
+    return folder_path, open_on_finish, auto_extract_archives, delete_archive_after_extract, max_parallel_downloads

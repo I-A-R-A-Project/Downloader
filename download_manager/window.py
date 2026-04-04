@@ -1,5 +1,8 @@
 import json
 import os
+import re
+import shutil
+import subprocess
 import tempfile
 import uuid
 from enum import Enum
@@ -10,7 +13,7 @@ from PyQt5.QtWidgets import (
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
-from config import APPDATA, DEFAULT_CONFIG, load_config
+from config import APPDATA, DEFAULT_CONFIG, load_config, normalize_path
 from download_manager.browser import UniversalDownloader
 from download_manager.dialogs import LinkInputWindow, SettingsDialog, apply_settings
 from download_manager.torrent import Aria2Client, TorrentUpdater, ensure_aria2_running
@@ -19,6 +22,30 @@ from download_manager.workers import DownloadSignals, FileDownloader
 
 
 SESSION_PATH = os.path.join(APPDATA, "MediaSearchPrototype", "download_state.json")
+ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z"}
+MAX_RESOLUTION_RETRIES = 3
+MAX_CORRUPT_ARCHIVE_RETRIES = 2
+CORRUPT_ARCHIVE_PATTERNS = (
+    "can not open file as archive",
+    "cannot open file as archive",
+    "is not archive",
+    "not a valid archive",
+)
+
+
+def find_7z_executable():
+    candidates = [
+        shutil.which("7z"),
+        shutil.which("7z.exe"),
+        r"C:\Program Files\WinRAR\WinRAR.exe",
+        r"C:\Program Files\WinRAR\Rar.exe",
+        r"C:\Program Files\7-Zip\7z.exe",
+        r"C:\Program Files (x86)\7-Zip\7z.exe",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return ""
 
 
 class DownloadType(Enum):
@@ -44,6 +71,48 @@ class TorrentCancelWorker(QRunnable):
             self.signals.finished.emit(self.gid, False, str(exc))
 
 
+class ArchiveExtractSignals(QObject):
+    finished = pyqtSignal(str, bool, str)
+
+
+class ArchiveExtractWorker(QRunnable):
+    def __init__(self, entry_id, archive_path, output_dir, password=""):
+        super().__init__()
+        self.entry_id = entry_id
+        self.archive_path = archive_path
+        self.output_dir = output_dir
+        self.password = password or ""
+        self.signals = ArchiveExtractSignals()
+
+    def run(self):
+        exe_path = find_7z_executable()
+        if not exe_path:
+            self.signals.finished.emit(self.entry_id, False, "No se encontró 7z.exe")
+            return
+
+        try:
+            os.makedirs(self.output_dir, exist_ok=True)
+            exe_name = os.path.basename(exe_path).lower()
+            if exe_name in {"winrar.exe", "rar.exe"}:
+                output_target = self.output_dir
+                if not output_target.endswith(os.sep):
+                    output_target += os.sep
+                command = [exe_path, "x", self.archive_path, output_target, "-y"]
+                command.append(f"-p{self.password}" if self.password else "-p-")
+            else:
+                command = [exe_path, "x", self.archive_path, f"-o{self.output_dir}", "-y"]
+                if self.password:
+                    command.append(f"-p{self.password}")
+            result = subprocess.run(command, capture_output=True, text=True, timeout=1800)
+            if result.returncode != 0:
+                error_text = (result.stderr or result.stdout or "Error extrayendo archivo").strip()
+                self.signals.finished.emit(self.entry_id, False, error_text)
+                return
+            self.signals.finished.emit(self.entry_id, True, "")
+        except Exception as exc:
+            self.signals.finished.emit(self.entry_id, False, str(exc))
+
+
 class DownloadWindow(QWidget):
     def __init__(self, download_entries):
         super().__init__()
@@ -54,12 +123,18 @@ class DownloadWindow(QWidget):
         self.config = load_config()
         self.folder_path = self.config.get("folder_path", DEFAULT_CONFIG["folder_path"])
         self.open_on_finish = self.config.get("open_on_finish", DEFAULT_CONFIG["open_on_finish"])
+        self.auto_extract_archives = self.config.get("auto_extract_archives", DEFAULT_CONFIG["auto_extract_archives"])
+        self.delete_archive_after_extract = self.config.get(
+            "delete_archive_after_extract",
+            DEFAULT_CONFIG["delete_archive_after_extract"],
+        )
         self.max_parallel_downloads = self.config.get("max_parallel_downloads", DEFAULT_CONFIG["max_parallel_downloads"])
         QThreadPool.globalInstance().setMaxThreadCount(self.max_parallel_downloads)
 
         self.downloaders = []
         self.active_resolutions = {}
         self.active_file_downloads = {}
+        self.active_extractions = {}
         self.worker_context = {}
         self.pending_torrent_entries = set()
         self.saved_password_hints = set()
@@ -90,6 +165,9 @@ class DownloadWindow(QWidget):
         self.add_links_button = QPushButton("Agregar enlaces")
         self.add_links_button.clicked.connect(self.open_link_input)
         self.actions_row.addWidget(self.add_links_button)
+        self.clear_completed_button = QPushButton("Limpiar completos")
+        self.clear_completed_button.clicked.connect(self.clear_completed_entries)
+        self.actions_row.addWidget(self.clear_completed_button)
         self.settings_button = QPushButton("Configuración ⚙")
         self.settings_button.clicked.connect(self.open_settings_dialog)
         self.actions_row.addWidget(self.settings_button)
@@ -114,8 +192,11 @@ class DownloadWindow(QWidget):
         else:
             self.clear_empty_state()
             self.reconcile_saved_torrents()
+            self.reconcile_retryable_entries()
+            self.reconcile_finished_archives()
             self.queue_scheduler()
 
+    # Session persistence
     def load_session(self):
         if not os.path.exists(SESSION_PATH):
             return
@@ -139,7 +220,7 @@ class DownloadWindow(QWidget):
     def normalize_entry(self, raw_entry, from_session=False):
         entry_id = raw_entry.get("id") or uuid.uuid4().hex
         url_original = (raw_entry.get("url_original") or raw_entry.get("url") or "").strip()
-        path = (raw_entry.get("path") or "").strip()
+        path = normalize_path((raw_entry.get("path") or "").strip())
         title = (raw_entry.get("title") or "").strip() or self.default_entry_title(raw_entry, url_original, path)
         kind = raw_entry.get("download_type")
         if kind not in {"regular", "torrent"}:
@@ -149,7 +230,7 @@ class DownloadWindow(QWidget):
         raw_direct_links = raw_entry.get("direct_links") or []
         if raw_entry.get("direct_url") and not raw_direct_links:
             raw_direct_links = [{
-                "path": raw_entry.get("resolved_path") or path,
+                "path": normalize_path(raw_entry.get("resolved_path") or path),
                 "url": raw_entry.get("direct_url"),
                 "headers": raw_entry.get("headers") or {},
                 "cookies": raw_entry.get("cookies") or {},
@@ -162,7 +243,7 @@ class DownloadWindow(QWidget):
             if from_session and child_status in {"downloading", "resolving"}:
                 child_status = "waiting"
             direct_links.append({
-                "path": link.get("path") or path,
+                "path": normalize_path(link.get("path") or path),
                 "url": (link.get("url") or "").strip(),
                 "headers": link.get("headers") or {},
                 "cookies": link.get("cookies") or {},
@@ -189,6 +270,10 @@ class DownloadWindow(QWidget):
             "torrent_hash": raw_entry.get("torrent_hash", "") or "",
             "speed_text": raw_entry.get("speed_text", "") or "",
             "error_text": raw_entry.get("error_text", "") or "",
+            "extract_status": raw_entry.get("extract_status", "") or "",
+            "extract_error": raw_entry.get("extract_error", "") or "",
+            "resolution_retry_count": int(raw_entry.get("resolution_retry_count", 0) or 0),
+            "archive_retry_count": int(raw_entry.get("archive_retry_count", 0) or 0),
         }
         if from_session:
             self.recompute_regular_status(entry)
@@ -229,7 +314,7 @@ class DownloadWindow(QWidget):
             "direct_url": entry.get("direct_url", ""),
             "direct_links": [
                 {
-                    "path": link.get("path", ""),
+                    "path": normalize_path(link.get("path", "")),
                     "url": link.get("url", ""),
                     "headers": link.get("headers") or {},
                     "cookies": link.get("cookies") or {},
@@ -242,10 +327,40 @@ class DownloadWindow(QWidget):
             "torrent_hash": entry.get("torrent_hash", ""),
             "speed_text": entry.get("speed_text", ""),
             "error_text": entry.get("error_text", ""),
+            "extract_status": entry.get("extract_status", ""),
+            "extract_error": entry.get("extract_error", ""),
+            "resolution_retry_count": entry.get("resolution_retry_count", 0),
+            "archive_retry_count": entry.get("archive_retry_count", 0),
         }
 
     def request_session_save(self):
         self.session_save_timer.start(150)
+
+    # Scheduler and regular download flow
+    def reconcile_finished_archives(self):
+        for entry_id in self.entry_order:
+            entry = self.entries.get(entry_id)
+            if not entry or entry["download_type"] != "regular":
+                continue
+            if entry.get("status") == "finished" and entry.get("extract_status") != "done":
+                self.maybe_queue_extraction(entry)
+
+    def reconcile_retryable_entries(self):
+        for entry_id in self.entry_order:
+            entry = self.entries.get(entry_id)
+            if not entry or entry["download_type"] != "regular":
+                continue
+
+            if (
+                entry.get("status") == "error"
+                and not entry.get("direct_links")
+                and entry.get("error_text") == "No se pudieron obtener los enlaces directos."
+            ):
+                self.retry_resolution(entry)
+                continue
+
+            if entry.get("extract_status") == "error":
+                self.retry_corrupt_archive_download(entry, entry.get("extract_error", ""))
 
     def queue_scheduler(self):
         if self._scheduler_queued or self._closing:
@@ -333,6 +448,8 @@ class DownloadWindow(QWidget):
 
         direct_links = self.convert_resolved_results(results)
         if not direct_links:
+            if self.retry_resolution(entry):
+                return
             entry["status"] = "error"
             entry["error_text"] = "No se pudieron obtener los enlaces directos."
             self.update_entry_visual(entry)
@@ -345,6 +462,8 @@ class DownloadWindow(QWidget):
         entry["status"] = "waiting"
         entry["progress"] = 0
         entry["error_text"] = ""
+        entry["resolution_retry_count"] = 0
+        entry["archive_retry_count"] = 0
         self.recompute_regular_status(entry)
         self.update_entry_visual(entry)
         self.request_session_save()
@@ -527,6 +646,7 @@ class DownloadWindow(QWidget):
         if success:
             link["status"] = "finished"
             link["progress"] = 100
+            entry["error_text"] = ""
         else:
             link["status"] = "error"
             entry["error_text"] = "La descarga no se pudo completar."
@@ -534,6 +654,8 @@ class DownloadWindow(QWidget):
         self.recompute_regular_status(entry)
         self.update_entry_visual(entry)
         self.request_session_save()
+        if success:
+            self.maybe_queue_extraction(entry)
         self.queue_scheduler()
 
     def on_direct_download_cancelled(self, worker_index):
@@ -556,10 +678,13 @@ class DownloadWindow(QWidget):
             return
 
         self.recompute_regular_status(entry)
+        if entry.get("extract_status") == "running":
+            entry["extract_status"] = ""
         self.update_entry_visual(entry)
         self.request_session_save()
         self.queue_scheduler()
 
+    # Entry actions
     def cancel_entry(self, entry_id):
         entry = self.entries.get(entry_id)
         if not entry or entry["status"] in {"finished", "cancelled"}:
@@ -670,6 +795,177 @@ class DownloadWindow(QWidget):
 
         self.request_session_save()
 
+    def clear_completed_entries(self):
+        completed_entry_ids = [
+            entry_id
+            for entry_id in list(self.entry_order)
+            if self.entries.get(entry_id, {}).get("status") == "finished"
+        ]
+        for entry_id in completed_entry_ids:
+            self.delete_entry(entry_id)
+
+    # Extraction
+    def maybe_queue_extraction(self, entry):
+        if not entry or entry["download_type"] != "regular":
+            return
+        if not self.auto_extract_archives:
+            return
+        if entry.get("status") != "finished":
+            return
+        if entry["id"] in self.active_extractions:
+            return
+        if entry.get("extract_status") == "done":
+            return
+
+        archive_path = self.find_extractable_archive(entry)
+        if not archive_path:
+            return
+
+        entry["extract_status"] = "running"
+        entry["extract_error"] = ""
+        self.request_session_save()
+
+        output_dir = os.path.dirname(archive_path) or self.absolute_download_path(entry.get("path", ""))
+        worker = ArchiveExtractWorker(entry["id"], archive_path, output_dir, entry.get("password", ""))
+        worker.signals.finished.connect(self.on_extraction_finished)
+        self.active_extractions[entry["id"]] = worker
+        QThreadPool.globalInstance().start(worker)
+
+    def on_extraction_finished(self, entry_id, ok, error_text):
+        self.active_extractions.pop(entry_id, None)
+        entry = self.entries.get(entry_id)
+        if not entry:
+            return
+
+        if ok:
+            entry["extract_status"] = "done"
+            entry["extract_error"] = ""
+            entry["archive_retry_count"] = 0
+            if self.delete_archive_after_extract:
+                delete_errors = []
+                for archive_path in self.archive_paths_for_entry(entry):
+                    if archive_path and os.path.exists(archive_path):
+                        try:
+                            os.remove(archive_path)
+                        except Exception as exc:
+                            delete_errors.append(f"{os.path.basename(archive_path)}: {exc}")
+                if delete_errors:
+                    entry["extract_error"] = "No se pudieron eliminar algunos comprimidos: " + "; ".join(delete_errors)
+            print(f"✅ Extraído: {entry['title']}")
+        else:
+            if self.retry_corrupt_archive_download(entry, error_text):
+                return
+            entry["extract_status"] = "error"
+            entry["extract_error"] = error_text
+            print(f"❌ Error extrayendo {entry['title']}: {error_text}")
+        self.request_session_save()
+
+    def retry_resolution(self, entry):
+        retry_count = int(entry.get("resolution_retry_count", 0) or 0)
+        if retry_count >= MAX_RESOLUTION_RETRIES:
+            return False
+
+        entry["resolution_retry_count"] = retry_count + 1
+        entry["status"] = "waiting"
+        entry["progress"] = 0
+        entry["error_text"] = (
+            f"No se pudieron obtener los enlaces directos. Reintentando "
+            f"({entry['resolution_retry_count']}/{MAX_RESOLUTION_RETRIES})..."
+        )
+        self.update_entry_visual(entry)
+        self.request_session_save()
+        self.queue_scheduler()
+        return True
+
+    def is_corrupt_archive_error(self, error_text):
+        normalized_error = (error_text or "").lower()
+        return any(pattern in normalized_error for pattern in CORRUPT_ARCHIVE_PATTERNS)
+
+    def retry_corrupt_archive_download(self, entry, error_text):
+        if not self.is_corrupt_archive_error(error_text):
+            return False
+
+        retry_count = int(entry.get("archive_retry_count", 0) or 0)
+        if retry_count >= MAX_CORRUPT_ARCHIVE_RETRIES:
+            return False
+
+        for archive_path in self.archive_paths_for_entry(entry):
+            if archive_path and os.path.exists(archive_path):
+                try:
+                    os.remove(archive_path)
+                except OSError as exc:
+                    print(f"⚠ No se pudo eliminar archivo corrupto {archive_path}: {exc}")
+
+        entry["archive_retry_count"] = retry_count + 1
+        entry["resolution_retry_count"] = 0
+        entry["direct_url"] = ""
+        entry["direct_links"] = []
+        entry["progress"] = 0
+        entry["status"] = "waiting"
+        entry["error_text"] = (
+            f"El archivo descargado no era un comprimido valido. Reintentando "
+            f"({entry['archive_retry_count']}/{MAX_CORRUPT_ARCHIVE_RETRIES})..."
+        )
+        entry["extract_status"] = ""
+        entry["extract_error"] = ""
+        self.update_entry_visual(entry)
+        self.request_session_save()
+        self.queue_scheduler()
+        print(
+            f"⚠ Archivo invalido para {entry['title']}. "
+            f"Reintentando descarga ({entry['archive_retry_count']}/{MAX_CORRUPT_ARCHIVE_RETRIES})."
+        )
+        return True
+
+    def find_extractable_archive(self, entry):
+        absolute_paths = self.archive_paths_for_entry(entry)
+        if not absolute_paths:
+            return ""
+
+        multipart = [path for path in absolute_paths if self.is_multipart_archive(path)]
+        if multipart:
+            first_part = self.find_first_archive_part(multipart)
+            return first_part or ""
+
+        for path in absolute_paths:
+            if self.is_extractable_archive(path):
+                return path
+        return ""
+
+    def archive_paths_for_entry(self, entry):
+        direct_links = entry.get("direct_links", [])
+        if not direct_links:
+            return []
+
+        if any(link.get("status") != "finished" for link in direct_links):
+            return []
+
+        absolute_paths = []
+        for link in direct_links:
+            full_path = self.absolute_download_path(link.get("path") or entry.get("path", ""))
+            if full_path and os.path.exists(full_path):
+                absolute_paths.append(full_path)
+        return absolute_paths
+
+    def is_extractable_archive(self, file_path):
+        lower_path = file_path.lower()
+        return os.path.splitext(lower_path)[1] in ARCHIVE_EXTENSIONS or bool(re.search(r"\.part\d+\.(rar|7z|zip)$", lower_path))
+
+    def is_multipart_archive(self, file_path):
+        return ".part" in os.path.basename(file_path).lower()
+
+    def find_first_archive_part(self, paths):
+        patterns = (
+            r"\.part0*1\.(rar|7z|zip)$",
+            r"\.part1\.(rar|7z|zip)$",
+        )
+        for pattern in patterns:
+            for path in sorted(paths):
+                if re.search(pattern, path.lower()):
+                    return path
+        return sorted(paths)[0] if paths else ""
+
+    # Window and UI helpers
     def on_torrent_cancel_finished(self, gid, ok, error_text):
         entry_id = self.torrent_gid_to_entry.pop(gid, "")
         entry = self.entries.get(entry_id)
@@ -860,7 +1156,7 @@ class DownloadWindow(QWidget):
             item["resume_button"].hide()
             item["delete_button"].setEnabled(False)
             item["delete_button"].hide()
-            item["bar"].setVisible(entry["status"] == "finished")
+            item["bar"].hide()
         else:
             item["cancel_button"].setEnabled(True)
             item["cancel_button"].show()
@@ -945,7 +1241,7 @@ class DownloadWindow(QWidget):
 
     def default_entry_title(self, raw_entry, url, path):
         if path:
-            return os.path.basename(os.path.normpath(path))
+            return os.path.basename(normalize_path(path))
         if url:
             return os.path.basename(url.rstrip("/").split("?")[0]) or url
         return "Archivo"
@@ -953,6 +1249,7 @@ class DownloadWindow(QWidget):
     def is_torrent_url(self, url):
         return bool(url) and (url.startswith("magnet:?") or url.endswith(".torrent"))
 
+    # Window actions and configuration
     def open_link_input(self):
         self._link_input = LinkInputWindow()
         self._link_input.links_ready.connect(self.on_links_ready)
@@ -968,8 +1265,16 @@ class DownloadWindow(QWidget):
     def open_settings_dialog(self):
         dialog = SettingsDialog(self)
         if dialog.exec_() == QDialog.Accepted:
-            self.folder_path, self.open_on_finish, self.max_parallel_downloads = apply_settings()
+            (
+                self.folder_path,
+                self.open_on_finish,
+                self.auto_extract_archives,
+                self.delete_archive_after_extract,
+                self.max_parallel_downloads,
+            ) = apply_settings()
+            self.folder_path = normalize_path(self.folder_path)
             QThreadPool.globalInstance().setMaxThreadCount(self.max_parallel_downloads)
+            self.reconcile_finished_archives()
             self.queue_scheduler()
 
     def ensure_torrent_timer_running(self):
