@@ -1,4 +1,4 @@
-import difflib, os, re, time
+import concurrent.futures, difflib, json, os, re, time
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
@@ -18,7 +18,11 @@ ELAMIGOS_CACHE_MAX_AGE_SECONDS = 6 * 60 * 60
 ELAMIGOS_HOST_LABELS = {"DDOWNLOAD", "RAPIDGATOR", "FILECRYPT", "KEEPLINKS"}
 FITGIRL_HOME_URL = "https://fitgirl-repacks.site/"
 FITGIRL_SEARCH_URL = FITGIRL_HOME_URL
+FITGIRL_AZ_URL = urljoin(FITGIRL_HOME_URL, "all-my-repacks-a-z/")
 FITGIRL_USER_AGENT = "Mozilla/5.0"
+FITGIRL_INDEX_CACHE_PATH = os.path.join(ELAMIGOS_CACHE_DIR, "fitgirl_index.json")
+FITGIRL_INDEX_MAX_PAGES = 300
+FITGIRL_INDEX_BATCH_SIZE = 12
 STEAMRIP_HOME_URL = "https://steamrip.com/"
 STEAMRIP_GAMES_LIST_URL = urljoin(STEAMRIP_HOME_URL, "games-list/")
 STEAMRIP_USER_AGENT = "Mozilla/5.0"
@@ -519,6 +523,150 @@ def warm_steamrip_cache(force_refresh=False):
         return False
 
 
+def _fetch_fitgirl_index_page(page):
+    response = requests.get(
+        FITGIRL_AZ_URL,
+        params={"lcp_page0": page},
+        headers={"User-Agent": FITGIRL_USER_AGENT},
+        timeout=20,
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def _is_fitgirl_index_navigation(text):
+    return text in {"Previous Page", "Next Page"} or bool(re.fullmatch(r"\d+", text or ""))
+
+
+def _iter_fitgirl_section_nodes(heading):
+    node = heading.find_next_sibling()
+    while node is not None:
+        if getattr(node, "name", None) in {"h1", "h2", "h3"}:
+            break
+        yield node
+        node = node.find_next_sibling()
+
+
+def _extract_fitgirl_index_entries(html):
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    heading = next(
+        (
+            tag
+            for tag in soup.find_all(["h1", "h2", "h3"])
+            if "all my repacks, a-z" in tag.get_text(" ", strip=True).lower()
+        ),
+        None,
+    )
+    if not heading:
+        return []
+
+    entries = []
+    seen = set()
+    for node in heading.next_elements:
+        name = getattr(node, "name", None)
+        if name in {"h1", "h2", "h3"}:
+            node_text = _clean_fitgirl_title(node.get_text(" ", strip=True)).lower()
+            if any(marker in node_text for marker in ("leave a reply", "most popular repacks", "support the cause", "my rss feed")):
+                break
+            continue
+        if name != "li":
+            continue
+
+        anchor = node.find("a", href=True)
+        if not anchor:
+            continue
+
+        title = _clean_fitgirl_title(anchor.get_text(" ", strip=True))
+        if _is_fitgirl_index_navigation(title):
+            break
+
+        href = urljoin(FITGIRL_HOME_URL, anchor.get("href", "").strip())
+        parsed = urlparse(href)
+        host = (parsed.netloc or "").lower().replace("www.", "")
+        if host != "fitgirl-repacks.site":
+            continue
+        if parsed.path.rstrip("/").lower() == "/all-my-repacks-a-z":
+            continue
+
+        normalized_title = _normalize_search_text(title)
+        if not title or not normalized_title or href in seen:
+            continue
+
+        seen.add(href)
+        entries.append({"title": title, "normalized_title": normalized_title, "detail_url": href})
+
+    return entries
+
+
+def _serialize_fitgirl_index_entries(entries):
+    return [[entry["title"], entry["detail_url"]] for entry in entries]
+
+
+def _deserialize_fitgirl_index_entries(payload):
+    entries = []
+    for item in payload or []:
+        if not isinstance(item, list) or len(item) != 2:
+            continue
+        title, detail_url = item
+        title = _clean_fitgirl_title(title)
+        normalized_title = _normalize_search_text(title)
+        if not title or not normalized_title or not detail_url:
+            continue
+        entries.append({"title": title, "normalized_title": normalized_title, "detail_url": detail_url})
+    return entries
+
+
+def _load_fitgirl_index(force_refresh=False):
+    os.makedirs(ELAMIGOS_CACHE_DIR, exist_ok=True)
+    if not force_refresh and os.path.exists(FITGIRL_INDEX_CACHE_PATH):
+        age = time.time() - os.path.getmtime(FITGIRL_INDEX_CACHE_PATH)
+        if age <= ELAMIGOS_CACHE_MAX_AGE_SECONDS:
+            with open(FITGIRL_INDEX_CACHE_PATH, "r", encoding="utf-8", errors="ignore") as f:
+                return _deserialize_fitgirl_index_entries(json.load(f))
+
+    entries = []
+    seen = set()
+    for start_page in range(1, FITGIRL_INDEX_MAX_PAGES + 1, FITGIRL_INDEX_BATCH_SIZE):
+        pages = list(range(start_page, min(start_page + FITGIRL_INDEX_BATCH_SIZE, FITGIRL_INDEX_MAX_PAGES + 1)))
+        batch_results = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(pages)) as executor:
+            future_map = {executor.submit(_fetch_fitgirl_index_page, page): page for page in pages}
+            for future in concurrent.futures.as_completed(future_map):
+                page = future_map[future]
+                batch_results[page] = _extract_fitgirl_index_entries(future.result())
+
+        batch_has_entries = False
+        for page in pages:
+            page_entries = batch_results.get(page, [])
+            if not page_entries:
+                continue
+            batch_has_entries = True
+            for entry in page_entries:
+                detail_url = entry["detail_url"]
+                if detail_url in seen:
+                    continue
+                seen.add(detail_url)
+                entries.append(entry)
+        if not batch_has_entries:
+            break
+
+    with open(FITGIRL_INDEX_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(_serialize_fitgirl_index_entries(entries), f, ensure_ascii=False, separators=(",", ":"))
+    return entries
+
+
+def warm_fitgirl_cache(force_refresh=False):
+    try:
+        _load_fitgirl_index(force_refresh=force_refresh)
+        return True
+    except Exception as exc:
+        print(f"[FitGirl preload] Error: {exc}")
+        return False
+
+
 def _fetch_fitgirl_search_page(query):
     response = requests.get(FITGIRL_SEARCH_URL, params={"s": query}, headers={"User-Agent": FITGIRL_USER_AGENT}, timeout=20)
     response.raise_for_status()
@@ -585,15 +733,6 @@ def _fitgirl_file_label(anchor, href):
         return anchor_text
     filename = os.path.basename(urlparse(href).path.rstrip("/"))
     return filename or href
-
-
-def _iter_fitgirl_section_nodes(heading):
-    node = heading.find_next_sibling()
-    while node is not None:
-        if getattr(node, "name", None) in {"h1", "h2", "h3"}:
-            break
-        yield node
-        node = node.find_next_sibling()
 
 
 def _extract_fitgirl_direct_links(soup, game_title):
@@ -695,10 +834,14 @@ def _extract_fitgirl_detail_links(detail_url, game_title):
 
 def search_fitgirl(query, force_refresh=False, max_candidates=6):
     try:
-        entries = _extract_fitgirl_search_entries(_fetch_fitgirl_search_page(query))
+        entries = _load_fitgirl_index(force_refresh=force_refresh)
     except Exception as exc:
-        print(f"[FitGirl] Error buscando '{query}': {exc}")
-        return []
+        print(f"[FitGirl index] Error cargando índice: {exc}")
+        try:
+            entries = _extract_fitgirl_search_entries(_fetch_fitgirl_search_page(query))
+        except Exception as search_exc:
+            print(f"[FitGirl] Error buscando '{query}': {search_exc}")
+            return []
     if not entries:
         return []
 
@@ -719,4 +862,5 @@ __all__ = [
     "search_steamrip",
     "warm_steamrip_cache",
     "search_fitgirl",
+    "warm_fitgirl_cache",
 ]

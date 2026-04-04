@@ -15,6 +15,7 @@ from media_search.game_sources import (
     search_fitgirl,
     search_steamrip,
     warm_elamigos_cache,
+    warm_fitgirl_cache,
     warm_steamrip_cache,
 )
 from config import DEFAULT_CONFIG, load_config
@@ -440,6 +441,7 @@ class MediaSearchUI(QWidget):
     def preload_download_sources(self):
         def warmup(_query):
             warm_elamigos_cache()
+            warm_fitgirl_cache()
             warm_steamrip_cache()
             return []
 
