@@ -10,12 +10,13 @@ from PyQt5.QtWidgets import (
     QMessageBox, QDialog, QDialogButtonBox, QFrame, QTabBar, QTabWidget,
     QCheckBox, QScrollArea, QAbstractItemView,
 )
-from config import load_config
-from mod_search.path_dialog import ModPathsDialog, DEFAULT_MOD_PATHS
+from config import load_config, save_config
+from mod_search.path_dialog import ModPathsDialog, DEFAULT_MOD_PATHS, FACTORIO_VERSION_PRESETS
 from media_search.workers import ImageLoaderWorker
 from mod_search.workers import (
     DependencyResolveWorker,
     FactorioInfoWorker,
+    FactorioLogWorker,
     FactorioPageWorker,
     FactorioSearchWorker,
     MODINFO_URL,
@@ -27,8 +28,12 @@ from mod_search.workers import (
     fetch_modrinth_version,
     filter_required_modrinth_dependencies,
     build_factorio_request_url,
+    factorio_release_matches_target,
     modrinth_headers,
     normalize_modrinth_version_option,
+    normalize_factorio_target_version,
+    parse_factorio_log,
+    build_factorio_dependency_candidates,
 )
 
 
@@ -352,6 +357,7 @@ class ModSearchWindow(QWidget):
     def __init__(self, game="factorio"):
         super().__init__()
         self.game = self.normalize_game(game)
+        self.config = load_config()
         self.setWindowTitle(self.window_title_for_game())
         self.resize(980, 640)
         self.thread_pool = QThreadPool()
@@ -382,7 +388,11 @@ class ModSearchWindow(QWidget):
             "category": {"include": set(), "exclude": set()},
             "tag": {"include": set(), "exclude": set()},
         }
+        self.factorio_log_path = ""
+        self.factorio_target_version = ""
+        self.factorio_component_versions = {}
         self.current_request_url = ""
+        self.pending_log_dependency_repair = False
         self.web_cache_dir = os.path.join(tempfile.gettempdir(), "MediaSearchPrototype", "mod_search_web_cache")
         self.factorio_theme_dir = os.path.join(tempfile.gettempdir(), "MediaSearchPrototype", "mod_search_theme")
         self.factorio_background_path = ""
@@ -408,6 +418,15 @@ class ModSearchWindow(QWidget):
         self.populate_mode_combo()
         top_row.addWidget(QLabel("Listado:"))
         top_row.addWidget(self.mode_combo)
+        if self.game == "factorio":
+            top_row.addWidget(QLabel("Factorio:"))
+            self.factorio_version_combo = QComboBox()
+            self.factorio_version_combo.setEditable(True)
+            self.factorio_version_combo.addItems(FACTORIO_VERSION_PRESETS)
+            top_row.addWidget(self.factorio_version_combo)
+            self.repair_dependencies_button = QPushButton("Arreglar dependencias")
+            self.repair_dependencies_button.clicked.connect(self.repair_factorio_dependencies_from_log)
+            top_row.addWidget(self.repair_dependencies_button)
         top_row.addStretch(1)
         self.settings_button = QPushButton("Carpetas de Mods ⚙")
         self.settings_button.clicked.connect(self.open_settings_dialog)
@@ -468,6 +487,7 @@ class ModSearchWindow(QWidget):
         root.addLayout(bottom_row)
 
         self.mode_combo.currentIndexChanged.connect(self.load_browse)
+        self.load_factorio_preferences()
         self.apply_factorio_theme()
         self.load_browse()
 
@@ -482,6 +502,131 @@ class ModSearchWindow(QWidget):
         if self.game == "minecraft":
             return "Buscar mods - Minecraft (Modrinth)"
         return "Buscar mods - Factorio"
+
+    def load_factorio_preferences(self):
+        if self.game != "factorio":
+            return
+        self.factorio_log_path = self.config.get("factorio_log_path", DEFAULT_MOD_PATHS["factorio_log_path"])
+        configured_version = self.config.get("factorio_target_version", "2.0")
+        payload = self.read_factorio_log_file(self.factorio_log_path)
+        detected_version = (payload or {}).get("factorio_version") or ""
+        self.factorio_component_versions = (payload or {}).get("component_versions") or {}
+        self.factorio_target_version = normalize_factorio_target_version(detected_version or configured_version) or "2.0"
+        if hasattr(self, "factorio_version_combo"):
+            if self.factorio_version_combo.findText(self.factorio_target_version) < 0:
+                self.factorio_version_combo.addItem(self.factorio_target_version)
+            self.factorio_version_combo.setCurrentText(self.factorio_target_version)
+            self.factorio_version_combo.currentTextChanged.connect(self.on_factorio_version_changed)
+
+    def on_factorio_version_changed(self, value):
+        if self.game != "factorio":
+            return
+        normalized = normalize_factorio_target_version(value)
+        if not normalized or normalized == self.factorio_target_version:
+            return
+        self.factorio_target_version = normalized
+        if self.factorio_version_combo.findText(normalized) < 0:
+            self.factorio_version_combo.addItem(normalized)
+        self.factorio_version_combo.blockSignals(True)
+        self.factorio_version_combo.setCurrentText(normalized)
+        self.factorio_version_combo.blockSignals(False)
+        self.config["factorio_target_version"] = normalized
+        save_config(self.config)
+        self.refresh_factorio_filter_url_preview()
+        self.reload_current_factorio_listing()
+
+    def detect_factorio_version_from_log_file(self, path):
+        log_path = os.path.normpath(path) if path else ""
+        if not log_path or not os.path.exists(log_path):
+            return ""
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
+                parsed = parse_factorio_log(handle.read())
+        except OSError:
+            return ""
+        return parsed.get("factorio_version") or ""
+
+    def read_factorio_log_file(self, path):
+        log_path = os.path.normpath(path) if path else ""
+        if not log_path or not os.path.exists(log_path):
+            return {}
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
+                parsed = parse_factorio_log(handle.read())
+        except OSError:
+            return {}
+        parsed["log_path"] = log_path
+        return parsed
+
+    def current_factorio_target_version(self):
+        if self.game != "factorio":
+            return ""
+        combo = getattr(self, "factorio_version_combo", None)
+        if combo is not None:
+            normalized = normalize_factorio_target_version(combo.currentText())
+            if normalized:
+                return normalized
+        return normalize_factorio_target_version(self.factorio_target_version) or "2.0"
+
+    def repair_factorio_dependencies_from_log(self):
+        if self.game != "factorio":
+            return
+        log_path = os.path.normpath(self.factorio_log_path) if self.factorio_log_path else ""
+        if not log_path:
+            QMessageBox.warning(self, "Error", "No hay ruta configurada para factorio-current.log.")
+            return
+        self.pending_log_dependency_repair = True
+        if hasattr(self, "repair_dependencies_button"):
+            self.repair_dependencies_button.setEnabled(False)
+        self.status_label.setText("Leyendo factorio-current.log...")
+        worker = FactorioLogWorker(log_path)
+        worker.signals.finished.connect(self.on_factorio_log_payload_ready)
+        self.thread_pool.start(worker)
+
+    def on_factorio_log_payload_ready(self, payload, error):
+        if hasattr(self, "repair_dependencies_button"):
+            self.repair_dependencies_button.setEnabled(True)
+        if error:
+            self.pending_log_dependency_repair = False
+            QMessageBox.warning(self, "Error", f"No se pudo leer factorio-current.log.\n{error}")
+            return
+        log_version = normalize_factorio_target_version(payload.get("factorio_version"))
+        self.factorio_component_versions = payload.get("component_versions") or {}
+        if log_version:
+            self.factorio_target_version = log_version
+            self.config["factorio_target_version"] = log_version
+            save_config(self.config)
+            if hasattr(self, "factorio_version_combo"):
+                if self.factorio_version_combo.findText(log_version) < 0:
+                    self.factorio_version_combo.addItem(log_version)
+                self.factorio_version_combo.blockSignals(True)
+                self.factorio_version_combo.setCurrentText(log_version)
+                self.factorio_version_combo.blockSignals(False)
+
+        replacement_mods = [mod_name for mod_name in (payload.get("replacement_mods") or []) if mod_name]
+        dependency_items = list(payload.get("dependencies") or [])
+        dependencies = replacement_mods[:]
+        for item in dependency_items:
+            if item and item not in dependencies:
+                dependencies.append(item)
+        if not dependencies:
+            self.pending_log_dependency_repair = False
+            self.status_label.setText("No se encontraron dependencias faltantes o incompatibles en el log.")
+            return
+        self.status_label.setText("Resolviendo dependencias desde factorio-current.log...")
+        worker = DependencyResolveWorker(self, dependencies, visited=set())
+        worker.signals.progress.connect(self.status_label.setText)
+        worker.signals.finished.connect(self.on_log_dependencies_resolved)
+        self.thread_pool.start(worker)
+
+    def on_log_dependencies_resolved(self, items):
+        self.pending_log_dependency_repair = False
+        added = self.add_cart_items(items)
+        self.update_cart_button()
+        if added:
+            self.status_label.setText(f"Dependencias agregadas desde el log: {len(added)}")
+            return
+        self.status_label.setText("No se pudieron agregar dependencias nuevas desde el log.")
 
     def configure_web_profile(self):
         try:
@@ -766,7 +911,9 @@ class ModSearchWindow(QWidget):
     def build_factorio_filter_params(self):
         if self.game != "factorio":
             return {}
-        params = {}
+        params = {
+            "factorio_version": self.current_factorio_target_version(),
+        }
         expansion = self.factorio_filter_state.get("expansion") or ""
         if expansion:
             params["expansion"] = expansion
@@ -790,7 +937,7 @@ class ModSearchWindow(QWidget):
 
     def build_factorio_preview_url(self):
         params = {
-            "factorio_version": 2.0,
+            "factorio_version": self.current_factorio_target_version(),
             "show_deprecated": False,
             "page": self.current_page or 1,
         }
@@ -1459,11 +1606,11 @@ class ModSearchWindow(QWidget):
             self.finish_add_modrinth_to_cart(mod_id, versions)
 
     def finish_add_factorio_to_cart(self, mod_id, info):
-        latest = self.get_latest_release(info)
-        if not latest:
-            self.status_label.setText(f"Sin releases disponibles: {mod_id}")
+        release = self.select_release_for_constraint(info, None)
+        if not release:
+            self.status_label.setText(f"Sin releases compatibles con Factorio {self.current_factorio_target_version()}: {mod_id}")
             return
-        version = latest.get("version")
+        version = release.get("version")
         if not version:
             self.status_label.setText(f"Release invalida: {mod_id}")
             return
@@ -1475,7 +1622,7 @@ class ModSearchWindow(QWidget):
         else:
             self.status_label.setText("Este mod ya esta en el carrito.")
 
-        deps = self.get_release_dependencies(latest)
+        deps = self.get_release_dependencies(release)
         if not deps:
             return
 
@@ -1517,12 +1664,70 @@ class ModSearchWindow(QWidget):
         releases = data.get("releases") or []
         if not releases:
             return None
-        return max(releases, key=lambda release: release.get("released_at") or "")
+        target_version = self.current_factorio_target_version()
+        compatible = [
+            release for release in releases
+            if factorio_release_matches_target(release, target_version)
+            and self.release_matches_installed_factorio_components(release)
+        ]
+        if compatible:
+            releases = compatible
+        return self.pick_best_factorio_release(releases)
 
     def get_release_dependencies(self, release):
         info_json = release.get("info_json") or {}
         deps = info_json.get("dependencies") or []
         return [dep for dep in deps if isinstance(dep, str)]
+
+    def release_matches_installed_factorio_components(self, release):
+        if self.game != "factorio":
+            return True
+        component_versions = dict(self.factorio_component_versions or {})
+        if not component_versions:
+            return True
+        if component_versions.get("space-age") and "space age" not in component_versions:
+            component_versions["space age"] = component_versions["space-age"]
+
+        for dep in self.get_release_dependencies(release):
+            dep_name, constraint = self.parse_dependency(dep, ignore_special=False)
+            if not dep_name or not constraint:
+                continue
+            dep_key = dep_name.strip().lower().replace(" ", "-")
+            installed_version = component_versions.get(dep_key)
+            if not installed_version:
+                continue
+            op, required_version = constraint
+            if not self.compare_versions(
+                self.parse_version(installed_version),
+                self.parse_version(required_version),
+                op,
+            ):
+                return False
+        return True
+
+    def factorio_release_specificity_score(self, release):
+        special_scores = []
+        for dep in self.get_release_dependencies(release):
+            dep_name, constraint = self.parse_dependency(dep, ignore_special=False)
+            if not dep_name or not constraint:
+                continue
+            dep_key = dep_name.strip().lower().replace(" ", "-")
+            if dep_key not in {"base", "space-age", "core"}:
+                continue
+            op, required_version = constraint
+            if op not in {"=", ">="}:
+                continue
+            special_scores.append(self.parse_version(required_version))
+
+        highest_special = max(special_scores) if special_scores else (0,)
+        mod_version = self.parse_version(release.get("version") or "0")
+        released_at = release.get("released_at") or ""
+        return highest_special, mod_version, released_at
+
+    def pick_best_factorio_release(self, releases):
+        if not releases:
+            return None
+        return max(releases, key=self.factorio_release_specificity_score)
 
     def build_factorio_cart_item_data(self, mod_id, version):
         anticache = random.random()
@@ -1606,12 +1811,13 @@ class ModSearchWindow(QWidget):
         resolved = []
         for dep in dependencies:
             dep_name, constraint = self.parse_dependency(dep)
-            if not dep_name or dep_name in visited:
+            visit_key = (dep_name, constraint)
+            if not dep_name or visit_key in visited:
                 continue
-            visited.add(dep_name)
+            visited.add(visit_key)
             if progress_cb:
                 progress_cb(f"Resolviendo dependencia: {dep_name}")
-            info = self.fetch_modinfo(dep_name)
+            resolved_mod_id, info = self.fetch_factorio_dependency_info(dep_name)
             if not info:
                 continue
             release = self.select_release_for_constraint(info, constraint)
@@ -1620,7 +1826,7 @@ class ModSearchWindow(QWidget):
             version = release.get("version")
             if not version:
                 continue
-            resolved.append(self.build_factorio_cart_item_data(dep_name, version))
+            resolved.append(self.build_factorio_cart_item_data(resolved_mod_id or dep_name, version))
             nested = self.get_release_dependencies(release)
             if nested:
                 resolved.extend(self.resolve_factorio_dependencies(nested, visited, progress_cb))
@@ -1664,7 +1870,7 @@ class ModSearchWindow(QWidget):
                 resolved.extend(self.resolve_modrinth_dependencies(nested, visited, progress_cb))
         return resolved
 
-    def parse_dependency(self, dep):
+    def parse_dependency(self, dep, ignore_special=True):
         dep = dep.strip()
         if not dep:
             return None, None
@@ -1677,19 +1883,28 @@ class ModSearchWindow(QWidget):
         if not dep:
             return None, None
 
-        parts = dep.split()
-        name = parts[0].strip()
-        if not name or name.lower() == "base":
+        match = re.match(r"^(?P<name>.+?)(?:\s+(?P<op>>=|<=|=|>|<)\s*(?P<version>\S+))?$", dep)
+        if not match:
+            return None, None
+        name = match.group("name").strip()
+        if not name:
+            return None, None
+        if ignore_special and name.lower() in {"base", "core", "space-age"}:
             return None, None
 
         constraint = None
-        if len(parts) >= 3 and parts[1] in (">=", "<=", ">", "<", "="):
-            constraint = (parts[1], parts[2])
-        elif len(parts) >= 2:
-            match = re.match(r"^(>=|<=|=|>|<)\s*(\S+)$", parts[1])
-            if match:
-                constraint = (match.group(1), match.group(2))
+        op = match.group("op")
+        version = match.group("version")
+        if op and version:
+            constraint = (op, version)
         return name, constraint
+
+    def fetch_factorio_dependency_info(self, dep_name):
+        for candidate in build_factorio_dependency_candidates(dep_name):
+            info = self.fetch_modinfo(candidate)
+            if info:
+                return candidate, info
+        return dep_name, None
 
     def fetch_modinfo(self, mod_id):
         if self.game == "minecraft":
@@ -1758,8 +1973,16 @@ class ModSearchWindow(QWidget):
         releases = info.get("releases") or []
         if not releases:
             return None
+        target_version = self.current_factorio_target_version()
+        releases = [
+            release for release in releases
+            if factorio_release_matches_target(release, target_version)
+            and self.release_matches_installed_factorio_components(release)
+        ]
+        if not releases:
+            return None
         if not constraint:
-            return self.get_latest_release(info)
+            return self.pick_best_factorio_release(releases)
 
         op, version = constraint
         target = self.parse_version(version)
@@ -1770,7 +1993,7 @@ class ModSearchWindow(QWidget):
                 filtered.append(release)
         if not filtered:
             return None
-        return max(filtered, key=lambda release: self.parse_version(release.get("version") or "0"))
+        return self.pick_best_factorio_release(filtered)
 
     def parse_version(self, value):
         parts = re.split(r"[.\-+]", value.strip())
@@ -1847,7 +2070,26 @@ class ModSearchWindow(QWidget):
 
     def open_settings_dialog(self):
         dialog = ModPathsDialog(self)
-        dialog.exec_()
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        self.config = load_config()
+        self.factorio_log_path = self.config.get("factorio_log_path", DEFAULT_MOD_PATHS["factorio_log_path"])
+        if self.game == "factorio":
+            payload = self.read_factorio_log_file(self.factorio_log_path)
+            self.factorio_component_versions = (payload or {}).get("component_versions") or {}
+            normalized = normalize_factorio_target_version(
+                (payload or {}).get("factorio_version")
+                or self.config.get("factorio_target_version", "2.0")
+            ) or "2.0"
+            self.factorio_target_version = normalized
+            if hasattr(self, "factorio_version_combo"):
+                if self.factorio_version_combo.findText(normalized) < 0:
+                    self.factorio_version_combo.addItem(normalized)
+                self.factorio_version_combo.blockSignals(True)
+                self.factorio_version_combo.setCurrentText(normalized)
+                self.factorio_version_combo.blockSignals(False)
+            self.refresh_factorio_filter_url_preview()
+            self.reload_current_factorio_listing()
 
     def on_dependencies_resolved(self, items):
         added = self.add_cart_items(items)

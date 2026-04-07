@@ -14,10 +14,13 @@ DEFAULT_CONFIG = {
     "vn_folder_path": os.path.join(USERPROFILE, "Downloads", "Visual Novels"),
     "games_folder_path": os.path.join(USERPROFILE, "Downloads", "Games"),
     "open_on_finish": False,
+    "on_all_downloads_complete": "none",
     "auto_extract_archives": False,
     "delete_archive_after_extract": False,
     "max_parallel_downloads": 2,
     "factorio_mods_path": os.path.join(APPDATA, "Factorio", "mods"),
+    "factorio_log_path": os.path.join(APPDATA, "Factorio", "factorio-current.log"),
+    "factorio_target_version": "2.0",
     "minecraft_mods_path": os.path.join(APPDATA, ".minecraft", "mods"),
 }
 

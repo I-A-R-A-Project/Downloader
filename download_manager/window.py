@@ -123,6 +123,10 @@ class DownloadWindow(QWidget):
         self.config = load_config()
         self.folder_path = self.config.get("folder_path", DEFAULT_CONFIG["folder_path"])
         self.open_on_finish = self.config.get("open_on_finish", DEFAULT_CONFIG["open_on_finish"])
+        self.on_all_downloads_complete = self.config.get(
+            "on_all_downloads_complete",
+            DEFAULT_CONFIG["on_all_downloads_complete"],
+        )
         self.auto_extract_archives = self.config.get("auto_extract_archives", DEFAULT_CONFIG["auto_extract_archives"])
         self.delete_archive_after_extract = self.config.get(
             "delete_archive_after_extract",
@@ -143,6 +147,9 @@ class DownloadWindow(QWidget):
         self._closing = False
         self._scheduler_queued = False
         self._next_worker_index = 0
+        self._completion_action_armed = False
+        self._completion_action_fired = False
+        self._shutdown_after_exit = False
 
         self.entries = {}
         self.entry_order = []
@@ -194,6 +201,7 @@ class DownloadWindow(QWidget):
             self.reconcile_saved_torrents()
             self.reconcile_retryable_entries()
             self.reconcile_finished_archives()
+            self.arm_completion_action_if_needed()
             self.queue_scheduler()
 
     # Session persistence
@@ -383,6 +391,7 @@ class DownloadWindow(QWidget):
         while self.count_regular_slots_in_use() < self.max_parallel_downloads:
             if not self.start_next_regular_work():
                 break
+        self.maybe_handle_completion_action()
 
     def count_regular_slots_in_use(self):
         return len(self.active_resolutions) + len(self.active_file_downloads)
@@ -591,6 +600,8 @@ class DownloadWindow(QWidget):
             self.store_password_hint(entry.get("path", ""), entry.get("password"), entry.get("title"))
             self.ensure_entry_widget(entry)
             self.update_entry_visual(entry)
+        self._completion_action_armed = True
+        self._completion_action_fired = False
         self.request_session_save()
         self.queue_scheduler()
 
@@ -656,6 +667,7 @@ class DownloadWindow(QWidget):
         self.request_session_save()
         if success:
             self.maybe_queue_extraction(entry)
+        self.maybe_handle_completion_action()
         self.queue_scheduler()
 
     def on_direct_download_cancelled(self, worker_index):
@@ -682,6 +694,7 @@ class DownloadWindow(QWidget):
             entry["extract_status"] = ""
         self.update_entry_visual(entry)
         self.request_session_save()
+        self.maybe_handle_completion_action()
         self.queue_scheduler()
 
     # Entry actions
@@ -859,6 +872,7 @@ class DownloadWindow(QWidget):
             entry["extract_error"] = error_text
             print(f"❌ Error extrayendo {entry['title']}: {error_text}")
         self.request_session_save()
+        self.maybe_handle_completion_action()
 
     def retry_resolution(self, entry):
         retry_count = int(entry.get("resolution_retry_count", 0) or 0)
@@ -1268,6 +1282,7 @@ class DownloadWindow(QWidget):
             (
                 self.folder_path,
                 self.open_on_finish,
+                self.on_all_downloads_complete,
                 self.auto_extract_archives,
                 self.delete_archive_after_extract,
                 self.max_parallel_downloads,
@@ -1275,6 +1290,7 @@ class DownloadWindow(QWidget):
             self.folder_path = normalize_path(self.folder_path)
             QThreadPool.globalInstance().setMaxThreadCount(self.max_parallel_downloads)
             self.reconcile_finished_archives()
+            self.arm_completion_action_if_needed()
             self.queue_scheduler()
 
     def ensure_torrent_timer_running(self):
@@ -1403,6 +1419,47 @@ class DownloadWindow(QWidget):
             for entry in self.entries.values()
         )
 
+    def has_unfinished_entries(self):
+        return any(
+            entry["status"] not in {"finished", "cancelled", "error"}
+            for entry in self.entries.values()
+        )
+
+    def all_entries_finished(self):
+        return bool(self.entry_order) and all(
+            self.entries.get(entry_id, {}).get("status") == "finished"
+            for entry_id in self.entry_order
+        )
+
+    def arm_completion_action_if_needed(self):
+        if self.has_unfinished_entries():
+            self._completion_action_armed = True
+            self._completion_action_fired = False
+
+    def maybe_handle_completion_action(self):
+        if self._closing:
+            return
+        if self.on_all_downloads_complete not in {"close", "shutdown"}:
+            return
+        if not self._completion_action_armed or self._completion_action_fired:
+            return
+        if self.has_active_work() or self.active_extractions or self.pending_external_entries:
+            return
+        if not self.all_entries_finished():
+            return
+
+        self._completion_action_fired = True
+        self._completion_action_armed = False
+        if self.on_all_downloads_complete == "shutdown":
+            self._shutdown_after_exit = True
+        self.close()
+
+    def trigger_system_shutdown(self):
+        try:
+            subprocess.Popen(["shutdown", "/s", "/t", "0"])
+        except Exception as exc:
+            print(f"No se pudo apagar la computadora automáticamente: {exc}")
+
     def confirm_close_if_needed(self):
         if not self.has_active_work():
             return True
@@ -1478,3 +1535,5 @@ class DownloadWindow(QWidget):
         app = QApplication.instance()
         if app is not None:
             app.quit()
+        if self._shutdown_after_exit:
+            self.trigger_system_shutdown()

@@ -21,6 +21,25 @@ MODRINTH_INDEX_BY_MODE = {
     "updated": "updated",
     "newest": "newest",
 }
+FACTORIO_VERSION_RE = re.compile(r"(\d+\.\d+(?:\.\d+)*)")
+FACTORIO_DEPENDENCY_QUOTED_RE = re.compile(r'(?:Dependency|dependency|requires)\s+"([^"]+)"')
+FACTORIO_DEPENDENCY_INLINE_RE = re.compile(
+    r'\brequires\s+([A-Za-z0-9_.-]+(?:\s*(?:>=|<=|=|>|<)\s*[A-Za-z0-9_.+-]+)?)',
+    re.IGNORECASE,
+)
+FACTORIO_DEPENDENCY_MISSING_ES_RE = re.compile(
+    r'Falta la dependencia requerida\s+(.+?)(?:\s*\(.*\))?$',
+    re.IGNORECASE,
+)
+FACTORIO_DEPENDENCY_UNSATISFIED_ES_RE = re.compile(
+    r'Dependencia\s+(.+?)\s+no est[aá]\s+satisfecha(?:\s*\(.*\))?$',
+    re.IGNORECASE,
+)
+FACTORIO_DEPENDENCY_UNSATISFIED_ACTIVE_ES_RE = re.compile(
+    r'Dependencia\s+(.+?)\s+no est[aá]\s+satisfecha\s+\(activa:\s*([A-Za-z0-9_.-]+)\s+([A-Za-z0-9_.+-]+)\)$',
+    re.IGNORECASE,
+)
+FACTORIO_SPECIAL_DEPENDENCIES = {"base", "core", "space-age"}
 
 
 def modrinth_headers():
@@ -226,6 +245,28 @@ class DependencyResolveSignals(QObject):
     finished = pyqtSignal(list)
 
 
+class FactorioLogSignals(QObject):
+    finished = pyqtSignal(dict, str)
+
+
+class FactorioLogWorker(QRunnable):
+    def __init__(self, log_path):
+        super().__init__()
+        self.log_path = log_path
+        self.signals = FactorioLogSignals()
+
+    def run(self):
+        try:
+            if not self.log_path:
+                raise FileNotFoundError("No hay ruta configurada para factorio-current.log.")
+            with open(self.log_path, "r", encoding="utf-8", errors="replace") as handle:
+                payload = parse_factorio_log(handle.read())
+            payload["log_path"] = self.log_path
+            self.signals.finished.emit(payload, "")
+        except Exception as exc:
+            self.signals.finished.emit({}, str(exc))
+
+
 class DependencyResolveWorker(QRunnable):
     def __init__(self, window, dependencies, visited):
         super().__init__()
@@ -402,6 +443,217 @@ def fetch_modrinth_search_page(mode, query, page):
         "page": page,
         "last_page": last_page,
     }
+
+
+def normalize_factorio_target_version(value):
+    text = str(value or "").strip()
+    match = FACTORIO_VERSION_RE.search(text)
+    if not match:
+        return ""
+    parts = match.group(1).split(".")
+    if len(parts) >= 2:
+        return f"{parts[0]}.{parts[1]}"
+    return match.group(1)
+
+
+def extract_factorio_runtime_version_from_log_text(text):
+    for line in (text or "").splitlines():
+        lower = line.lower()
+        if "factorio" not in lower:
+            continue
+        after_keyword = line[lower.index("factorio") + len("factorio"):]
+        match = FACTORIO_VERSION_RE.search(after_keyword)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def extract_release_factorio_version(release):
+    if not isinstance(release, dict):
+        return ""
+    candidates = [release.get("factorio_version")]
+    info_json = release.get("info_json") or {}
+    if isinstance(info_json, dict):
+        candidates.extend(
+            [
+                info_json.get("factorio_version"),
+                info_json.get("game_version"),
+                info_json.get("factorioVersion"),
+            ]
+        )
+    for candidate in candidates:
+        normalized = normalize_factorio_target_version(candidate)
+        if normalized:
+            return normalized
+    return ""
+
+
+def factorio_release_matches_target(release, target_version):
+    target = normalize_factorio_target_version(target_version)
+    if not target:
+        return True
+    release_version = extract_release_factorio_version(release)
+    if not release_version:
+        return False
+    return release_version == target
+
+
+def extract_factorio_version_from_log_text(text):
+    return normalize_factorio_target_version(extract_factorio_runtime_version_from_log_text(text))
+
+
+def parse_factorio_dependency_issues_from_log(text):
+    dependencies = []
+    seen = set()
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        lower = stripped.lower()
+        if (
+            "depend" not in lower
+            and "require" not in lower
+            and "falta la dependencia requerida" not in lower
+            and "no está satisfecha" not in lower
+            and "no esta satisfecha" not in lower
+        ):
+            continue
+        matches = []
+        matches.extend(FACTORIO_DEPENDENCY_QUOTED_RE.findall(stripped))
+        matches.extend(FACTORIO_DEPENDENCY_INLINE_RE.findall(stripped))
+        missing_match = FACTORIO_DEPENDENCY_MISSING_ES_RE.search(stripped)
+        if missing_match:
+            matches.append(missing_match.group(1))
+        unsatisfied_match = FACTORIO_DEPENDENCY_UNSATISFIED_ES_RE.search(stripped)
+        if unsatisfied_match:
+            matches.append(unsatisfied_match.group(1))
+
+        for match in matches:
+            dependency = " ".join(str(match).split()).strip(" .:")
+            if not dependency:
+                continue
+            name = dependency.split()[0].strip().lower()
+            if name in FACTORIO_SPECIAL_DEPENDENCIES:
+                continue
+            if dependency not in seen:
+                seen.add(dependency)
+                dependencies.append(dependency)
+    return dependencies
+
+
+def parse_factorio_log_component_versions(text):
+    versions = {}
+    runtime = extract_factorio_runtime_version_from_log_text(text)
+    if runtime:
+        versions["base"] = runtime
+
+    current_mod = ""
+    for line in (text or "").splitlines():
+        raw = line.rstrip()
+        stripped = raw.strip()
+        if not stripped.startswith("•"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        content = stripped.lstrip("•").strip()
+        if not content:
+            continue
+        lower = content.lower()
+        if not lower.startswith(
+            (
+                "dependencia ",
+                "falta la dependencia requerida ",
+                "incompatible con ",
+                "versión incompatible de factorio",
+                "version incompatible de factorio",
+            )
+        ):
+            current_mod = content
+            continue
+
+        match = FACTORIO_DEPENDENCY_UNSATISFIED_ACTIVE_ES_RE.search(content)
+        if not match:
+            continue
+        active_name = (match.group(2) or "").strip().lower()
+        active_version = (match.group(3) or "").strip()
+        if active_name in FACTORIO_SPECIAL_DEPENDENCIES and active_version:
+            versions[active_name] = active_version
+    return versions
+
+
+def parse_factorio_log_replacement_mods(text):
+    replacements = []
+    seen = set()
+    current_mod = ""
+    for line in (text or "").splitlines():
+        raw = line.rstrip()
+        stripped = raw.strip()
+        if not stripped.startswith("•"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        content = stripped.lstrip("•").strip()
+        if not content:
+            continue
+        lower = content.lower()
+        if not lower.startswith(
+            (
+                "dependencia ",
+                "falta la dependencia requerida ",
+                "incompatible con ",
+                "versión incompatible de factorio",
+                "version incompatible de factorio",
+            )
+        ):
+            current_mod = content
+            continue
+        if not current_mod:
+            continue
+
+        active_match = FACTORIO_DEPENDENCY_UNSATISFIED_ACTIVE_ES_RE.search(content)
+        if active_match:
+            dep_name = (active_match.group(2) or "").strip().lower()
+            if dep_name in FACTORIO_SPECIAL_DEPENDENCIES and current_mod not in seen:
+                seen.add(current_mod)
+                replacements.append(current_mod)
+            continue
+
+        if lower.startswith(("versión incompatible de factorio", "version incompatible de factorio")):
+            if current_mod not in seen:
+                seen.add(current_mod)
+                replacements.append(current_mod)
+    return replacements
+
+
+def parse_factorio_log(text):
+    return {
+        "factorio_version": extract_factorio_version_from_log_text(text),
+        "factorio_runtime_version": extract_factorio_runtime_version_from_log_text(text),
+        "dependencies": parse_factorio_dependency_issues_from_log(text),
+        "component_versions": parse_factorio_log_component_versions(text),
+        "replacement_mods": parse_factorio_log_replacement_mods(text),
+    }
+
+
+def build_factorio_dependency_candidates(name):
+    base = str(name or "").strip()
+    if not base:
+        return []
+    variants = [base]
+    space_to_dash = re.sub(r"\s+", "-", base)
+    space_to_underscore = re.sub(r"\s+", "_", base)
+    dash_to_space = base.replace("-", " ")
+    underscore_to_space = base.replace("_", " ")
+    underscore_to_dash = base.replace("_", "-")
+    dash_to_underscore = base.replace("-", "_")
+    for candidate in (
+        space_to_dash,
+        space_to_underscore,
+        dash_to_space,
+        underscore_to_space,
+        underscore_to_dash,
+        dash_to_underscore,
+    ):
+        candidate = candidate.strip()
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+    return variants
 
 
 def normalize_modrinth_search_hit(hit):

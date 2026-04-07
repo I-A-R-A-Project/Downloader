@@ -1,14 +1,16 @@
 import os
 from PyQt5.QtWidgets import (
     QFileDialog, QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QLineEdit, QMessageBox
+    QPushButton, QLineEdit, QMessageBox, QComboBox
 )
 from config import DEFAULT_CONFIG, load_config, save_config
 
 DEFAULT_MOD_PATHS = {
     "factorio_mods_path": DEFAULT_CONFIG["factorio_mods_path"],
+    "factorio_log_path": DEFAULT_CONFIG["factorio_log_path"],
     "minecraft_mods_path": DEFAULT_CONFIG["minecraft_mods_path"],
 }
+FACTORIO_VERSION_PRESETS = ["2.0", "1.1", "1.0", "0.18", "0.17", "0.16"]
 
 
 class ModPathsDialog(QDialog):
@@ -34,6 +36,29 @@ class ModPathsDialog(QDialog):
         factorio_layout.addWidget(self.factorio_path_edit)
         factorio_layout.addWidget(factorio_btn)
         layout.addLayout(factorio_layout)
+
+        layout.addWidget(QLabel("Versión objetivo de Factorio:"))
+        self.factorio_version_combo = QComboBox()
+        self.factorio_version_combo.setEditable(True)
+        self.factorio_version_combo.addItems(FACTORIO_VERSION_PRESETS)
+        current_version = self.config.get("factorio_target_version", DEFAULT_CONFIG["factorio_target_version"])
+        if current_version and self.factorio_version_combo.findText(current_version) < 0:
+            self.factorio_version_combo.addItem(current_version)
+        self.factorio_version_combo.setCurrentText(current_version)
+        layout.addWidget(self.factorio_version_combo)
+
+        layout.addWidget(QLabel("Archivo factorio-current.log:"))
+        self.factorio_log_path_edit = QLineEdit()
+        self.factorio_log_path_edit.setText(
+            self.config.get("factorio_log_path", DEFAULT_MOD_PATHS["factorio_log_path"])
+        )
+        factorio_log_btn = QPushButton("📄")
+        factorio_log_btn.setFixedWidth(30)
+        factorio_log_btn.clicked.connect(self.choose_factorio_log_file)
+        factorio_log_layout = QHBoxLayout()
+        factorio_log_layout.addWidget(self.factorio_log_path_edit)
+        factorio_log_layout.addWidget(factorio_log_btn)
+        layout.addLayout(factorio_log_layout)
 
         layout.addWidget(QLabel("Carpeta de mods (Minecraft):"))
         self.minecraft_path_edit = QLineEdit()
@@ -70,9 +95,25 @@ class ModPathsDialog(QDialog):
         if folder:
             self.minecraft_path_edit.setText(folder)
 
+    def choose_factorio_log_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Seleccionar factorio-current.log",
+            os.path.dirname(self.factorio_log_path_edit.text().strip() or DEFAULT_MOD_PATHS["factorio_log_path"]),
+            "Log files (*.log);;Todos los archivos (*)",
+        )
+        if path:
+            self.factorio_log_path_edit.setText(path)
+
     def save_and_close(self):
         factorio_path = self.factorio_path_edit.text().strip() or self.config.get(
             "factorio_mods_path", DEFAULT_MOD_PATHS["factorio_mods_path"]
+        )
+        factorio_log_path = self.factorio_log_path_edit.text().strip() or self.config.get(
+            "factorio_log_path", DEFAULT_MOD_PATHS["factorio_log_path"]
+        )
+        factorio_target_version = self.factorio_version_combo.currentText().strip() or self.config.get(
+            "factorio_target_version", DEFAULT_CONFIG["factorio_target_version"]
         )
         minecraft_path = self.minecraft_path_edit.text().strip() or self.config.get(
             "minecraft_mods_path", DEFAULT_MOD_PATHS["minecraft_mods_path"]
@@ -84,6 +125,8 @@ class ModPathsDialog(QDialog):
             return
 
         self.config["factorio_mods_path"] = factorio_path
+        self.config["factorio_log_path"] = factorio_log_path
+        self.config["factorio_target_version"] = factorio_target_version
         self.config["minecraft_mods_path"] = minecraft_path
         save_config(self.config)
         self.accept()

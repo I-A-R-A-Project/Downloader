@@ -2,7 +2,7 @@ import os
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QComboBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
     QSpinBox, QTextEdit, QVBoxLayout, QWidget,
 )
 from config import DEFAULT_CONFIG, load_config, normalize_path, save_config
@@ -19,7 +19,7 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout()
 
         self.folder_path_edit = QLineEdit()
-        self.folder_path_edit.setPlaceholderText(self.config.get("folder_path", DEFAULT_CONFIG["folder_path"]))
+        self.folder_path_edit.setText(self.config.get("folder_path", DEFAULT_CONFIG["folder_path"]))
         self.folder_path_edit.setReadOnly(False)
         self.select_folder_btn = QPushButton("📁")
         self.select_folder_btn.setFixedWidth(30)
@@ -32,6 +32,21 @@ class SettingsDialog(QDialog):
         self.open_folder_cb = QCheckBox("Abrir carpeta al finalizar")
         self.open_folder_cb.setChecked(self.config.get("open_on_finish", DEFAULT_CONFIG["open_on_finish"]))
         layout.addWidget(self.open_folder_cb)
+
+        finish_layout = QHBoxLayout()
+        finish_layout.addWidget(QLabel("Al finalizar todas las descargas:"))
+        self.on_complete_combo = QComboBox()
+        self.on_complete_combo.addItem("No hacer nada", "none")
+        self.on_complete_combo.addItem("Cerrar programa", "close")
+        self.on_complete_combo.addItem("Apagar computadora", "shutdown")
+        saved_action = self.config.get(
+            "on_all_downloads_complete",
+            DEFAULT_CONFIG["on_all_downloads_complete"],
+        )
+        combo_index = self.on_complete_combo.findData(saved_action)
+        self.on_complete_combo.setCurrentIndex(combo_index if combo_index >= 0 else 0)
+        finish_layout.addWidget(self.on_complete_combo)
+        layout.addLayout(finish_layout)
 
         self.auto_extract_cb = QCheckBox("Descomprimir al finalizar")
         self.auto_extract_cb.setChecked(
@@ -101,6 +116,7 @@ class SettingsDialog(QDialog):
 
         self.config["folder_path"] = folder_path
         self.config["open_on_finish"] = self.open_folder_cb.isChecked()
+        self.config["on_all_downloads_complete"] = self.on_complete_combo.currentData()
         self.config["auto_extract_archives"] = self.auto_extract_cb.isChecked()
         self.config["delete_archive_after_extract"] = (
             self.delete_archive_cb.isChecked() if self.auto_extract_cb.isChecked() else False
@@ -216,8 +232,16 @@ def apply_settings():
     config = load_config()
     folder_path = config.get("folder_path")
     open_on_finish = config.get("open_on_finish")
+    on_all_downloads_complete = config.get("on_all_downloads_complete")
     auto_extract_archives = config.get("auto_extract_archives")
     delete_archive_after_extract = config.get("delete_archive_after_extract")
     max_parallel_downloads = config.get("max_parallel_downloads")
     print(f"Configuración actualizada: {config}")
-    return folder_path, open_on_finish, auto_extract_archives, delete_archive_after_extract, max_parallel_downloads
+    return (
+        folder_path,
+        open_on_finish,
+        on_all_downloads_complete,
+        auto_extract_archives,
+        delete_archive_after_extract,
+        max_parallel_downloads,
+    )
