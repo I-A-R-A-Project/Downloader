@@ -1,8 +1,8 @@
 import os, sys, json, time
-from PyQt5.QtCore import QObject, QIODevice, QSharedMemory, QSystemSemaphore, QTimer, pyqtSignal
+from PyQt5.QtCore import QObject, QIODevice, QSharedMemory, QSystemSemaphore, QTimer, pyqtSignal, Qt
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 from PyQt5.QtWidgets import QApplication, QMessageBox
-from download_manager.window import DownloadWindow
+from config import DEFAULT_CONFIG, load_config, save_config
 
 SERVER_NAME = "MediaSearchPrototype.DownloadManager"
 
@@ -196,11 +196,40 @@ def parse_input(args, base_dir=None):
 
 if __name__ == '__main__':
     os.system("title Descargas")
+    args = sys.argv[1:]
+    config = load_config()
+
+    explicit_mode = None
+    if "--tui" in args:
+        args = [arg for arg in args if arg != "--tui"]
+        explicit_mode = "tui"
+    if "--gui" in args:
+        args = [arg for arg in args if arg != "--gui"]
+        explicit_mode = "gui"
+
+    if "--set-default-tui" in args:
+        args = [arg for arg in args if arg != "--set-default-tui"]
+        config["download_manager_mode"] = "tui"
+        save_config(config)
+    if "--set-default-gui" in args:
+        args = [arg for arg in args if arg != "--set-default-gui"]
+        config["download_manager_mode"] = "gui"
+        save_config(config)
+
+    use_tui = (explicit_mode or config.get("download_manager_mode", DEFAULT_CONFIG["download_manager_mode"])) == "tui"
+    entries = parse_input(args, os.getcwd()) if args else []
+
+    if use_tui:
+        from download_manager.tui import run_tui_download_manager
+    else:
+        from download_manager.window import DownloadWindow
+
+    QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
 
-    args = sys.argv[1:]
-    entries = parse_input(args, os.getcwd()) if args else []
+    if use_tui:
+        sys.exit(run_tui_download_manager(app, entries))
 
     bridge = SingleInstanceBridge(SERVER_NAME, app)
     try:

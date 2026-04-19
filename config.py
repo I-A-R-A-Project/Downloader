@@ -18,6 +18,7 @@ DEFAULT_CONFIG = {
     "auto_extract_archives": False,
     "delete_archive_after_extract": False,
     "max_parallel_downloads": 2,
+    "download_manager_mode": "gui",
     "factorio_mods_path": os.path.join(APPDATA, "Factorio", "mods"),
     "factorio_log_path": os.path.join(APPDATA, "Factorio", "factorio-current.log"),
     "factorio_target_version": "2.0",

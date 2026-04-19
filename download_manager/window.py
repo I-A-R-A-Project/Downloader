@@ -133,6 +133,10 @@ class DownloadWindow(QWidget):
             DEFAULT_CONFIG["delete_archive_after_extract"],
         )
         self.max_parallel_downloads = self.config.get("max_parallel_downloads", DEFAULT_CONFIG["max_parallel_downloads"])
+        self.download_manager_mode = self.config.get(
+            "download_manager_mode",
+            DEFAULT_CONFIG["download_manager_mode"],
+        )
         QThreadPool.globalInstance().setMaxThreadCount(self.max_parallel_downloads)
 
         self.downloaders = []
@@ -1286,6 +1290,7 @@ class DownloadWindow(QWidget):
                 self.auto_extract_archives,
                 self.delete_archive_after_extract,
                 self.max_parallel_downloads,
+                self.download_manager_mode,
             ) = apply_settings()
             self.folder_path = normalize_path(self.folder_path)
             QThreadPool.globalInstance().setMaxThreadCount(self.max_parallel_downloads)

@@ -73,6 +73,17 @@ class SettingsDialog(QDialog):
         hbox.addWidget(self.max_downloads_spin)
         layout.addLayout(hbox)
 
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("Modo por defecto:"))
+        self.default_mode_combo = QComboBox()
+        self.default_mode_combo.addItem("GUI", "gui")
+        self.default_mode_combo.addItem("TUI", "tui")
+        saved_mode = self.config.get("download_manager_mode", DEFAULT_CONFIG["download_manager_mode"])
+        mode_index = self.default_mode_combo.findData(saved_mode)
+        self.default_mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
+        mode_layout.addWidget(self.default_mode_combo)
+        layout.addLayout(mode_layout)
+
         btn_layout = QHBoxLayout()
         save_btn = QPushButton("Guardar")
         cancel_btn = QPushButton("Cancelar")
@@ -122,6 +133,7 @@ class SettingsDialog(QDialog):
             self.delete_archive_cb.isChecked() if self.auto_extract_cb.isChecked() else False
         )
         self.config["max_parallel_downloads"] = self.max_downloads_spin.value()
+        self.config["download_manager_mode"] = self.default_mode_combo.currentData()
         save_config(self.config)
         self.accept()
 
@@ -236,6 +248,7 @@ def apply_settings():
     auto_extract_archives = config.get("auto_extract_archives")
     delete_archive_after_extract = config.get("delete_archive_after_extract")
     max_parallel_downloads = config.get("max_parallel_downloads")
+    download_manager_mode = config.get("download_manager_mode")
     print(f"Configuración actualizada: {config}")
     return (
         folder_path,
@@ -244,4 +257,5 @@ def apply_settings():
         auto_extract_archives,
         delete_archive_after_extract,
         max_parallel_downloads,
+        download_manager_mode,
     )
