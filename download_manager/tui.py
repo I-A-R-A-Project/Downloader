@@ -16,6 +16,7 @@ from download_manager.browser import UniversalDownloader
 from download_manager.direct_file import build_download_path, resolve_direct_filename
 from download_manager.torrent import Aria2Client, ensure_aria2_running
 from download_manager.window import ArchiveExtractWorker
+from download_manager.youtube import detect_youtube_mode, is_youtube_url, run_yt_dlp_download
 
 try:
     from tqdm import tqdm
@@ -68,22 +69,24 @@ class TuiDownloadManager:
 
         regular_entries = []
         torrent_entries = []
+        youtube_entries = []
         for entry in self.entries:
             self.store_password_hint(entry)
             if entry["download_type"] == "torrent":
                 torrent_entries.append(entry)
+            elif entry["download_type"] == "youtube":
+                youtube_entries.append(entry)
             else:
                 regular_entries.append(entry)
 
         failed = False
 
         if regular_entries:
-            pending_regular = [entry for entry in regular_entries if entry.get("status") not in {"finished", "cancelled", "error"}]
+            pending_regular = [entry for entry in regular_entries if entry.get("status") not in {"finished", "cancelled"}]
             if pending_regular:
                 self.log(f"Resolve regular entries: {len(pending_regular)}")
-            for entry in pending_regular:
-                if not entry.get("direct_links") and not self.resolve_entry(entry):
-                    failed = True
+            if not self.resolve_regular_entries(pending_regular):
+                failed = True
             if not self.download_regular_entries(regular_entries):
                 failed = True
 
@@ -92,6 +95,13 @@ class TuiDownloadManager:
             if pending_torrents:
                 self.log(f"Process torrent entries: {len(pending_torrents)}")
             if pending_torrents and not self.download_torrent_entries(torrent_entries):
+                failed = True
+
+        if youtube_entries:
+            pending_youtube = [entry for entry in youtube_entries if entry.get("status") not in {"finished", "cancelled"}]
+            if pending_youtube:
+                self.log(f"Process YouTube entries: {len(pending_youtube)}")
+            if pending_youtube and not self.download_youtube_entries(youtube_entries):
                 failed = True
 
         self.save_session_to_disk()
@@ -123,8 +133,13 @@ class TuiDownloadManager:
         path = normalize_path((raw_entry.get("path") or "").strip()) or self.folder_path
         title = (raw_entry.get("title") or "").strip() or self.default_title(url, path)
         kind = raw_entry.get("download_type")
-        if kind not in {"regular", "torrent"}:
-            kind = "torrent" if self.is_torrent_url(url) else "regular"
+        if kind not in {"regular", "torrent", "youtube"}:
+            if self.is_torrent_url(url):
+                kind = "torrent"
+            elif is_youtube_url(url):
+                kind = "youtube"
+            else:
+                kind = "regular"
 
         direct_links = []
         raw_direct_links = raw_entry.get("direct_links") or []
@@ -152,7 +167,7 @@ class TuiDownloadManager:
             })
 
         status = raw_entry.get("status") or "waiting"
-        if from_session and kind == "regular" and status in {"downloading", "resolving"}:
+        if from_session and kind in {"regular", "youtube"} and status in {"downloading", "resolving"}:
             status = "waiting"
 
         entry = {
@@ -162,6 +177,7 @@ class TuiDownloadManager:
             "title": title,
             "password": (raw_entry.get("password") or "").strip(),
             "download_type": kind,
+            "youtube_mode": raw_entry.get("youtube_mode") or detect_youtube_mode(url),
             "status": status,
             "progress": int(raw_entry.get("progress", 0) or 0),
             "direct_url": raw_entry.get("direct_url", "") or "",
@@ -188,6 +204,7 @@ class TuiDownloadManager:
             "url_original": entry["url_original"],
             "password": entry.get("password", ""),
             "download_type": entry["download_type"],
+            "youtube_mode": entry.get("youtube_mode", "video"),
             "status": entry.get("status", "waiting"),
             "progress": entry.get("progress", 0),
             "direct_url": entry.get("direct_url", ""),
@@ -305,6 +322,87 @@ class TuiDownloadManager:
         self.save_session_to_disk()
         return True
 
+    def resolve_regular_entries(self, entries):
+        tasks = []
+        for entry in entries:
+            if entry.get("status") == "error":
+                self.retry_failed_entry(entry)
+            if entry.get("failed") or entry.get("status") in {"finished", "cancelled"}:
+                continue
+            if not entry.get("direct_links"):
+                tasks.append(entry)
+
+        if not tasks:
+            return not any(entry.get("failed") for entry in entries)
+
+        results = []
+        pending_entries = list(tasks)
+        active_downloaders = {}
+        loop = QEventLoop()
+
+        def start_next():
+            while pending_entries and len(active_downloaders) < self.max_parallel_downloads:
+                entry = pending_entries.pop(0)
+
+                if self.is_direct_file_url(entry["url_original"]):
+                    results.append(self.resolve_entry(entry))
+                    continue
+
+                entry["status"] = "resolving"
+                entry["error_text"] = ""
+                self.save_session_to_disk()
+
+                downloader = UniversalDownloader([{
+                    "url": entry["url_original"],
+                    "path": entry["path"],
+                    "password": entry["password"],
+                    "title": entry["title"],
+                }])
+                active_downloaders[entry["id"]] = downloader
+                downloader.direct_links_ready.connect(
+                    lambda resolved, entry_id=entry["id"], instance=downloader: finish_one(entry_id, resolved, instance)
+                )
+                downloader.start()
+
+            if not pending_entries and not active_downloaders:
+                loop.quit()
+
+        def finish_one(entry_id, resolved, downloader):
+            entry = self.entry_by_id(entry_id)
+            active_downloaders.pop(entry_id, None)
+
+            try:
+                downloader.close()
+                downloader.deleteLater()
+            except Exception:
+                pass
+
+            direct_links = self.convert_resolved_results(resolved)
+            if not direct_links:
+                entry["failed"] = True
+                entry["status"] = "error"
+                entry["error_text"] = "No se pudieron obtener los enlaces directos."
+                self.save_session_to_disk()
+                self.log(f"[error] resolve failed {entry['title']}")
+                results.append(False)
+            else:
+                entry["direct_links"] = direct_links
+                entry["direct_url"] = direct_links[0]["url"] if len(direct_links) == 1 else ""
+                entry["status"] = "waiting"
+                entry["progress"] = 0
+                entry["error_text"] = ""
+                self.save_session_to_disk()
+                results.append(True)
+
+            self.app.processEvents()
+            start_next()
+
+        start_next()
+        if pending_entries or active_downloaders:
+            loop.exec_()
+
+        return all(results) if results else True
+
     def resolve_with_browser(self, entry):
         loop = QEventLoop()
         holder = {"results": []}
@@ -369,7 +467,7 @@ class TuiDownloadManager:
     def download_regular_entries(self, regular_entries):
         tasks = []
         for entry in regular_entries:
-            if entry.get("failed") or entry.get("status") in {"finished", "cancelled", "error"}:
+            if entry.get("failed") or entry.get("status") in {"finished", "cancelled"}:
                 continue
             for link in entry.get("direct_links", []):
                 if link.get("status") == "waiting":
@@ -381,21 +479,35 @@ class TuiDownloadManager:
         results = []
         with ThreadPoolExecutor(max_workers=self.max_parallel_downloads) as executor:
             pending = {}
-            for position, (entry, link) in enumerate(tasks):
+            available_positions = list(range(self.max_parallel_downloads))
+            task_index = 0
+
+            while task_index < len(tasks) and available_positions:
+                position = available_positions.pop(0)
+                entry, link = tasks[task_index]
                 future = executor.submit(self.download_direct_link, entry, link, position)
-                pending[future] = entry
+                pending[future] = (entry, position)
+                task_index += 1
 
             while pending:
                 done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
                 self.app.processEvents()
                 for future in done:
-                    entry = pending.pop(future)
+                    entry, position = pending.pop(future)
                     ok = False
                     try:
                         ok = bool(future.result())
                     except Exception as exc:
                         self.log(f"[error] download crashed {entry['title']}: {exc}")
                     results.append(ok)
+                    available_positions.append(position)
+
+                    if task_index < len(tasks):
+                        next_position = available_positions.pop(0)
+                        next_entry, next_link = tasks[task_index]
+                        next_future = executor.submit(self.download_direct_link, next_entry, next_link, next_position)
+                        pending[next_future] = (next_entry, next_position)
+                        task_index += 1
 
         if self.auto_extract_archives:
             for entry in regular_entries:
@@ -515,6 +627,147 @@ class TuiDownloadManager:
             return int(entry.get("progress", 0) or 0)
         values = [int(link.get("progress", 0) or 0) for link in direct_links]
         return int(sum(values) / len(values)) if values else 0
+
+    def retry_failed_entry(self, entry):
+        if not entry or entry.get("status") != "error":
+            return False
+
+        entry["failed"] = False
+        entry["error_text"] = ""
+        entry["progress"] = 0
+
+        if entry["download_type"] == "torrent":
+            entry["torrent_gid"] = ""
+            entry["torrent_hash"] = ""
+            entry["speed_text"] = ""
+            entry["status"] = "waiting"
+            self.save_session_to_disk()
+            return True
+
+        if entry["download_type"] == "youtube":
+            entry["speed_text"] = ""
+            entry["status"] = "waiting"
+            self.save_session_to_disk()
+            return True
+
+        if entry.get("direct_links"):
+            for link in entry["direct_links"]:
+                if link.get("status") == "finished":
+                    continue
+                link["status"] = "waiting"
+                link["progress"] = 0
+            self.recompute_regular_status(entry)
+        else:
+            entry["status"] = "waiting"
+
+        self.save_session_to_disk()
+        return True
+
+    def download_youtube_entries(self, entries):
+        tasks = []
+        for entry in entries:
+            if entry.get("status") == "error":
+                self.retry_failed_entry(entry)
+            if entry.get("failed") or entry.get("status") in {"finished", "cancelled"}:
+                continue
+            tasks.append(entry)
+
+        if not tasks:
+            return not any(entry.get("failed") for entry in entries)
+
+        results = []
+        with ThreadPoolExecutor(max_workers=self.max_parallel_downloads) as executor:
+            pending = {}
+            available_positions = list(range(self.max_parallel_downloads))
+            task_index = 0
+
+            while task_index < len(tasks) and available_positions:
+                position = available_positions.pop(0)
+                entry = tasks[task_index]
+                future = executor.submit(self.download_youtube_entry, entry, position)
+                pending[future] = position
+                task_index += 1
+
+            while pending:
+                done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
+                self.app.processEvents()
+                for future in done:
+                    position = pending.pop(future)
+                    ok = False
+                    try:
+                        ok = bool(future.result())
+                    except Exception as exc:
+                        self.log(f"[error] youtube crashed: {exc}")
+                    results.append(ok)
+                    available_positions.append(position)
+
+                    if task_index < len(tasks):
+                        next_position = available_positions.pop(0)
+                        next_entry = tasks[task_index]
+                        next_future = executor.submit(self.download_youtube_entry, next_entry, next_position)
+                        pending[next_future] = next_position
+                        task_index += 1
+
+        self.save_session_to_disk()
+        return all(results) if results else True
+
+    def download_youtube_entry(self, entry, position):
+        target_dir = self.absolute_download_path(entry.get("path"))
+        os.makedirs(target_dir, exist_ok=True)
+        entry["status"] = "downloading"
+        entry["progress"] = 0
+        entry["speed_text"] = ""
+        entry["error_text"] = ""
+        self.save_session_to_disk()
+
+        bar = tqdm(
+            total=100,
+            desc=self.short_label(entry["title"]),
+            unit="%",
+            position=position,
+            leave=True,
+            dynamic_ncols=True,
+        )
+
+        def on_progress(percent, speed_text, _title):
+            bar.n = max(0, min(100, int(percent or 0)))
+            if speed_text:
+                bar.set_postfix_str(speed_text.strip())
+            bar.refresh()
+            entry["progress"] = int(percent or 0)
+            entry["speed_text"] = speed_text or ""
+
+        def on_title(title):
+            if title:
+                entry["title"] = title
+
+        try:
+            ok, error_text = run_yt_dlp_download(
+                entry["url_original"],
+                target_dir,
+                mode=entry.get("youtube_mode", "video"),
+                progress_callback=on_progress,
+                title_callback=on_title,
+            )
+            if ok:
+                bar.n = 100
+                bar.refresh()
+                entry["status"] = "finished"
+                entry["progress"] = 100
+                entry["speed_text"] = ""
+                entry["error_text"] = ""
+                self.save_session_to_disk()
+                return True
+
+            self.log(f"[error] youtube failed {entry['title']}: {error_text}")
+            entry["failed"] = True
+            entry["status"] = "error"
+            entry["speed_text"] = ""
+            entry["error_text"] = error_text or "La descarga de YouTube no se pudo completar."
+            self.save_session_to_disk()
+            return False
+        finally:
+            bar.close()
 
     def extract_entry(self, entry):
         archive_path = self.find_extractable_archive(entry)

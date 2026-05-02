@@ -103,13 +103,48 @@ class ModWebPage(SilentPage):
         target = url.toString()
         if not target:
             return True
+        if target == "about:blank":
+            self.mark_intercepted_navigation()
+            return False
+        if self.window.handle_internal_navigation(target, source_page_key=self.page_key):
+            self.mark_intercepted_navigation()
+            return False
         if nav_type == QWebEnginePage.NavigationTypeLinkClicked:
-            if self.window.handle_internal_navigation(target):
-                return False
-        if nav_type == QWebEnginePage.NavigationTypeLinkClicked:
+            self.mark_intercepted_navigation()
             QDesktopServices.openUrl(url)
             return False
         return True
+
+    def createWindow(self, _type):
+        return PopupInterceptPage(self.window, self.page_key, self)
+
+    def mark_intercepted_navigation(self):
+        self.setProperty("_ignore_next_failed_load", True)
+
+    def consume_intercepted_navigation(self):
+        ignored = bool(self.property("_ignore_next_failed_load"))
+        if ignored:
+            self.setProperty("_ignore_next_failed_load", False)
+        return ignored
+
+
+class PopupInterceptPage(SilentPage):
+    def __init__(self, window, source_page_key, parent=None):
+        super().__init__(parent)
+        self.window = window
+        self.source_page_key = source_page_key or ""
+
+    def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+        if not is_main_frame:
+            return False
+        target = url.toString()
+        if not target or target == "about:blank":
+            return False
+        if self.window.handle_internal_navigation(target, source_page_key=self.source_page_key):
+            return False
+        if target.startswith("http://") or target.startswith("https://"):
+            QDesktopServices.openUrl(url)
+        return False
 
 
 class ClickableLabel(QLabel):
@@ -1088,7 +1123,7 @@ class ModSearchWindow(QWidget):
                 return mod_id
         return ""
 
-    def handle_internal_navigation(self, target):
+    def handle_internal_navigation(self, target, source_page_key=""):
         parsed = QUrl(target)
         host = parsed.host().lower()
         if not host:
@@ -1096,6 +1131,9 @@ class ModSearchWindow(QWidget):
         if host == FACTORIO_MOD_HOST:
             mod_id = self.extract_mod_id_from_url(target)
             if mod_id:
+                page_key = self.build_internal_page_key(target, mod_id=mod_id)
+                if source_page_key and page_key == source_page_key:
+                    return False
                 self.open_mod_tab(mod_id, target, self.project_name_for_id(mod_id))
                 return True
             download_mod_id = self.extract_factorio_download_mod_id(target)
@@ -1105,14 +1143,21 @@ class ModSearchWindow(QWidget):
             if path in {"", "/"} or path.startswith("/browse") or path == "/search":
                 return self.apply_factorio_browse_url(target)
             page_key = self.build_internal_page_key(target)
+            if source_page_key and page_key == source_page_key:
+                return False
             self.open_internal_page(page_key, target, title=self.build_internal_page_title(target))
             return True
         if host == MODRINTH_MOD_HOST:
             mod_id = self.extract_mod_id_from_url(target)
             if mod_id:
+                page_key = self.build_internal_page_key(target, mod_id=mod_id)
+                if source_page_key and page_key == source_page_key:
+                    return False
                 self.open_mod_tab(mod_id, target, self.project_name_for_id(mod_id))
                 return True
             page_key = self.build_internal_page_key(target)
+            if source_page_key and page_key == source_page_key:
+                return False
             self.open_internal_page(page_key, target, title=self.build_internal_page_title(target))
             return True
         return False
@@ -1468,7 +1513,10 @@ class ModSearchWindow(QWidget):
         tab = self.web_tabs.get(page_key)
         if tab is None:
             return
+        page = tab.web_view.page()
         if not ok:
+            if hasattr(page, "consume_intercepted_navigation") and page.consume_intercepted_navigation():
+                return
             self.update_loading_placeholder(
                 tab,
                 message="No se pudo cargar la página",
@@ -1476,6 +1524,8 @@ class ModSearchWindow(QWidget):
             )
             tab.web_view.setVisible(False)
             return
+        if hasattr(page, "consume_intercepted_navigation"):
+            page.consume_intercepted_navigation()
         tab.web_view.setVisible(True)
         if getattr(tab, "loading_placeholder", None) is not None:
             tab.loading_placeholder.hide()

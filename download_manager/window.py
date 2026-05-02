@@ -19,6 +19,7 @@ from download_manager.dialogs import LinkInputWindow, SettingsDialog, apply_sett
 from download_manager.torrent import Aria2Client, TorrentUpdater, ensure_aria2_running
 from download_manager.torrent_queue import TorrentProcessor
 from download_manager.workers import DownloadSignals, FileDownloader
+from download_manager.youtube import YtDlpDownloadWorker, detect_youtube_mode, is_youtube_url
 
 
 SESSION_PATH = os.path.join(APPDATA, "MediaSearchPrototype", "download_state.json")
@@ -51,6 +52,7 @@ def find_7z_executable():
 class DownloadType(Enum):
     NORMAL = 0
     TORRENT = 1
+    YOUTUBE = 2
 
 
 class TorrentCancelSignals(QObject):
@@ -142,6 +144,7 @@ class DownloadWindow(QWidget):
         self.downloaders = []
         self.active_resolutions = {}
         self.active_file_downloads = {}
+        self.active_youtube_downloads = {}
         self.active_extractions = {}
         self.worker_context = {}
         self.pending_torrent_entries = set()
@@ -235,8 +238,13 @@ class DownloadWindow(QWidget):
         path = normalize_path((raw_entry.get("path") or "").strip())
         title = (raw_entry.get("title") or "").strip() or self.default_entry_title(raw_entry, url_original, path)
         kind = raw_entry.get("download_type")
-        if kind not in {"regular", "torrent"}:
-            kind = "torrent" if self.is_torrent_url(url_original) else "regular"
+        if kind not in {"regular", "torrent", "youtube"}:
+            if self.is_torrent_url(url_original):
+                kind = "torrent"
+            elif is_youtube_url(url_original):
+                kind = "youtube"
+            else:
+                kind = "regular"
 
         direct_links = []
         raw_direct_links = raw_entry.get("direct_links") or []
@@ -264,7 +272,7 @@ class DownloadWindow(QWidget):
             })
 
         status = raw_entry.get("status") or "waiting"
-        if from_session and kind == "regular" and status in {"downloading", "resolving"}:
+        if from_session and kind in {"regular", "youtube"} and status in {"downloading", "resolving"}:
             status = "waiting"
 
         entry = {
@@ -274,6 +282,7 @@ class DownloadWindow(QWidget):
             "url_original": url_original,
             "password": raw_entry.get("password", "") or "",
             "download_type": kind,
+            "youtube_mode": raw_entry.get("youtube_mode") or detect_youtube_mode(url_original),
             "status": status,
             "progress": int(raw_entry.get("progress", 0) or 0),
             "direct_url": raw_entry.get("direct_url", "") or "",
@@ -287,7 +296,7 @@ class DownloadWindow(QWidget):
             "resolution_retry_count": int(raw_entry.get("resolution_retry_count", 0) or 0),
             "archive_retry_count": int(raw_entry.get("archive_retry_count", 0) or 0),
         }
-        if from_session:
+        if from_session and kind == "regular":
             self.recompute_regular_status(entry)
         return entry
 
@@ -321,6 +330,7 @@ class DownloadWindow(QWidget):
             "url_original": entry["url_original"],
             "password": entry["password"],
             "download_type": entry["download_type"],
+            "youtube_mode": entry.get("youtube_mode", "video"),
             "status": entry["status"],
             "progress": entry.get("progress", 0),
             "direct_url": entry.get("direct_url", ""),
@@ -374,6 +384,23 @@ class DownloadWindow(QWidget):
             if entry.get("extract_status") == "error":
                 self.retry_corrupt_archive_download(entry, entry.get("extract_error", ""))
 
+            if entry.get("status") == "error":
+                self.retry_failed_entry(entry)
+
+        for entry_id in self.entry_order:
+            entry = self.entries.get(entry_id)
+            if not entry or entry["download_type"] != "torrent":
+                continue
+            if entry.get("status") == "error":
+                self.retry_failed_entry(entry)
+
+        for entry_id in self.entry_order:
+            entry = self.entries.get(entry_id)
+            if not entry or entry["download_type"] != "youtube":
+                continue
+            if entry.get("status") == "error":
+                self.retry_failed_entry(entry)
+
     def queue_scheduler(self):
         if self._scheduler_queued or self._closing:
             return
@@ -398,15 +425,20 @@ class DownloadWindow(QWidget):
         self.maybe_handle_completion_action()
 
     def count_regular_slots_in_use(self):
-        return len(self.active_resolutions) + len(self.active_file_downloads)
+        return len(self.active_resolutions) + len(self.active_file_downloads) + len(self.active_youtube_downloads)
 
     def start_next_regular_work(self):
         for entry_id in self.entry_order:
             entry = self.entries.get(entry_id)
-            if not entry or entry["download_type"] != "regular":
+            if not entry or entry["download_type"] == "torrent":
                 continue
             if entry["status"] in {"finished", "cancelled", "error"}:
                 continue
+            if entry["download_type"] == "youtube":
+                if entry_id in self.active_youtube_downloads:
+                    continue
+                self.start_youtube_download(entry)
+                return True
             if entry_id in self.active_resolutions:
                 continue
 
@@ -551,6 +583,34 @@ class DownloadWindow(QWidget):
         self.active_file_downloads[worker_index] = thread
         self.worker_context[worker_index] = (entry["id"], link_index)
         QThreadPool.globalInstance().start(thread)
+
+    def start_youtube_download(self, entry):
+        target_dir = self.absolute_download_path(entry.get("path") or self.folder_path)
+        if not target_dir or not entry.get("url_original"):
+            entry["status"] = "error"
+            entry["error_text"] = "Falta URL o carpeta para YouTube."
+            self.update_entry_visual(entry)
+            self.request_session_save()
+            return
+
+        entry["status"] = "downloading"
+        entry["error_text"] = ""
+        entry["speed_text"] = ""
+        self.update_entry_visual(entry)
+        self.request_session_save()
+
+        worker = YtDlpDownloadWorker(
+            entry["id"],
+            entry["url_original"],
+            target_dir,
+            entry.get("youtube_mode", "video"),
+        )
+        worker.signals.progress.connect(self.on_youtube_progress)
+        worker.signals.title.connect(self.on_youtube_title)
+        worker.signals.finished.connect(self.on_youtube_finished)
+        worker.signals.cancelled.connect(self.on_youtube_cancelled)
+        self.active_youtube_downloads[entry["id"]] = worker
+        QThreadPool.globalInstance().start(worker)
 
     def enqueue_torrent_entry(self, entry):
         self.clear_empty_state()
@@ -701,6 +761,59 @@ class DownloadWindow(QWidget):
         self.maybe_handle_completion_action()
         self.queue_scheduler()
 
+    def on_youtube_progress(self, entry_id, percent, speed_text):
+        entry = self.entries.get(entry_id)
+        if not entry:
+            return
+        entry["status"] = "downloading"
+        entry["progress"] = int(percent or 0)
+        entry["speed_text"] = speed_text or ""
+        self.update_entry_visual(entry)
+        self.request_session_save()
+
+    def on_youtube_title(self, entry_id, title):
+        entry = self.entries.get(entry_id)
+        if not entry or not title:
+            return
+        entry["title"] = title
+        self.update_entry_visual(entry)
+        self.request_session_save()
+
+    def on_youtube_finished(self, entry_id, ok, error_text):
+        self.active_youtube_downloads.pop(entry_id, None)
+        entry = self.entries.get(entry_id)
+        if not entry or entry["status"] == "cancelled":
+            self.queue_scheduler()
+            return
+
+        if ok:
+            entry["status"] = "finished"
+            entry["progress"] = 100
+            entry["speed_text"] = ""
+            entry["error_text"] = ""
+        else:
+            entry["status"] = "error"
+            entry["speed_text"] = ""
+            entry["error_text"] = error_text or "La descarga de YouTube no se pudo completar."
+        self.update_entry_visual(entry)
+        self.request_session_save()
+        self.maybe_handle_completion_action()
+        self.queue_scheduler()
+
+    def on_youtube_cancelled(self, entry_id):
+        self.active_youtube_downloads.pop(entry_id, None)
+        entry = self.entries.get(entry_id)
+        if not entry:
+            self.queue_scheduler()
+            return
+
+        entry["status"] = "cancelled"
+        entry["speed_text"] = ""
+        self.update_entry_visual(entry)
+        self.request_session_save()
+        self.maybe_handle_completion_action()
+        self.queue_scheduler()
+
     # Entry actions
     def cancel_entry(self, entry_id):
         entry = self.entries.get(entry_id)
@@ -730,6 +843,13 @@ class DownloadWindow(QWidget):
                 except Exception:
                     pass
 
+        youtube_worker = self.active_youtube_downloads.get(entry_id)
+        if youtube_worker is not None:
+            try:
+                youtube_worker.cancel()
+            except Exception:
+                pass
+
         if entry["download_type"] == "torrent":
             entry["status"] = "cancelled"
             if entry.get("torrent_gid"):
@@ -739,6 +859,14 @@ class DownloadWindow(QWidget):
             else:
                 self.update_entry_visual(entry)
                 self.request_session_save()
+            return
+
+        if entry["download_type"] == "youtube":
+            entry["status"] = "cancelled"
+            entry["speed_text"] = ""
+            self.update_entry_visual(entry)
+            self.request_session_save()
+            self.queue_scheduler()
             return
 
         for link in entry.get("direct_links", []):
@@ -761,6 +889,9 @@ class DownloadWindow(QWidget):
         if entry["download_type"] == "torrent":
             entry["torrent_gid"] = ""
             entry["torrent_hash"] = ""
+            entry["speed_text"] = ""
+            entry["status"] = "waiting"
+        elif entry["download_type"] == "youtube":
             entry["speed_text"] = ""
             entry["status"] = "waiting"
         else:
@@ -933,6 +1064,46 @@ class DownloadWindow(QWidget):
             f"⚠ Archivo invalido para {entry['title']}. "
             f"Reintentando descarga ({entry['archive_retry_count']}/{MAX_CORRUPT_ARCHIVE_RETRIES})."
         )
+        return True
+
+    def retry_failed_entry(self, entry):
+        if not entry or entry.get("status") != "error":
+            return False
+
+        entry["error_text"] = ""
+        entry["progress"] = 0
+
+        if entry["download_type"] == "torrent":
+            entry["torrent_gid"] = ""
+            entry["torrent_hash"] = ""
+            entry["speed_text"] = ""
+            entry["status"] = "waiting"
+            self.update_entry_visual(entry)
+            self.request_session_save()
+            self.queue_scheduler()
+            return True
+
+        if entry["download_type"] == "youtube":
+            entry["speed_text"] = ""
+            entry["status"] = "waiting"
+            self.update_entry_visual(entry)
+            self.request_session_save()
+            self.queue_scheduler()
+            return True
+
+        if entry.get("direct_links"):
+            for link in entry["direct_links"]:
+                if link.get("status") == "finished":
+                    continue
+                link["status"] = "waiting"
+                link["progress"] = 0
+            self.recompute_regular_status(entry)
+        else:
+            entry["status"] = "waiting"
+
+        self.update_entry_visual(entry)
+        self.request_session_save()
+        self.queue_scheduler()
         return True
 
     def find_extractable_archive(self, entry):
@@ -1200,6 +1371,17 @@ class DownloadWindow(QWidget):
                 return f"Descargando torrent: {title}{speed_text}"
             return f"En espera: {title}"
 
+        if entry["download_type"] == "youtube":
+            if status == "finished":
+                return f"✅ YouTube completado: {title}"
+            if status == "cancelled":
+                return f"⏹ YouTube cancelado: {title}"
+            if status == "error":
+                return f"❌ Error YouTube: {title}"
+            if status == "downloading":
+                return f"Descargando YouTube: {title}{speed_text}"
+            return f"En espera YouTube: {title}"
+
         if status == "finished":
             return f"✅ Completado: {title}"
         if status == "cancelled":
@@ -1214,6 +1396,8 @@ class DownloadWindow(QWidget):
 
     def entry_progress(self, entry):
         if entry["download_type"] == "torrent":
+            return int(entry.get("progress", 0) or 0)
+        if entry["download_type"] == "youtube":
             return int(entry.get("progress", 0) or 0)
 
         direct_links = entry.get("direct_links", [])
@@ -1417,7 +1601,7 @@ class DownloadWindow(QWidget):
         return clean_name or name
 
     def has_active_work(self):
-        if self.active_file_downloads or self.active_resolutions or self.pending_torrent_entries:
+        if self.active_file_downloads or self.active_resolutions or self.active_youtube_downloads or self.pending_torrent_entries:
             return True
         return any(
             entry["status"] in {"downloading", "resolving"}
@@ -1480,6 +1664,12 @@ class DownloadWindow(QWidget):
 
     def prepare_session_for_shutdown(self):
         for entry in self.entries.values():
+            if entry["download_type"] == "youtube":
+                if entry["status"] == "downloading":
+                    entry["status"] = "waiting"
+                    entry["speed_text"] = ""
+                self.update_entry_visual(entry)
+                continue
             if entry["download_type"] != "regular":
                 continue
             if entry["status"] in {"downloading", "resolving"}:
@@ -1502,6 +1692,13 @@ class DownloadWindow(QWidget):
                 pass
         self.active_file_downloads.clear()
         self.worker_context.clear()
+
+        for worker in list(self.active_youtube_downloads.values()):
+            try:
+                worker.cancel()
+            except Exception:
+                pass
+        self.active_youtube_downloads.clear()
 
         for _entry_id, downloader in list(self.active_resolutions.items()):
             try:

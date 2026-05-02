@@ -6,6 +6,7 @@ from PyQt5.QtWidgets import (
     QSpinBox, QTextEdit, QVBoxLayout, QWidget,
 )
 from config import DEFAULT_CONFIG, load_config, normalize_path, save_config
+from download_manager.youtube import detect_youtube_mode, is_youtube_url
 
 
 class SettingsDialog(QDialog):
@@ -156,7 +157,6 @@ class DownloadDetailsDialog(QDialog):
 
             pass_input = QLineEdit()
             pass_input.setEchoMode(QLineEdit.Password)
-
             form.addRow(QLabel("<b>URL:</b>"), url_label)
             form.addRow("Contraseña:", pass_input)
 
@@ -187,11 +187,20 @@ class DownloadDetailsDialog(QDialog):
             path_input.setText(folder)
 
     def get_results(self):
-        return [{
-            "url": entry["url"],
-            "password": entry["password_widget"].text().strip(),
-            "path": normalize_path(entry["path_widget"].text().strip()),
-        } for entry in self.entries]
+        results = []
+        for entry in self.entries:
+            result = {
+                "url": entry["url"],
+                "password": entry["password_widget"].text().strip(),
+                "path": normalize_path(entry["path_widget"].text().strip()),
+            }
+            if is_youtube_url(entry["url"]):
+                youtube_mode = detect_youtube_mode(entry["url"])
+                result["download_type"] = "youtube"
+                result["youtube_mode"] = youtube_mode
+                result["title"] = "YouTube Playlist" if youtube_mode == "playlist" else "YouTube Video"
+            results.append(result)
+        return results
 
 
 class LinkInputWindow(QWidget):
