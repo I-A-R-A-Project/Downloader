@@ -8,8 +8,8 @@ import shutil
 import subprocess
 import requests
 from bs4 import BeautifulSoup
-from PyQt5.QtCore import QObject, QRunnable, pyqtSignal, pyqtSlot
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt6.QtCore import QObject, QRunnable, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QImage, QPixmap
 from config import CONFIG_PATH
 
 

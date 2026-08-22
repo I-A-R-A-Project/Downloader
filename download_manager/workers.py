@@ -1,5 +1,5 @@
 import os, requests, time
-from PyQt5.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
+from PyQt6.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
 from config import DEFAULT_CONFIG, load_config
 
 

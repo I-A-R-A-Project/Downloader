@@ -1,13 +1,13 @@
 import json, logging, os, re, subprocess, tempfile
 import webbrowser
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QComboBox, QLineEdit, QListWidget,
     QLabel, QListWidgetItem, QTextEdit, QPushButton,
     QMessageBox, QTreeWidget, QTreeWidgetItem
 )
-from PyQt5.QtGui import QMovie, QPixmap
-from PyQt5.QtCore import Qt, QTimer, QSize, QThreadPool, pyqtSignal
+from PyQt6.QtGui import QMovie, QPixmap
+from PyQt6.QtCore import Qt, QTimer, QSize, QThreadPool, pyqtSignal
 from media_search.anime_sources import search_aniteca, search_1337x, search_nyaa
 from media_search.game_sources import (
     RAWG_API_KEY,
@@ -61,7 +61,7 @@ class MultiChoiceDownloader(QWidget):
             if source=="Nyaa" or source=="1337x":
                 group_name+=f" - torrents"
             group_item = QTreeWidgetItem([group_name])
-            group_item.setFlags(group_item.flags() & ~Qt.ItemIsSelectable)
+            group_item.setFlags(group_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
             self.tree_widget.addTopLevelItem(group_item)
 
             aux={}
@@ -78,8 +78,8 @@ class MultiChoiceDownloader(QWidget):
 
                 if subgroup_text and subgroup_text not in aux:
                     subgroup_item = QTreeWidgetItem([subgroup_text])
-                    subgroup_item.setFlags(subgroup_item.flags() | Qt.ItemIsUserCheckable)
-                    subgroup_item.setCheckState(0, Qt.Unchecked)
+                    subgroup_item.setFlags(subgroup_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    subgroup_item.setCheckState(0, Qt.CheckState.Unchecked)
                     subgroup_item.setExpanded(True)
                     aux[subgroup_text] = subgroup_item
                     group_item.addChild(aux[subgroup_text])
@@ -87,9 +87,9 @@ class MultiChoiceDownloader(QWidget):
                 password = result.get("password")
 
                 child_item = QTreeWidgetItem([item_text])
-                child_item.setFlags(child_item.flags() | Qt.ItemIsUserCheckable)
-                child_item.setCheckState(0, Qt.Unchecked)
-                child_item.setData(0, Qt.UserRole, {
+                child_item.setFlags(child_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                child_item.setCheckState(0, Qt.CheckState.Unchecked)
+                child_item.setData(0, Qt.ItemDataRole.UserRole, {
                     "title": item_text,
                     "url": result["url"],
                     "password": password or "",
@@ -214,11 +214,11 @@ class MultiChoiceDownloader(QWidget):
                 if child.childCount() > 0:
                     for k in range(child.childCount()):
                         grandchild = child.child(k)
-                        if grandchild.checkState(0) == Qt.Checked:
+                        if grandchild.checkState(0) == Qt.CheckState.Checked:
                             self.pending += self.procesar_item_si_valido(grandchild, index)
                             index += 1
                 else:
-                    if child.checkState(0) == Qt.Checked:
+                    if child.checkState(0) == Qt.CheckState.Checked:
                         self.pending += self.procesar_item_si_valido(child, index)
                         index += 1
         if self.pending == 0:
@@ -227,7 +227,7 @@ class MultiChoiceDownloader(QWidget):
             QMessageBox.warning(self, "Nada seleccionado", "Por favor selecciona al menos un enlace.")
 
     def procesar_item_si_valido(self, item, index):
-                data = item.data(0, Qt.UserRole)
+                data = item.data(0, Qt.ItemDataRole.UserRole)
                 if data is not None:
                     self.results_temp.append((index, data, None))
                     worker = URLWorker(index, data["title"], data["url"])
@@ -312,7 +312,7 @@ class MediaSearchUI(QWidget):
         self.spinner_search_bar = QLabel()
         self.spinner_search_bar.setMovie(self.spinner_movie)
         self.spinner_search_bar.setFixedSize(24, 24)
-        self.spinner_search_bar.setAlignment(Qt.AlignCenter)
+        self.spinner_search_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.spinner_search_bar.setVisible(False)
         search_layout.addWidget(self.search_bar)
         search_layout.addWidget(self.search_button)
@@ -349,7 +349,7 @@ class MediaSearchUI(QWidget):
         self.spinner_details = QLabel()
         self.spinner_details.setMovie(self.spinner_movie)
         self.spinner_details.setFixedSize(24, 24)
-        self.spinner_details.setAlignment(Qt.AlignCenter)
+        self.spinner_details.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.spinner_details.setVisible(False)
         buttons.addWidget(self.trailer_button)
         buttons.addWidget(self.download_button)
@@ -368,7 +368,7 @@ class MediaSearchUI(QWidget):
         for _ in range(4):
             label = QLabel()
             label.setStyleSheet("font-weight: bold;")
-            label.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+            label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
             details_right.addWidget(label)
             self.labels_info.append(label)
         details_inner_layout.addLayout(details_right)
@@ -456,13 +456,13 @@ class MediaSearchUI(QWidget):
             return True
 
         msg = QMessageBox(self)
-        msg.setIcon(QMessageBox.Warning)
+        msg.setIcon(QMessageBox.Icon.Warning)
         msg.setWindowTitle("Carpeta no encontrada")
         msg.setText(f"{label} no existe:\n\n{folder_path}")
         msg.setInformativeText("¿Deseas crearla?")
-        create_btn = msg.addButton("Crear carpeta", QMessageBox.AcceptRole)
-        msg.addButton("Cancelar", QMessageBox.RejectRole)
-        msg.exec_()
+        create_btn = msg.addButton("Crear carpeta", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
         if msg.clickedButton() != create_btn:
             return False
 
@@ -486,7 +486,7 @@ class MediaSearchUI(QWidget):
 
     def open_paths_dialog(self):
         dialog = MediaPathsDialog(self)
-        if dialog.exec_() == dialog.Accepted:
+        if dialog.exec() == dialog.DialogCode.Accepted:
             config = load_config()
             self.download_paths = self.load_download_paths(config)
 
@@ -565,7 +565,7 @@ class MediaSearchUI(QWidget):
         existing_keys = set()
         if append:
             for i in range(self.results_list.count()):
-                data = self.results_list.item(i).data(Qt.UserRole) or {}
+                data = self.results_list.item(i).data(Qt.ItemDataRole.UserRole) or {}
                 existing_keys.add((data.get("source"), data.get("id"), data.get("url"), data.get("title")))
 
         for item in items:
@@ -593,7 +593,7 @@ class MediaSearchUI(QWidget):
         else:
             lw_item = QListWidgetItem(item['title'])
 
-        lw_item.setData(Qt.UserRole, item)
+        lw_item.setData(Qt.ItemDataRole.UserRole, item)
         self.results_list.addItem(lw_item)
         image_url = item.get("image")
         if image_url and image_url not in self.image_cache:
@@ -624,7 +624,7 @@ class MediaSearchUI(QWidget):
         }
 
         self.trailer_button.setEnabled(False)
-        data = item.data(Qt.UserRole)
+        data = item.data(Qt.ItemDataRole.UserRole)
         self.current_item = item
         self.current_image_url = data.get("image") or ""
         logger.info(
@@ -657,7 +657,7 @@ class MediaSearchUI(QWidget):
             if trailer:
                 self.trailer_button.setEnabled(True)
                 data["trailer"] = trailer
-                self.current_item.setData(Qt.UserRole, data)
+                self.current_item.setData(Qt.ItemDataRole.UserRole, data)
             self.download_button.setEnabled(True)
             self.download_button.setText("Descargar")
             self.mods_button.setEnabled(False)
@@ -754,7 +754,7 @@ class MediaSearchUI(QWidget):
         if image and not image.isNull():
             pixmap = QPixmap.fromImage(image)
             scaled = pixmap.scaled(
-                self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                self.image_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
             )
             self.image_cache[url] = scaled
             self.image_label.setPixmap(scaled)
@@ -775,24 +775,24 @@ class MediaSearchUI(QWidget):
     def apply_game_details_to_list(self, game_id, description, trailer_url):
         for index in range(self.results_list.count()):
             item = self.results_list.item(index)
-            data = item.data(Qt.UserRole) or {}
+            data = item.data(Qt.ItemDataRole.UserRole) or {}
             if data.get("source") != "RAWG" or data.get("id") != game_id:
                 continue
             data["description"] = description or "Sin descripción."
             data["trailer"] = trailer_url or None
-            item.setData(Qt.UserRole, data)
+            item.setData(Qt.ItemDataRole.UserRole, data)
 
     def apply_game_details_to_current(self, game_id, description, trailer_url):
         if not self.current_item:
             return
 
-        data = self.current_item.data(Qt.UserRole) or {}
+        data = self.current_item.data(Qt.ItemDataRole.UserRole) or {}
         if data.get("source") != "RAWG" or data.get("id") != game_id:
             return
 
         data["description"] = description or "Sin descripción."
         data["trailer"] = trailer_url or None
-        self.current_item.setData(Qt.UserRole, data)
+        self.current_item.setData(Qt.ItemDataRole.UserRole, data)
         self.details.setPlainText(data["description"])
         self.trailer_button.setEnabled(bool(data["trailer"]))
 
@@ -806,7 +806,7 @@ class MediaSearchUI(QWidget):
             return
         self.trailer_request_id = None
         if self.current_item:
-            trailer_url = normalize_trailer_url((self.current_item.data(Qt.UserRole) or {}).get("trailer"))
+            trailer_url = normalize_trailer_url((self.current_item.data(Qt.ItemDataRole.UserRole) or {}).get("trailer"))
             self.trailer_button.setEnabled(bool(trailer_url))
         else:
             self.trailer_button.setEnabled(False)
@@ -816,8 +816,8 @@ class MediaSearchUI(QWidget):
             return
 
         self.trailer_button.setEnabled(False)
-        trailer_url = normalize_trailer_url((self.current_item.data(Qt.UserRole) or {}).get("trailer"))
-        title = (self.current_item.data(Qt.UserRole) or {}).get("title", "").strip()
+        trailer_url = normalize_trailer_url((self.current_item.data(Qt.ItemDataRole.UserRole) or {}).get("trailer"))
+        title = (self.current_item.data(Qt.ItemDataRole.UserRole) or {}).get("title", "").strip()
         window_title = f"Trailer de {title}" if title else "Trailer"
         if not trailer_url:
             self.trailer_button.setEnabled(True)
@@ -882,7 +882,7 @@ class MediaSearchUI(QWidget):
         if image and not image.isNull() and url not in self.image_cache:
             pixmap = QPixmap.fromImage(image)
             self.image_cache[url] = pixmap.scaled(
-                self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                self.image_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
             )
         self.start_preload_images()
 
@@ -912,8 +912,8 @@ class MediaSearchUI(QWidget):
     def download_item(self):
         if not self.current_item:
             return
-        title = re.sub(r"\s*\([^)]*\)\s*$", "", self.current_item.data(Qt.UserRole)['title']).strip()
-        logger.info("UI download_item: source=%s title=%r", (self.current_item.data(Qt.UserRole) or {}).get("source"), title)
+        title = re.sub(r"\s*\([^)]*\)\s*$", "", self.current_item.data(Qt.ItemDataRole.UserRole)['title']).strip()
+        logger.info("UI download_item: source=%s title=%r", (self.current_item.data(Qt.ItemDataRole.UserRole) or {}).get("source"), title)
         if title in self.active_downloads:
             print(f"⏳ Ya se está buscando: {title}")
             return
@@ -954,7 +954,7 @@ class MediaSearchUI(QWidget):
                 self.active_downloads.discard(title)
 
                 if self.results_dict:
-                    item_category = self.category_for_item(self.current_item.data(Qt.UserRole) or {})
+                    item_category = self.category_for_item(self.current_item.data(Qt.ItemDataRole.UserRole) or {})
                     config_key, label = MEDIA_CATEGORY_PATHS[item_category]
                     download_path = self.download_paths.get(item_category) or DEFAULT_CONFIG[config_key]
                     if not self.ensure_download_path(download_path, f"Carpeta de descarga ({label})"):
@@ -979,7 +979,7 @@ class MediaSearchUI(QWidget):
 
         pool = QThreadPool.globalInstance()
         sources = [("Aniteca", search_aniteca), ("Nyaa", search_nyaa), ("1337x", search_1337x)]
-        current_source = (self.current_item.data(Qt.UserRole) or {}).get("source", "")
+        current_source = (self.current_item.data(Qt.ItemDataRole.UserRole) or {}).get("source", "")
         if current_source == "RAWG":
             sources = [("ElAmigos", search_elamigos), ("FitGirl", search_fitgirl), ("SteamRIP", search_steamrip)]
         elif current_source == "VNDB":
@@ -1000,7 +1000,7 @@ class MediaSearchUI(QWidget):
     def open_mods(self):
         if not self.current_item:
             return
-        data = self.current_item.data(Qt.UserRole) or {}
+        data = self.current_item.data(Qt.ItemDataRole.UserRole) or {}
         if data.get("source") != "RAWG":
             return
         title = data.get("title", "")

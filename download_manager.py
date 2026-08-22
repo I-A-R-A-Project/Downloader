@@ -1,7 +1,7 @@
 import os, sys, json, time
-from PyQt5.QtCore import QObject, QIODevice, QSharedMemory, QSystemSemaphore, QTimer, pyqtSignal, Qt
-from PyQt5.QtNetwork import QLocalServer, QLocalSocket
-from PyQt5.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtCore import QObject, QIODevice, QSharedMemory, QSystemSemaphore, QTimer, pyqtSignal, Qt
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+from PyQt6.QtWidgets import QApplication, QMessageBox
 from config import DEFAULT_CONFIG, load_config, save_config
 
 SERVER_NAME = "MediaSearchPrototype.DownloadManager"
@@ -224,7 +224,7 @@ if __name__ == '__main__':
     else:
         from download_manager.window import DownloadWindow
 
-    QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
 
@@ -269,4 +269,4 @@ if __name__ == '__main__':
     window.show()
     if entries:
         QTimer.singleShot(0, lambda items=entries: window.load_entries(items))
-    sys.exit(app.exec_())
+    sys.exit(app.exec())

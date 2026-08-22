@@ -1,11 +1,13 @@
 # Downloader
 
-GUI tools for searching media and managing downloads (HTTP + torrents) built with PyQt5.
+GUI tools for searching media and managing downloads (HTTP + torrents) built with PyQt6.
 
 ## Apps
 - `media_search.py`: search anime, manga, visual novels, and games; collect links; hand selected entries to `download_manager.py`.
 - `download_manager.py`: single-instance download manager for direct links and torrents.
-- `mod_search.py`: Factorio mod browser with dependency-aware cart and handoff to `download_manager.py`.
+- `mod_manager\`: browser-based mod managers for Minecraft and Factorio.
+- `mod_search\` and `mod_search.py`: legacy desktop mod browser, no longer
+  part of the normal workflow.
 
 ## Current capabilities
 
@@ -26,7 +28,9 @@ GUI tools for searching media and managing downloads (HTTP + torrents) built wit
   - `password`
   - `title`
 - Selected links for one result are grouped into a subfolder named after the result title.
-- RAWG Factorio entries expose `Ver mods` and open `mod_search.py`.
+- Mod managers are published at:
+  - Minecraft: https://minecraftmods-green.vercel.app/
+  - Factorio: https://factoriomods.vercel.app/
 
 ### `download_manager`
 - Single-instance window with local IPC handoff from secondary launches.
@@ -50,13 +54,17 @@ GUI tools for searching media and managing downloads (HTTP + torrents) built wit
 - Optional post-download extraction for direct-download archives using 7-Zip or WinRAR.
 - Optional deletion of the archive after successful extraction.
 
-### `mod_search`
-- Focused on Factorio today.
-- Browse updated, downloaded, and trending pages.
-- Search mods.
-- Open mod pages in tabs inside the app.
-- Add mods to a cart and resolve dependencies before sending downloads to `download_manager.py`.
-- Render sanitized HTML/Markdown descriptions locally.
+### `mod_manager`
+- Minecraft page searches Modrinth, filters by loader/version/category, selects
+  versions and required dependencies, persists a cart, and exports Downloader
+  JSON.
+- Factorio page searches and parses Mod Portal listings, filters by game
+  version/category/tag/expansion, resolves required dependencies, persists a
+  cart, exports Downloader JSON, and supports optional log-based version
+  detection.
+- `mod_manager` is one Vite + React app with `/minecraft` and `/factorio`
+  routes. It uses browser `localStorage` and builds to static files.
+- `mod_search` remains only as legacy Python code for reference or fallback.
 
 ## Supported direct-link handling in `download_manager`
 - Direct file URLs with common archive/installer/document extensions.
@@ -82,8 +90,8 @@ GUI tools for searching media and managing downloads (HTTP + torrents) built wit
 - Python 3.10+ recommended
 - Windows, Linux, or macOS with GUI support
 - Python packages:
-  - PyQt5
-  - PyQtWebEngine
+  - PyQt6
+  - PyQt6-WebEngine
   - requests
   - beautifulsoup4
 
@@ -93,7 +101,7 @@ Optional:
 
 ## Install
 ```bash
-pip install PyQt5 PyQtWebEngine requests beautifulsoup4
+pip install -r requirements.txt
 ```
 
 ## Usage
@@ -137,10 +145,21 @@ Expected JSON shape:
 ]
 ```
 
-### Mod browser
+### Mod managers
+
+Open deployed pages:
+
+- https://minecraftmods-green.vercel.app/
+- https://factoriomods.vercel.app/
+
+For local development:
+
 ```bash
-python mod_search.py --game factorio
+npm install
+npm run dev
 ```
+
+Open `/minecraft` or `/factorio`. Run `npm run build` for static deployment.
 
 ## Configuration
 Stored in `%APPDATA%\\MediaSearchPrototype\\config.json`.
@@ -156,8 +175,8 @@ Current config fields:
 - `auto_extract_archives`
 - `delete_archive_after_extract`
 - `max_parallel_downloads`
-- `factorio_mods_path`
-- `minecraft_mods_path`
+- `factorio_mods_path` and `minecraft_mods_path` are legacy settings used by
+  `mod_search`; web pages keep their own paths in `localStorage`.
 
 ## Session data
 - Download session: `%APPDATA%\\MediaSearchPrototype\\download_state.json`
@@ -197,7 +216,13 @@ There is no automated GUI/integration coverage yet for `download_manager` schedu
   - extraction lifecycle
 - Add integration tests or fixtures for `media_search` to `download_manager` handoff JSON shape.
 - Decide whether the `General` category in `media_search` should be implemented or removed from the UI.
-- Expand `mod_search` beyond Factorio, or document it as permanently Factorio-only.
+- Replace the Factorio `iara-downloads://` protocol placeholder with a real
+  Downloader handoff.
+- Add direct Downloader handoff to Minecraft page; currently it exports JSON or
+  starts browser downloads.
+- Port Factorio log dependency parsing, incompatible-mod detection, and
+  replacement suggestions from `mod_search` to the web page if those workflows
+  remain needed.
 - Review whether completed torrent downloads should also participate in the archive-extraction workflow; today extraction is only triggered for regular direct-download entries.
 - Move embedded API keys and other site-specific constants to user configuration or environment-based overrides.
 

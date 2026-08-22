@@ -4,7 +4,7 @@ import shutil
 import subprocess
 from urllib.parse import parse_qs, urlparse
 
-from PyQt5.QtCore import QObject, QRunnable, pyqtSignal
+from PyQt6.QtCore import QObject, QRunnable, pyqtSignal
 
 
 YOUTUBE_URL_RE = re.compile(r"^https?://(?:www\.)?(?:youtube\.com|youtu\.be)/", re.IGNORECASE)

@@ -1,5 +1,5 @@
 import sys
-from PyQt5.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication
 
 from media_search.logging_utils import configure_media_search_logging
 from media_search.window import MediaSearchUI
@@ -15,7 +15,7 @@ def main():
     app = QApplication(sys.argv)
     window = MediaSearchUI()
     window.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

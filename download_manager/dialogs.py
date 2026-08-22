@@ -1,6 +1,6 @@
 import os
-from PyQt5.QtCore import pyqtSignal
-from PyQt5.QtWidgets import (
+from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QComboBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
     QSpinBox, QTextEdit, QVBoxLayout, QWidget,
@@ -110,13 +110,13 @@ class SettingsDialog(QDialog):
         folder_path = normalize_path(self.folder_path_edit.text())
         if not os.path.exists(folder_path) or not os.path.isdir(folder_path):
             msg = QMessageBox(self)
-            msg.setIcon(QMessageBox.Critical)
+            msg.setIcon(QMessageBox.Icon.Critical)
             msg.setWindowTitle("Carpeta no encontrada")
             msg.setText("La carpeta especificada no existe:\n\n" + folder_path)
             msg.setInformativeText("¿Deseas crearla?")
-            create_btn = msg.addButton("Crear carpeta", QMessageBox.AcceptRole)
-            msg.addButton("Cancelar", QMessageBox.RejectRole)
-            msg.exec_()
+            create_btn = msg.addButton("Crear carpeta", QMessageBox.ButtonRole.AcceptRole)
+            msg.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+            msg.exec()
             if msg.clickedButton() == create_btn:
                 try:
                     os.makedirs(folder_path)
@@ -156,7 +156,7 @@ class DownloadDetailsDialog(QDialog):
             url_label.setWordWrap(True)
 
             pass_input = QLineEdit()
-            pass_input.setEchoMode(QLineEdit.Password)
+            pass_input.setEchoMode(QLineEdit.EchoMode.Password)
             form.addRow(QLabel("<b>URL:</b>"), url_label)
             form.addRow("Contraseña:", pass_input)
 
@@ -176,7 +176,10 @@ class DownloadDetailsDialog(QDialog):
                 "path_widget": path_input,
             })
 
-        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
@@ -232,7 +235,7 @@ class LinkInputWindow(QWidget):
 
     def open_settings_dialog(self):
         dialog = SettingsDialog(self)
-        if dialog.exec_() == QDialog.Accepted:
+        if dialog.exec() == QDialog.DialogCode.Accepted:
             apply_settings()
 
     def proceed(self):
@@ -243,7 +246,7 @@ class LinkInputWindow(QWidget):
         if not urls:
             return
         dialog = DownloadDetailsDialog(urls, self)
-        if dialog.exec_() == QDialog.Accepted:
+        if dialog.exec() == QDialog.DialogCode.Accepted:
             self.links = dialog.get_results()
             self.links_ready.emit(self.links)
             self.close()

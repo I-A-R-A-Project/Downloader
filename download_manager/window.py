@@ -7,8 +7,8 @@ import tempfile
 import uuid
 from enum import Enum
 
-from PyQt5.QtCore import QObject, QRunnable, QTimer, QThreadPool, pyqtSignal
-from PyQt5.QtWidgets import (
+from PyQt6.QtCore import QObject, QRunnable, QTimer, QThreadPool, pyqtSignal
+from PyQt6.QtWidgets import (
     QApplication, QDialog, QFrame, QGroupBox, QHBoxLayout, QLabel, QMessageBox,
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
@@ -1242,7 +1242,10 @@ class DownloadWindow(QWidget):
             return group
 
         box = QGroupBox(self._group_title(group_key))
-        box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        box.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Maximum,
+        )
         layout = QVBoxLayout(box)
         layout.setContentsMargins(2, 5, 2, 5)
         layout.setSpacing(5)
@@ -1257,8 +1260,11 @@ class DownloadWindow(QWidget):
         group = self._get_or_create_group(group_key)
 
         container = QFrame()
-        container.setFrameShape(QFrame.StyledPanel)
-        container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        container.setFrameShape(QFrame.Shape.StyledPanel)
+        container.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Maximum,
+        )
 
         layout = QVBoxLayout(container)
         layout.setContentsMargins(5, 5, 5, 5)
@@ -1466,7 +1472,7 @@ class DownloadWindow(QWidget):
 
     def open_settings_dialog(self):
         dialog = SettingsDialog(self)
-        if dialog.exec_() == QDialog.Accepted:
+        if dialog.exec() == QDialog.DialogCode.Accepted:
             (
                 self.folder_path,
                 self.open_on_finish,
@@ -1657,10 +1663,10 @@ class DownloadWindow(QWidget):
             self,
             "Cerrar descargas",
             "Hay descargas en curso. Si cerras ahora, se cancelara el trabajo activo.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
-        return answer == QMessageBox.Yes
+        return answer == QMessageBox.StandardButton.Yes
 
     def prepare_session_for_shutdown(self):
         for entry in self.entries.values():

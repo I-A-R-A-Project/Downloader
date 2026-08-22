@@ -1,5 +1,5 @@
 import os, threading, json, requests, subprocess, time, tempfile, zipfile, base64
-from PyQt5.QtCore import QRunnable, pyqtSignal, QObject
+from PyQt6.QtCore import QRunnable, pyqtSignal, QObject
 
 ARIA2_RPC_URL = "http://localhost:6800/jsonrpc"
 ARIA2_SECRET = "aria2rpc"

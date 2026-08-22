@@ -9,7 +9,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from urllib.parse import urlparse
 
 import requests
-from PyQt5.QtCore import QEventLoop
+from PyQt6.QtCore import QEventLoop
 
 from config import APPDATA, DEFAULT_CONFIG, load_config, normalize_path
 from download_manager.browser import UniversalDownloader
@@ -399,7 +399,7 @@ class TuiDownloadManager:
 
         start_next()
         if pending_entries or active_downloaders:
-            loop.exec_()
+            loop.exec()
 
         return all(results) if results else True
 
@@ -419,7 +419,7 @@ class TuiDownloadManager:
 
         downloader.direct_links_ready.connect(_finish)
         downloader.start()
-        loop.exec_()
+        loop.exec()
         try:
             downloader.close()
             downloader.deleteLater()

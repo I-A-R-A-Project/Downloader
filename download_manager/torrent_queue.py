@@ -1,5 +1,5 @@
 import os, tempfile, requests
-from PyQt5.QtCore import QObject, QRunnable, pyqtSignal
+from PyQt6.QtCore import QObject, QRunnable, pyqtSignal
 from download_manager.torrent import add_magnet_link, add_torrent_file
 
 class TorrentProcessorSignals(QObject):

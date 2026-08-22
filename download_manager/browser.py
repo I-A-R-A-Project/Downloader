@@ -1,7 +1,8 @@
 import os, re, time, traceback, uuid, requests
 from urllib.parse import parse_qs, unquote, urlparse
-from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineProfile
-from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QUrl, QTimer, pyqtSignal, Qt
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
+from PyQt6.QtCore import QObject, QRunnable, QThreadPool, QUrl, QTimer, pyqtSignal, Qt
 from bs4 import BeautifulSoup
 from download_manager.gdrive_handler import (
     parse_gdrive_folder_id, parse_gdrive_file_id, resolve_gdrive_file,
@@ -439,8 +440,8 @@ class UniversalDownloader(QWebEngineView):
     def __init__(self, urls):
         super().__init__()
         profile = QWebEngineProfile(f"universal-downloader-{uuid.uuid4().hex[:8]}", self)
-        profile.setPersistentCookiesPolicy(QWebEngineProfile.NoPersistentCookies)
-        profile.setHttpCacheType(QWebEngineProfile.MemoryHttpCache)
+        profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
+        profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
         profile.downloadRequested.connect(self.on_download_requested)
         cookie_store = profile.cookieStore()
         cookie_store.cookieAdded.connect(self.on_cookie_added)
@@ -494,7 +495,7 @@ class UniversalDownloader(QWebEngineView):
         self._gofile_clicked_urls = set()
 
         self.setWindowTitle("Universal Downloader")
-        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         self.loadFinished.connect(self.on_load_finished)
         self.page().windowCloseRequested.connect(self.on_window_close_requested)
         self.renderProcessTerminated.connect(self.on_render_process_terminated)

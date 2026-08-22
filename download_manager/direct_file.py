@@ -1,6 +1,6 @@
 import os, re, requests
 from urllib.parse import urlparse
-from PyQt5.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
+from PyQt6.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
 
 
 def build_download_path(base_path, *parts):

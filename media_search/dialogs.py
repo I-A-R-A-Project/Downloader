@@ -1,8 +1,8 @@
 import os
 
-from PyQt5.QtCore import QTimer, Qt
-from PyQt5.QtGui import QKeyEvent
-from PyQt5.QtWidgets import (
+from PyQt6.QtCore import QEvent, QTimer, Qt
+from PyQt6.QtGui import QKeyEvent
+from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
     QDialog,
@@ -13,7 +13,8 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QVBoxLayout,
 )
-from PyQt5.QtWebEngineWidgets import QWebEnginePage, QWebEngineView
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebEngineCore import QWebEnginePage
 
 from config import DEFAULT_CONFIG, load_config, save_config
 
@@ -62,9 +63,9 @@ class TrailerWindow(QDialog):
     def simulate_k_keypress(self):
         if not self.web_view:
             return
-        event = QKeyEvent(QKeyEvent.KeyPress, Qt.Key_K, Qt.NoModifier, "k")
+        event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_K, Qt.KeyboardModifier.NoModifier, "k")
         QApplication.postEvent(self.web_view.focusProxy(), event)
-        event_release = QKeyEvent(QKeyEvent.KeyRelease, Qt.Key_K, Qt.NoModifier, "k")
+        event_release = QKeyEvent(QEvent.Type.KeyRelease, Qt.Key.Key_K, Qt.KeyboardModifier.NoModifier, "k")
         QApplication.postEvent(self.web_view.focusProxy(), event_release)
 
     def closeEvent(self, event):
@@ -128,13 +129,13 @@ class MediaPathsDialog(QDialog):
             return True
 
         msg = QMessageBox(self)
-        msg.setIcon(QMessageBox.Warning)
+        msg.setIcon(QMessageBox.Icon.Warning)
         msg.setWindowTitle("Carpeta no encontrada")
         msg.setText(f"{label} no existe:\n\n{folder_path}")
         msg.setInformativeText("¿Deseas crearla?")
-        create_btn = msg.addButton("Crear carpeta", QMessageBox.AcceptRole)
-        msg.addButton("Cancelar", QMessageBox.RejectRole)
-        msg.exec_()
+        create_btn = msg.addButton("Crear carpeta", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
         if msg.clickedButton() != create_btn:
             return False
 
