@@ -53,7 +53,10 @@ class SingleInstanceBridge(QObject):
         data = json.dumps(payload).encode("utf-8") + b"\n"
         for attempt in range(attempts):
             socket = QLocalSocket(self)
-            socket.connectToServer(self.server_name, QIODevice.ReadWrite)
+            socket.connectToServer(
+                self.server_name,
+                QIODevice.OpenModeFlag.ReadWrite,
+            )
             if socket.waitForConnected(wait_ms):
                 if socket.write(data) == -1:
                     socket.abort()
@@ -122,7 +125,10 @@ class SingleInstanceBridge(QObject):
 
     def _can_connect_to_primary(self):
         probe = QLocalSocket(self)
-        probe.connectToServer(self.server_name, QIODevice.WriteOnly)
+        probe.connectToServer(
+            self.server_name,
+            QIODevice.OpenModeFlag.WriteOnly,
+        )
         connected = probe.waitForConnected(300)
         if connected:
             probe.disconnectFromServer()

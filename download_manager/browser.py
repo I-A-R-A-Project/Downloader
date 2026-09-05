@@ -1613,7 +1613,7 @@ class UniversalDownloader(QWebEngineView):
         ext = os.path.splitext(path)[1].lower()
         direct_exts = {
             ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
-            ".iso", ".exe", ".msi", ".apk", ".pdf", ".cbz", ".cbr"
+            ".iso", ".exe", ".msi", ".apk", ".pdf", ".epub", ".cbz", ".cbr"
         }
         return ext in direct_exts
 

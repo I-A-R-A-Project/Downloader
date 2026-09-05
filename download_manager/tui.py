@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 import requests
 from PyQt6.QtCore import QEventLoop
 
-from config import APPDATA, DEFAULT_CONFIG, load_config, normalize_path
+from config import DATA_DIR, DEFAULT_CONFIG, load_config, normalize_path
 from download_manager.browser import UniversalDownloader
 from download_manager.direct_file import build_download_path, resolve_direct_filename
 from download_manager.torrent import Aria2Client, ensure_aria2_running
@@ -30,7 +30,7 @@ DIRECT_EXTENSIONS = {
     ".iso", ".exe", ".msi", ".apk", ".pdf", ".cbz", ".cbr",
 }
 ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z"}
-SESSION_PATH = os.path.join(APPDATA, "MediaSearchPrototype", "download_state.json")
+SESSION_PATH = os.path.join(str(DATA_DIR), "download_state.json")
 
 
 def run_tui_download_manager(app, entries):

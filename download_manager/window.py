@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
-from config import APPDATA, DEFAULT_CONFIG, load_config, normalize_path
+from config import DATA_DIR, DEFAULT_CONFIG, load_config, normalize_path
 from download_manager.browser import UniversalDownloader
 from download_manager.dialogs import LinkInputWindow, SettingsDialog, apply_settings
 from download_manager.torrent import Aria2Client, TorrentUpdater, ensure_aria2_running
@@ -22,7 +22,7 @@ from download_manager.workers import DownloadSignals, FileDownloader
 from download_manager.youtube import YtDlpDownloadWorker, detect_youtube_mode, is_youtube_url
 
 
-SESSION_PATH = os.path.join(APPDATA, "MediaSearchPrototype", "download_state.json")
+SESSION_PATH = os.path.join(str(DATA_DIR), "download_state.json")
 ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z"}
 MAX_RESOLUTION_RETRIES = 3
 MAX_CORRUPT_ARCHIVE_RETRIES = 2
@@ -1344,9 +1344,17 @@ class DownloadWindow(QWidget):
             item["delete_button"].setEnabled(True)
             item["delete_button"].show()
             item["bar"].hide()
-        elif entry["status"] in {"finished", "error"}:
+        elif entry["status"] == "finished":
             item["cancel_button"].setEnabled(False)
             item["cancel_button"].hide()
+            item["resume_button"].setEnabled(False)
+            item["resume_button"].hide()
+            item["delete_button"].setEnabled(False)
+            item["delete_button"].hide()
+            item["bar"].hide()
+        elif entry["status"] == "error":
+            item["cancel_button"].setEnabled(True)
+            item["cancel_button"].show()
             item["resume_button"].setEnabled(False)
             item["resume_button"].hide()
             item["delete_button"].setEnabled(False)

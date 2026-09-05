@@ -1,232 +1,157 @@
 # Downloader
 
-GUI tools for searching media and managing downloads (HTTP + torrents) built with PyQt6.
+Herramientas GUI para buscar media y gestionar descargas (HTTP + torrents)
+construidas con PyQt6.
 
 ## Apps
-- `media_search.py`: search anime, manga, visual novels, and games; collect links; hand selected entries to `download_manager.py`.
-- `download_manager.py`: single-instance download manager for direct links and torrents.
-- `mod_manager\`: browser-based mod managers for Minecraft and Factorio.
-- `mod_search\` and `mod_search.py`: legacy desktop mod browser, no longer
-  part of the normal workflow.
 
-## Current capabilities
+- `media_search.py`: busca anime, manga, visual novels y juegos; recolecta
+  links; entrega las entradas seleccionadas a `download_manager.py`.
+- `download_manager.py`: gestor de instancia única para links directos y
+  torrents.
+- `mod_manager/`: un gestor web de mods en Vite + React con rutas `/minecraft`
+  y `/factorio`, ahora mantenido como app separada a nivel raíz.
+- `mod_search.py` y `mod_search/`: navegador legacy de mods en PyQt.
 
-### `media_search`
-- Search sources:
-  - Anime and manga via Jikan/MyAnimeList
-  - Visual novels via VNDB Kana
-  - Games via RAWG
-- Download link collection:
-  - Anime and manga: Aniteca, Nyaa, 1337x
-  - Games: ElAmigos, FitGirl, SteamRIP
-  - Visual novels: Nyaa, 1337x, ElAmigos, FitGirl, SteamRIP
-- Per-category download folders from config.
-- Link selector groups releases by subgroup metadata instead of repeating that text on every item.
-- Selected entries are sent to `download_manager.py` with:
-  - `url`
-  - `path`
-  - `password`
-  - `title`
-- Selected links for one result are grouped into a subfolder named after the result title.
-- Mod managers are published at:
-  - Minecraft: https://minecraftmods-green.vercel.app/
-  - Factorio: https://factoriomods.vercel.app/
+## Mod manager
 
-### `download_manager`
-- Single-instance window with local IPC handoff from secondary launches.
-- Accepts:
-  - direct CLI URLs
-  - magnet links
-  - `.torrent` URLs
-  - JSON entry lists
-- Persists download session to `%APPDATA%\\MediaSearchPrototype\\download_state.json`.
-- Restores saved items on startup, including waiting, cancelled, downloading, finished, and torrent entries.
-- Scheduler respects `max_parallel_downloads` for regular downloads and does not resolve more direct links once the parallel limit is full.
-- UI states:
-  - `En espera`
-  - `Resolviendo`
-  - `Descargando`
-  - `Completado`
-  - `Cancelado`
-  - `Error`
-- Cancelled items can be resumed or removed from the session.
-- Password hints are also appended to `__passwords__.txt` inside the target folder.
-- Optional post-download extraction for direct-download archives using 7-Zip or WinRAR.
-- Optional deletion of the archive after successful extraction.
+La app web canónica es `mod_manager/` a nivel raíz. Comparte una plantilla de
+React y un build de Vite para ambas rutas:
 
-### `mod_manager`
-- Minecraft page searches Modrinth, filters by loader/version/category, selects
-  versions and required dependencies, persists a cart, and exports Downloader
-  JSON.
-- Factorio page searches and parses Mod Portal listings, filters by game
-  version/category/tag/expansion, resolves required dependencies, persists a
-  cart, exports Downloader JSON, and supports optional log-based version
-  detection.
-- `mod_manager` is one Vite + React app with `/minecraft` and `/factorio`
-  routes. It uses browser `localStorage` and builds to static files.
-- `mod_search` remains only as legacy Python code for reference or fallback.
+- `/minecraft` usa Modrinth para búsqueda, filtros, selección de archivo/
+  versión, dependencias necesarias, carrito, descargas directas, exportación
+  JSON y handoff opcional al Downloader.
+- `/factorio` usa listados de Mod Portal a través de un proxy CORS configurable,
+  `re146.dev` para metadatos/dependencias y `mods-storage.re146.dev` para
+  archivos. Añade filtros de Factorio, resolución de dependencias y manejo
+  opcional de `factorio-current.log`.
 
-## Supported direct-link handling in `download_manager`
-- Direct file URLs with common archive/installer/document extensions.
-- MediaFire:
-  - files via API first, HTML fallback
-  - folders via API first, HTML fallback
-- Google Drive:
-  - files via API/session-based direct resolution
-  - folders by clicking `Descargar todo` in the embedded browser and capturing the generated ZIP request
-- 4shared
-- FileCrypt containers and link pages
-- Interactive host automation:
-  - Rapidgator
-  - DDownload
-  - DDL.to
-  - FuckingFast
-  - DataNodes
-  - MegaDB
-  - GoFile
-- Torrents and magnet links through Aria2 RPC
-
-## Requirements
-- Python 3.10+ recommended
-- Windows, Linux, or macOS with GUI support
-- Python packages:
-  - PyQt6
-  - PyQt6-WebEngine
-  - requests
-  - beautifulsoup4
-
-Optional:
-- `aria2c` for torrents. The repo already includes `aria2c.exe` for Windows.
-- `7z.exe` or WinRAR for archive extraction.
-
-## Install
-```bash
-pip install -r requirements.txt
-```
-
-## Usage
-
-### Media search
-```bash
-python media_search.py
-```
-
-Notes:
-- Searchable categories currently implemented: `Anime`, `Manga`, `Visual Novel`, `Games`.
-- `General` exists in the UI but does not dispatch a search worker yet.
-- RAWG uses the API key embedded in [media_search/game_sources.py](/C:/Users/Nexxus/Desktop/Downloader/media_search/game_sources.py).
-- VNDB search, image caching, and trailer launch are handled from [media_search/workers.py](/C:/Users/Nexxus/Desktop/Downloader/media_search/workers.py).
-
-### Download manager
-Open the manager:
-```bash
-python download_manager.py
-```
-
-Pass one or more URLs:
-```bash
-python download_manager.py "https://www.mediafire.com/file/..." "magnet:?xt=urn:btih:..."
-```
-
-Pass a JSON file containing entries:
-```bash
-python download_manager.py input.json
-```
-
-Expected JSON shape:
-```json
-[
-  {
-    "url": "https://example.com/file",
-    "path": "C:\\Users\\User\\Downloads\\Game",
-    "password": "",
-    "title": "Game"
-  }
-]
-```
-
-### Mod managers
-
-Open deployed pages:
-
-- https://minecraftmods-green.vercel.app/
-- https://factoriomods.vercel.app/
-
-For local development:
+Desde `IARA/mod_manager`:
 
 ```bash
 npm install
 npm run dev
+npm run build
+npm run preview
 ```
 
-Open `/minecraft` or `/factorio`. Run `npm run build` for static deployment.
+Las URLs de desarrollo son `/minecraft` y `/factorio`. `npm run build` genera
+archivos estáticos en `dist/`, incluyendo índices de ruta para navegación
+directa. Publicá `dist/` en un host estático; `vercel.json` reescribe ambos
+prefijos para Vercel.
 
-## Configuration
-Stored in `%APPDATA%\\MediaSearchPrototype\\config.json`.
+### Proxy
 
-Current config fields:
-- `folder_path`
-- `general_folder_path`
-- `anime_folder_path`
-- `manga_folder_path`
-- `vn_folder_path`
-- `games_folder_path`
-- `open_on_finish`
-- `auto_extract_archives`
-- `delete_archive_after_extract`
-- `max_parallel_downloads`
-- `factorio_mods_path` and `minecraft_mods_path` are legacy settings used by
-  `mod_search`; web pages keep their own paths in `localStorage`.
+La URL del proxy y su estado activo son configurables desde el diálogo de
+Settings de cada ruta y se guardan en el `localStorage` del navegador.
+Minecraft usa Modrinth directamente por defecto y considera el proxy opcional.
+Factorio activa el proxy desplegado
+`https://factoriomods.supermaty97.workers.dev` por defecto porque Mod Portal
+normalmente necesita CORS. Los proxies deben exponer `/fetch?url=<encoded-url>`
+y enviar headers CORS.
 
-## Session data
-- Download session: `%APPDATA%\\MediaSearchPrototype\\download_state.json`
-- Media caches also live under `%APPDATA%\\MediaSearchPrototype\\...`
+### Storage del navegador
 
-The saved session currently preserves:
-- target path
-- original URL
-- resolved direct links
-- password
-- state
-- progress
-- torrent identifiers
-- extraction state
+Claves canónicas:
+
+- Minecraft: `modrinthSearchSettings`, `modrinthSearchCart`
+- Factorio: `modSearchSettings`, `modSearchCart`
+
+La app React también lee aliases antiguos
+(`minecraftModSettings`/`minecraftModCart` y
+`factorioModSettings`/`factorioModCart`), normaliza nombres viejos del carrito
+y escribe el resultado en las claves canónicas. No borra las claves viejas.
+El storage está acotado al origen del navegador.
+
+### Protocolo de handoff al Downloader
+
+El handoff del carrito crea entradas con forma
+`{url, path, password, title}`, codifica la lista JSON en UTF-8 base64url y
+navega a:
+
+```text
+iara-downloads://add-mods?payload=<base64url-json>
+```
+
+Esto requiere el protocol handler instalado por `installer/`. El receptor
+decodifica el payload y abre el ejecutable del Downloader. Para construir el
+instalador Windows, ver `..\installer\README.md`. El fallback fiable sigue
+siendo `Export JSON` y luego:
+
+```bash
+python download_manager.py modrinth_cart.json
+python download_manager.py mod_search_cart.json
+```
+
+Las páginas estáticas viejas fueron removidas. Los cambios web nuevos van en
+`mod_manager/src/`, y el workflow legacy de `mod_search.py` queda fuera del
+flujo React.
+
+## Capacidades actuales
+
+### `media_search`
+
+- Fuentes de búsqueda:
+  - Anime y manga vía Jikan/MyAnimeList
+  - Visual novels vía VNDB Kana
+  - Juegos vía RAWG
+- Recolección de links de descarga:
+  - Anime y manga: Aniteca, Nyaa, 1337x
+  - Juegos: ElAmigos, FitGirl, SteamRIP
+  - Visual novels: Nyaa, 1337x, ElAmigos, FitGirl, SteamRIP
+- Carpetas de descarga por categoría desde configuración.
+- Las entradas seleccionadas se envían a `download_manager.py` con `url`,
+  `path`, `password` y `title`.
+
+### `download_manager`
+
+- Ventana de instancia única con IPC local desde lanzamientos secundarios.
+- Acepta URLs directas de CLI, magnet links, URLs `.torrent` y listas JSON.
+- Persiste sesiones en `%APPDATA%\\IARA\\Downloader\\download_state.json`.
+- El scheduler respeta `max_parallel_downloads` para descargas regulares.
+- Soporta cancelación/reanudación, extracción opcional de archivos y borrado
+  opcional del archivo comprimido.
+
+## Requisitos
+
+- Python 3.10+ recomendado
+- Windows, Linux o macOS con soporte GUI
+- `PyQt6`, `PyQt6-WebEngine`, `requests`, `beautifulsoup4`
+- Opcional: `aria2c` para torrents; `7z.exe` o WinRAR para extracción
+
+## Instalación y uso
+
+```bash
+pip install -r requirements.txt
+python media_search.py
+python download_manager.py
+python mod_search.py --game factorio
+```
+
+## Configuración y datos de sesión
+
+`%APPDATA%\\IARA\\Downloader\\config.json` guarda carpetas de descarga,
+configuración de extracción, concurrencia HTTP y paths legacy de mods. Las
+rutas de mods web quedan en `localStorage` del navegador.
+
+La sesión de descarga conserva rutas objetivo, URLs originales/resueltas,
+passwords, estado, progreso, identificadores torrent y estado de extracción.
 
 ## Tests
-Run with:
+
 ```bash
 python -m pytest -q
 ```
 
-Current automated coverage is focused on parsing and data transformation:
-- Aniteca mapping
-- anime torrent search parsing
-- game source parsing
-- mod description rendering
+La cobertura principal es parsing y transformación de datos. No hay cobertura
+completa de integración para scheduler, IPC, restore de sesión, resolución de
+hosts por browser ni reconciliación de torrents.
 
-There is no automated GUI/integration coverage yet for `download_manager` scheduling, IPC, or browser-driven host flows.
+## Limitaciones conocidas
 
-## TODO / what still needs completion
-- Implement more downstream host flows in [download_manager/browser.py](/C:/Users/Nexxus/Desktop/Downloader/download_manager/browser.py) for mirrors surfaced by ElAmigos, FitGirl, and SteamRIP when the manager still opens the page but fails to capture a final file URL.
-- Add automated tests for `download_manager`:
-  - session restore
-  - scheduler slot usage
-  - resume/cancel/delete flows
-  - torrent reconciliation
-  - extraction lifecycle
-- Add integration tests or fixtures for `media_search` to `download_manager` handoff JSON shape.
-- Decide whether the `General` category in `media_search` should be implemented or removed from the UI.
-- Replace the Factorio `iara-downloads://` protocol placeholder with a real
-  Downloader handoff.
-- Add direct Downloader handoff to Minecraft page; currently it exports JSON or
-  starts browser downloads.
-- Port Factorio log dependency parsing, incompatible-mod detection, and
-  replacement suggestions from `mod_search` to the web page if those workflows
-  remain needed.
-- Review whether completed torrent downloads should also participate in the archive-extraction workflow; today extraction is only triggered for regular direct-download entries.
-- Move embedded API keys and other site-specific constants to user configuration or environment-based overrides.
-
-## Notes
-- If a site search finds mirrors but `download_manager` cannot reach a final direct file URL, treat that as a capability gap in `download_manager`, not in `media_search`.
-- VikingFile remains intentionally disabled because the embedded browser flow does not load it correctly yet.
-- Use only sources you are authorized to access and comply with local laws and site terms.
+- Algunos mirrors que aparecen en `media_search` todavía no tienen resolución
+  confiable del host final en `download_manager/browser.py`; eso se trata como
+  gap de capacidad del Downloader.
+- `media_search` sigue dejando una categoría `General` sin worker de búsqueda.
+- Los torrents completados no entran al flujo regular de extracción.
+- Hay API keys y constantes del sitio embebidas en el código fuente.

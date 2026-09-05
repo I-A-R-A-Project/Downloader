@@ -1,11 +1,17 @@
 import json
 import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from web_common.paths import app_data_dir
 
 
 APPDATA = os.environ.get("APPDATA", os.path.expanduser("~"))
 USERPROFILE = os.environ.get("USERPROFILE", os.path.expanduser("~"))
 
-CONFIG_PATH = os.path.join(APPDATA, "MediaSearchPrototype", "config.json")
+DATA_DIR = app_data_dir("Downloader")
+CONFIG_PATH = str(DATA_DIR / "config.json")
 DEFAULT_CONFIG = {
     "folder_path": os.path.join(USERPROFILE, "Downloads"),
     "general_folder_path": os.path.join(USERPROFILE, "Downloads"),
