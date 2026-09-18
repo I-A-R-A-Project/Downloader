@@ -4,6 +4,7 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PyQt6.QtCore import QObject, QRunnable, QThreadPool, QUrl, QTimer, pyqtSignal, Qt
 from bs4 import BeautifulSoup
+from download_manager.direct_file import is_direct_file_url
 from download_manager.gdrive_handler import (
     parse_gdrive_folder_id, parse_gdrive_file_id, resolve_gdrive_file,
 )
@@ -500,13 +501,15 @@ class UniversalDownloader(QWebEngineView):
         self.page().windowCloseRequested.connect(self.on_window_close_requested)
         self.renderProcessTerminated.connect(self.on_render_process_terminated)
         self._started = False
+        self._closed = False
+        self._completion_emitted = False
 
     def start(self):
-        if self._started:
+        if self._started or self._closed:
             return
         self._started = True
         if not self.urls:
-            QTimer.singleShot(0, lambda: self.direct_links_ready.emit(self.offscreen_results))
+            QTimer.singleShot(0, lambda: self.emit_results(self.offscreen_results))
             self.close()
             return
         if self.urls:
@@ -558,7 +561,7 @@ class UniversalDownloader(QWebEngineView):
 
     def on_load_finished(self, ok=True):
         try:
-            if self.current_index >= len(self.urls):
+            if self._closed or self.current_index >= len(self.urls):
                 return
             source_url = self.current_source_url()
             print(self.urls[self.current_index])
@@ -571,9 +574,10 @@ class UniversalDownloader(QWebEngineView):
             print(traceback.format_exc())
 
     def process_current_url(self):
+        if self._closed:
+            return
         if not self.urls:
-            self.direct_links_ready.emit(self.results)
-            self.close()
+            self.finish(self.results)
             return
         url, path = self.urls[self.current_index]
         self._filecrypt_wait_attempts = 0
@@ -595,7 +599,7 @@ class UniversalDownloader(QWebEngineView):
 
     def route_url_handling(self):
         try:
-            if self.current_index >= len(self.urls):
+            if self._closed or self.current_index >= len(self.urls):
                 return
             url, path = self.urls[self.current_index]
             if "mediafire.com" in url:
@@ -621,7 +625,7 @@ class UniversalDownloader(QWebEngineView):
             print(traceback.format_exc())
 
     def route_url_handling_for(self, source_url):
-        if source_url != self.current_source_url():
+        if self._closed or source_url != self.current_source_url():
             return
         self.route_url_handling()
 
@@ -1490,12 +1494,29 @@ class UniversalDownloader(QWebEngineView):
         self.proceed_to_next()
 
     def proceed_to_next(self):
+        if self._closed:
+            return
         self.current_index += 1
         if self.current_index < len(self.urls):
             QTimer.singleShot(0, self.process_current_url)
         else:
-            self.direct_links_ready.emit(self.results)
-            self.close()
+            self.finish(self.results)
+
+    def emit_results(self, results):
+        if self._completion_emitted or self._closed:
+            return
+        self._completion_emitted = True
+        try:
+            self.direct_links_ready.emit(results)
+        except RuntimeError as error:
+            print(f"❌ No se pudieron emitir resultados del navegador: {error}")
+
+    def finish(self, results):
+        if self._closed:
+            return
+        self.emit_results(results)
+        self._closed = True
+        self.close()
 
     def extract_mediafire_folder_key(self, url):
         match = re.search(r"/folder/([^/]+)", url)
@@ -1606,16 +1627,7 @@ class UniversalDownloader(QWebEngineView):
         self.resolve_mediafire_file_async(url, current_path)
 
     def is_direct_file_url(self, url):
-        parsed = urlparse(url)
-        if is_interactive_download_host(url):
-            return False
-        path = parsed.path or ""
-        ext = os.path.splitext(path)[1].lower()
-        direct_exts = {
-            ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
-            ".iso", ".exe", ".msi", ".apk", ".pdf", ".epub", ".cbz", ".cbr"
-        }
-        return ext in direct_exts
+        return is_direct_file_url(url)
 
     def handle_direct_file(self, url, current_path):
         request = (self.current_index, url, current_path)

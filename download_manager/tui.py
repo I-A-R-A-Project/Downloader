@@ -13,7 +13,11 @@ from PyQt6.QtCore import QEventLoop
 
 from config import DATA_DIR, DEFAULT_CONFIG, load_config, normalize_path
 from download_manager.browser import UniversalDownloader
-from download_manager.direct_file import build_download_path, resolve_direct_filename
+from download_manager.direct_file import (
+    build_download_path,
+    is_direct_file_url,
+    resolve_direct_filename,
+)
 from download_manager.torrent import Aria2Client, ensure_aria2_running
 from download_manager.window import ArchiveExtractWorker
 from download_manager.youtube import detect_youtube_mode, is_youtube_url, run_yt_dlp_download
@@ -25,10 +29,6 @@ except ImportError as exc:
 
 
 CHUNK_SIZE = 8192
-DIRECT_EXTENSIONS = {
-    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
-    ".iso", ".exe", ".msi", ".apk", ".pdf", ".cbz", ".cbr",
-}
 ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z"}
 SESSION_PATH = os.path.join(str(DATA_DIR), "download_state.json")
 
@@ -269,8 +269,7 @@ class TuiDownloadManager:
         return lower_url.startswith("magnet:?") or lower_url.endswith(".torrent")
 
     def is_direct_file_url(self, url):
-        ext = os.path.splitext(urlparse(url).path or "")[1].lower()
-        return ext in DIRECT_EXTENSIONS
+        return is_direct_file_url(url)
 
     def log(self, message):
         with self._print_lock:

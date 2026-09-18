@@ -3,6 +3,35 @@ from urllib.parse import urlparse
 from PyQt6.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
 
 
+SPECIAL_DOWNLOAD_HOSTS = {
+    "mediafire.com",
+    "4shared.com",
+    "drive.google.com",
+    "filecrypt.cc",
+    "filecrypt.to",
+    "rapidgator.net",
+    "ddownload.com",
+    "ddl.to",
+    "fuckingfast.co",
+    "datanodes.to",
+    "megadb.net",
+    "gofile.io",
+}
+
+
+def is_direct_file_url(url):
+    parsed = urlparse((url or "").strip())
+    host = (parsed.hostname or "").lower()
+    if not parsed.scheme or not parsed.netloc or any(
+        host == special_host or host.endswith(f".{special_host}")
+        for special_host in SPECIAL_DOWNLOAD_HOSTS
+    ):
+        return False
+
+    path = (parsed.path or "").rstrip("/")
+    return bool(os.path.splitext(path)[1])
+
+
 def build_download_path(base_path, *parts):
     segments = [segment for segment in (base_path, *parts) if segment]
     if not segments:

@@ -73,7 +73,7 @@ class SingleInstanceBridge(QObject):
                     return False
                 ack = bytes(socket.readAll()).strip()
                 socket.disconnectFromServer()
-                if socket.state() != QLocalSocket.UnconnectedState:
+                if socket.state() != QLocalSocket.LocalSocketState.UnconnectedState:
                     socket.waitForDisconnected(wait_ms)
                 socket.deleteLater()
                 return ack == b"ok"
@@ -132,7 +132,7 @@ class SingleInstanceBridge(QObject):
         connected = probe.waitForConnected(300)
         if connected:
             probe.disconnectFromServer()
-            if probe.state() != QLocalSocket.UnconnectedState:
+            if probe.state() != QLocalSocket.LocalSocketState.UnconnectedState:
                 probe.waitForDisconnected(100)
         return connected
 
@@ -171,7 +171,7 @@ class SingleInstanceBridge(QObject):
                 if isinstance(parsed_entries, list):
                     entries = parsed_entries
 
-        if socket.state() == QLocalSocket.ConnectedState:
+        if socket.state() == QLocalSocket.LocalSocketState.ConnectedState:
             socket.write(b"ok\n")
             socket.flush()
             socket.waitForBytesWritten(500)
