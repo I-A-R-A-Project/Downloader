@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from web_common.paths import app_data_dir
+from web_common.storage.paths import app_data_dir
 
 
 APPDATA = os.environ.get("APPDATA", os.path.expanduser("~"))
