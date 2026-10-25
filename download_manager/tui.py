@@ -20,7 +20,9 @@ from download_manager.direct_file import (
 )
 from download_manager.torrent import Aria2Client, ensure_aria2_running
 from download_manager.window import ArchiveExtractWorker
+from download_manager.workers import InvalidDownloadResponse, file_is_html, response_is_html
 from download_manager.youtube import detect_youtube_mode, is_youtube_url, run_yt_dlp_download
+from web_common.downloads.browser_downloads import request_cookie_jar
 
 try:
     from tqdm import tqdm
@@ -191,6 +193,31 @@ class TuiDownloadManager:
             "resolution_retry_count": int(raw_entry.get("resolution_retry_count", 0) or 0),
             "archive_retry_count": int(raw_entry.get("archive_retry_count", 0) or 0),
             "failed": False,
+            "auth_cookies": [] if from_session else [
+                {
+                    "name": str(cookie.get("name") or ""),
+                    "value": str(cookie.get("value") or ""),
+                    "domain": str(cookie.get("domain") or ""),
+                    "path": str(cookie.get("path") or "/"),
+                    "secure": bool(cookie.get("secure")),
+                    "http_only": bool(cookie.get("http_only")),
+                    "expires_at": cookie.get("expires_at"),
+                }
+                for cookie in raw_entry.get("auth_cookies", [])
+                if isinstance(cookie, dict)
+                and cookie.get("name")
+                and cookie.get("domain")
+            ],
+            "auth_headers": {} if from_session else {
+                str(key): str(value)
+                for key, value in (raw_entry.get("auth_headers") or {}).items()
+                if isinstance(key, str)
+                and isinstance(value, str)
+                and "\r" not in key
+                and "\n" not in key
+                and "\r" not in value
+                and "\n" not in value
+            },
         }
         if from_session and kind == "regular":
             self.recompute_regular_status(entry)
@@ -285,7 +312,16 @@ class TuiDownloadManager:
             return False
 
         if self.is_direct_file_url(entry["url_original"]):
-            filename = resolve_direct_filename(entry["url_original"])
+            cookie_jar = request_cookie_jar(
+                entry.get("auth_cookies", []), entry["url_original"]
+            )
+            headers = {"User-Agent": "Mozilla/5.0"}
+            headers.update(entry.get("auth_headers", {}))
+            filename = resolve_direct_filename(
+                entry["url_original"],
+                headers=headers,
+                cookies=cookie_jar,
+            )
             entry["direct_links"] = [{
                 "path": build_download_path(entry["path"], filename),
                 "url": entry["url_original"],
@@ -356,6 +392,8 @@ class TuiDownloadManager:
                     "path": entry["path"],
                     "password": entry["password"],
                     "title": entry["title"],
+                    "auth_cookies": entry.get("auth_cookies", []),
+                    "auth_headers": entry.get("auth_headers", {}),
                 }])
                 active_downloaders[entry["id"]] = downloader
                 downloader.direct_links_ready.connect(
@@ -410,6 +448,8 @@ class TuiDownloadManager:
             "path": entry["path"],
             "password": entry["password"],
             "title": entry["title"],
+            "auth_cookies": entry.get("auth_cookies", []),
+            "auth_headers": entry.get("auth_headers", {}),
         }])
 
         def _finish(results):
@@ -524,13 +564,21 @@ class TuiDownloadManager:
         target_path = self.absolute_download_path(link.get("path") or entry["path"])
         os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
         headers = dict(link.get("headers") or {})
-        cookies = link.get("cookies") or {}
+        headers = {**entry.get("auth_headers", {}), **headers}
+        cookies = request_cookie_jar(
+            entry.get("auth_cookies", []),
+            url,
+            base_cookies=link.get("cookies") or {},
+        )
         link["status"] = "downloading"
         entry["status"] = "downloading"
         entry["error_text"] = ""
         self.save_session_to_disk()
 
         existing_size = os.path.getsize(target_path) if os.path.exists(target_path) else 0
+        expected_html = os.path.splitext(target_path)[1].lower() in {".html", ".htm"}
+        if existing_size and file_is_html(target_path) and not expected_html:
+            existing_size = 0
         if existing_size:
             headers["Range"] = f"bytes={existing_size}-"
 
@@ -557,6 +605,22 @@ class TuiDownloadManager:
                     timeout=30,
                 ) as response:
                     response.raise_for_status()
+                    if existing_size and response.status_code != 206:
+                        existing_size = 0
+                    chunks = iter(response.iter_content(chunk_size=CHUNK_SIZE))
+                    first_chunk = b""
+                    for chunk in chunks:
+                        if chunk:
+                            first_chunk = chunk
+                            break
+                    if not expected_html and response_is_html(
+                        response.headers.get("content-type", ""),
+                        first_chunk,
+                    ):
+                        raise InvalidDownloadResponse(
+                            "El servidor devolvió una página HTML en vez del archivo. "
+                            "La sesión puede haber expirado o Moodle no autorizó el enlace."
+                        )
                     total_size = self.compute_total_size(response, existing_size)
                     if total_size:
                         bar.total = total_size
@@ -564,7 +628,10 @@ class TuiDownloadManager:
 
                     mode = "ab" if existing_size else "wb"
                     with open(target_path, mode) as fh:
-                        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                        if first_chunk:
+                            fh.write(first_chunk)
+                            bar.update(len(first_chunk))
+                        for chunk in chunks:
                             if not chunk:
                                 continue
                             fh.write(chunk)
@@ -580,6 +647,9 @@ class TuiDownloadManager:
                 link["progress"] = 100
                 entry["error_text"] = ""
                 self.recompute_regular_status(entry)
+                if entry["status"] == "finished":
+                    entry.pop("auth_cookies", None)
+                    entry.pop("auth_headers", None)
                 self.save_session_to_disk()
                 return True
             except Exception as exc:
@@ -588,7 +658,11 @@ class TuiDownloadManager:
                 entry["failed"] = True
                 link["status"] = "error"
                 entry["status"] = "error"
-                entry["error_text"] = "La descarga no se pudo completar."
+                entry["error_text"] = (
+                    str(exc)
+                    if isinstance(exc, InvalidDownloadResponse)
+                    else "La descarga no se pudo completar."
+                )
                 self.recompute_regular_status(entry)
                 self.save_session_to_disk()
                 return False

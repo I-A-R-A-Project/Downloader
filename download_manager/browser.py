@@ -1,12 +1,21 @@
 import os, re, time, traceback, uuid, requests
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
-from PyQt6.QtCore import QObject, QRunnable, QThreadPool, QUrl, QTimer, pyqtSignal, Qt
+from PyQt6.QtWebEngineCore import (
+    QWebEngineHttpRequest,
+    QWebEnginePage,
+    QWebEngineProfile,
+)
+from PyQt6.QtCore import QObject, QRunnable, QThreadPool, QUrl, QTimer, QDateTime, pyqtSignal, Qt
+from PyQt6.QtNetwork import QNetworkCookie
 from bs4 import BeautifulSoup
-from download_manager.direct_file import is_direct_file_url
+from download_manager.direct_file import is_direct_file_url, resolve_direct_filename
 from download_manager.gdrive_handler import (
     parse_gdrive_folder_id, parse_gdrive_file_id, resolve_gdrive_file,
+)
+from web_common.downloads.browser_downloads import (
+    cookies_for_url,
+    request_cookie_jar,
 )
 
 FILECRYPT_HOSTS = {
@@ -79,6 +88,22 @@ def is_meaningful_external_url(url):
 def is_interactive_download_host(url):
     host = (urlparse(url).hostname or "").lower()
     return host in INTERACTIVE_DOWNLOAD_HOSTS
+
+
+def find_moodle_pluginfile_url(html, base_url):
+    soup = BeautifulSoup(html or "", "html.parser")
+    for element in soup.find_all(["a", "iframe", "embed", "object"]):
+        target = (
+            element.get("href")
+            or element.get("src")
+            or element.get("data")
+            or ""
+        )
+        target = urljoin(base_url, target)
+        path = urlparse(target).path.lower()
+        if "/pluginfile.php/" in path or path.endswith("/pluginfile.php"):
+            return target
+    return ""
 
 
 def extract_filename_from_headers(headers):
@@ -157,50 +182,26 @@ def extract_filename_from_url_candidate(url):
     return ""
 
 
-def resolve_direct_filename(url):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    final_url = url
-    filename = None
-
-    try:
-        response = requests.head(url, allow_redirects=True, timeout=15, headers=headers)
-        final_url = response.url or url
-        filename = extract_filename_from_headers(response.headers)
-    except Exception:
-        pass
-
-    if not filename:
-        try:
-            response = requests.get(url, stream=True, allow_redirects=True, timeout=15, headers=headers)
-            final_url = response.url or final_url
-            filename = extract_filename_from_headers(response.headers)
-            response.close()
-        except Exception:
-            pass
-
-    if not filename:
-        filename = os.path.basename(urlparse(final_url).path)
-
-    if not filename:
-        filename = "archivo_descargado"
-
-    return filename
-
-
 class DirectFileResolveSignals(QObject):
     finished = pyqtSignal(int, str, str, str)
 
 
 class DirectFileResolveWorker(QRunnable):
-    def __init__(self, index, url, current_path):
+    def __init__(self, index, url, current_path, headers=None, cookies=None):
         super().__init__()
         self.index = index
         self.url = url
         self.current_path = current_path
+        self.headers = headers or {}
+        self.cookies = cookies or {}
         self.signals = DirectFileResolveSignals()
 
     def run(self):
-        filename = resolve_direct_filename(self.url)
+        filename = resolve_direct_filename(
+            self.url,
+            headers=self.headers,
+            cookies=self.cookies,
+        )
         self.signals.finished.emit(self.index, self.url, self.current_path, filename)
 
 
@@ -440,16 +441,17 @@ class UniversalDownloader(QWebEngineView):
 
     def __init__(self, urls):
         super().__init__()
-        profile = QWebEngineProfile(f"universal-downloader-{uuid.uuid4().hex[:8]}", self)
+        profile = QWebEngineProfile(f"universal-downloader-{uuid.uuid4().hex[:8]}")
         profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
         profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
         profile.downloadRequested.connect(self.on_download_requested)
         cookie_store = profile.cookieStore()
         cookie_store.cookieAdded.connect(self.on_cookie_added)
         cookie_store.cookieRemoved.connect(self.on_cookie_removed)
-        cookie_store.loadAllCookies()
         self.profile = profile
-        self.setPage(SilentPage(profile, self))
+        page = SilentPage(profile, self)
+        page.destroyed.connect(profile.deleteLater)
+        self.setPage(page)
         self.resize(1200, 800)
         self.urls = []
         self.offscreen_results = []
@@ -458,6 +460,8 @@ class UniversalDownloader(QWebEngineView):
             url = entry.get("url", "")
             path = entry.get("path", "")
             password = entry.get("password", "")
+            auth_cookies = entry.get("auth_cookies") or []
+            auth_headers = entry.get("auth_headers") or {}
             if url.startswith("magnet:?"):
                 print(f"🔗 Magnet detectado: {url}")
                 filename = f"{uuid.uuid4().hex[:8]}.magnet"
@@ -467,11 +471,17 @@ class UniversalDownloader(QWebEngineView):
                 filename = url.split("/")[-1].split("?")[0]
                 self.offscreen_results.append((build_download_path(path, filename), url))
             else:
-                self.urls.append((url, path))
+                self.urls.append((url, path, auth_cookies, auth_headers))
 
         self.current_index = 0
         self.results = ResultBuffer(self._on_result_appended)
         self._cookies = {}
+        self._auth_cookies = []
+        self._pending_auth_cookies = set()
+        self._waiting_for_auth_cookies = False
+        self._auth_cookie_timer = QTimer(self)
+        self._auth_cookie_timer.setSingleShot(True)
+        self._auth_cookie_timer.timeout.connect(self._continue_after_cookie_timeout)
         self._gdrive_click_attempts = 0
         self._gdrive_click_max_attempts = 10
         self._gdrive_waiting_download = False
@@ -501,8 +511,10 @@ class UniversalDownloader(QWebEngineView):
         self.page().windowCloseRequested.connect(self.on_window_close_requested)
         self.renderProcessTerminated.connect(self.on_render_process_terminated)
         self._started = False
+        self._navigation_started = False
         self._closed = False
         self._completion_emitted = False
+        cookie_store.loadAllCookies()
 
     def start(self):
         if self._started or self._closed:
@@ -512,10 +524,71 @@ class UniversalDownloader(QWebEngineView):
             QTimer.singleShot(0, lambda: self.emit_results(self.offscreen_results))
             self.close()
             return
-        if self.urls:
-            self.process_current_url()
+        self._prepare_auth_cookies()
+
+    def _current_auth_context(self):
+        if self.current_index >= len(self.urls):
+            return [], {}
+        _url, _path, cookies, headers = self.urls[self.current_index]
+        return cookies, headers
+
+    def _prepare_auth_cookies(self):
+        cookies, _headers = self._current_auth_context()
+        self._auth_cookies = list(cookies)
+        cookie_store = self.profile.cookieStore()
+        cookies_to_set = []
+        for record in self._auth_cookies:
+            name = str(record.get("name") or "").encode("utf-8")
+            value = str(record.get("value") or "").encode("utf-8")
+            domain = str(record.get("domain") or "")
+            if not name or not domain:
+                continue
+            cookie = QNetworkCookie(name, value)
+            cookie.setDomain(domain)
+            cookie.setPath(str(record.get("path") or "/"))
+            cookie.setSecure(bool(record.get("secure")))
+            cookie.setHttpOnly(bool(record.get("http_only")))
+            cookie_path = cookie.path() or "/"
+            if isinstance(cookie_path, bytes):
+                cookie_path = cookie_path.decode("utf-8", errors="replace")
+            expires_at = record.get("expires_at")
+            if expires_at:
+                cookie.setExpirationDate(
+                    QDateTime.fromMSecsSinceEpoch(int(expires_at))
+                )
+            key = (
+                domain,
+                cookie_path,
+                name.decode("utf-8", errors="replace"),
+                value.decode("utf-8", errors="replace"),
+            )
+            self._pending_auth_cookies.add(key)
+            origin_scheme = "https" if cookie.isSecure() else "http"
+            cookies_to_set.append(
+                (cookie, QUrl(f"{origin_scheme}://{domain.lstrip('.')}/"))
+            )
+
+        for cookie, origin in cookies_to_set:
+            cookie_store.setCookie(cookie, origin)
+
+        if self._pending_auth_cookies:
+            self._waiting_for_auth_cookies = True
+            self._auth_cookie_timer.start(5000)
         else:
-            self.close()
+            self._begin_navigation()
+
+    def _begin_navigation(self):
+        if self._navigation_started or self._closed:
+            return
+        self._waiting_for_auth_cookies = False
+        self._auth_cookie_timer.stop()
+        self._navigation_started = True
+        self.process_current_url()
+
+    def _continue_after_cookie_timeout(self):
+        if self._pending_auth_cookies:
+            print("⚠ No se confirmaron todas las cookies de sesión antes de resolver.")
+        self._begin_navigation()
 
     def _on_result_appended(self, item):
         if not item:
@@ -528,6 +601,10 @@ class UniversalDownloader(QWebEngineView):
         if self.current_index >= len(self.urls):
             return ""
         return self.urls[self.current_index][0]
+
+    def _insert_url(self, index, url, path):
+        cookies, headers = self._current_auth_context()
+        self.urls.insert(index, (url, path, cookies, headers))
 
     def should_block_popups(self):
         return self.is_filecrypt_url(self.current_source_url())
@@ -564,7 +641,7 @@ class UniversalDownloader(QWebEngineView):
             if self._closed or self.current_index >= len(self.urls):
                 return
             source_url = self.current_source_url()
-            print(self.urls[self.current_index])
+            print(self.urls[self.current_index][:2])
             print(f"[{self.current_index+1}/{len(self.urls)}] Páginas cargadas...")
             if not ok:
                 print("❌ La página no terminó de cargar correctamente.")
@@ -579,7 +656,7 @@ class UniversalDownloader(QWebEngineView):
         if not self.urls:
             self.finish(self.results)
             return
-        url, path = self.urls[self.current_index]
+        url, path = self.urls[self.current_index][:2]
         self._filecrypt_wait_attempts = 0
         self._filecrypt_link_wait_attempts = 0
         self._interactive_wait_attempts = 0
@@ -595,13 +672,20 @@ class UniversalDownloader(QWebEngineView):
         self.show()
         self.raise_()
         self.activateWindow()
-        self.load(QUrl(url))
+        _cookies, headers = self._current_auth_context()
+        if headers:
+            request = QWebEngineHttpRequest(QUrl(url))
+            for name, value in headers.items():
+                request.setHeader(name.encode("ascii"), value.encode("utf-8"))
+            self.load(request)
+        else:
+            self.load(QUrl(url))
 
     def route_url_handling(self):
         try:
             if self._closed or self.current_index >= len(self.urls):
                 return
-            url, path = self.urls[self.current_index]
+            url, path = self.urls[self.current_index][:2]
             if "mediafire.com" in url:
                 self.handle_mediafire(url, path)
             elif self.is_filecrypt_url(url):
@@ -616,6 +700,10 @@ class UniversalDownloader(QWebEngineView):
                 self.handle_interactive_download_host(url, path)
             elif self.is_direct_file_url(url):
                 self.handle_direct_file(url, path)
+            elif self.is_moodle_mod_view_url(url):
+                self.page().toHtml(
+                    lambda html: self.handle_moodle_mod_view(url, path, html)
+                )
             else:
                 print("❌ Sitio no soportado.")
                 self.results.append((None, None))
@@ -628,6 +716,26 @@ class UniversalDownloader(QWebEngineView):
         if self._closed or source_url != self.current_source_url():
             return
         self.route_url_handling()
+
+    @staticmethod
+    def is_moodle_mod_view_url(url):
+        return urlparse(url).path.lower().endswith("/mod_view.php")
+
+    def handle_moodle_mod_view(self, source_url, current_path, html):
+        if self._closed or source_url != self.current_source_url():
+            return
+        target = find_moodle_pluginfile_url(html, source_url)
+        if not target:
+            print("❌ Moodle no expuso un enlace pluginfile.php en la página del recurso.")
+            self.results.append((None, None))
+            self.proceed_to_next()
+            return
+
+        self.capture_interactive_direct_link(
+            source_url,
+            current_path,
+            target,
+        )
 
     def is_filecrypt_url(self, url):
         return (urlparse(url).hostname or "").lower() in FILECRYPT_HOSTS
@@ -699,14 +807,14 @@ class UniversalDownloader(QWebEngineView):
         self._filecrypt_pending_batches[source_url] = batch
         insert_position = self.current_index + 1
         for row in reversed(rows):
-            self.urls.insert(insert_position, (row["link_url"], current_path))
+            self._insert_url(insert_position, row["link_url"], current_path)
         self.proceed_to_next()
 
     def handle_filecrypt_link_url(self, url, current_path):
         resolved_url = self._filecrypt_link_targets.pop(url, "")
         if resolved_url:
             print(f"✅ Filecrypt redirigió a: {resolved_url}")
-            self.urls.insert(self.current_index + 1, (resolved_url, current_path))
+            self._insert_url(self.current_index + 1, resolved_url, current_path)
             self.proceed_to_next()
             return
 
@@ -721,7 +829,7 @@ class UniversalDownloader(QWebEngineView):
         if resolved_url:
             self.capture_filecrypt_link_target(link_url, resolved_url)
             print(f"✅ Filecrypt redirigió a: {resolved_url}")
-            self.urls.insert(self.current_index + 1, (resolved_url, current_path))
+            self._insert_url(self.current_index + 1, resolved_url, current_path)
             self.proceed_to_next()
             return
 
@@ -821,7 +929,7 @@ class UniversalDownloader(QWebEngineView):
             "path": save_target,
             "url": direct_url,
             "headers": {"User-Agent": "Mozilla/5.0", "Referer": source_url},
-            "cookies": self.cookies_for_url(direct_url),
+            "cookies": self.cookies_for_url(direct_url, include_auth=False),
         })
         self.proceed_to_next()
 
@@ -1062,7 +1170,7 @@ class UniversalDownloader(QWebEngineView):
             "path": save_target,
             "url": direct_link,
             "headers": {"User-Agent": "Mozilla/5.0", "Referer": source_url},
-            "cookies": self.cookies_for_url(direct_link),
+            "cookies": self.cookies_for_url(direct_link, include_auth=False),
         })
         self.proceed_to_next()
 
@@ -1181,12 +1289,25 @@ class UniversalDownloader(QWebEngineView):
             value = bytes(cookie.value()).decode("utf-8", errors="ignore")
             domain = cookie.domain() or ""
             path = cookie.path() or "/"
+            if isinstance(path, bytes):
+                path = path.decode("utf-8", errors="replace")
+            expires_at = None
+            expiration = cookie.expirationDate()
+            if not cookie.isSessionCookie() and expiration.isValid():
+                expires_at = expiration.toMSecsSinceEpoch()
             self._cookies[(domain, path, name)] = {
                 "name": name,
                 "value": value,
                 "domain": domain,
                 "path": path,
+                "secure": cookie.isSecure(),
+                "expires_at": expires_at,
             }
+            pending_key = (domain, path, name, value)
+            if pending_key in self._pending_auth_cookies:
+                self._pending_auth_cookies.discard(pending_key)
+                if self._waiting_for_auth_cookies and not self._pending_auth_cookies:
+                    self._begin_navigation()
         except Exception:
             print("❌ Error almacenando cookie en UniversalDownloader:")
             print(traceback.format_exc())
@@ -1195,19 +1316,29 @@ class UniversalDownloader(QWebEngineView):
         name = bytes(cookie.name()).decode("utf-8", errors="ignore")
         domain = cookie.domain() or ""
         path = cookie.path() or "/"
+        if isinstance(path, bytes):
+            path = path.decode("utf-8", errors="replace")
         self._cookies.pop((domain, path, name), None)
 
-    def cookies_for_url(self, url):
-        parsed = urlparse(url)
-        host = (parsed.hostname or "").lower()
-        path = parsed.path or "/"
+    def cookies_for_url(self, url, include_auth=True):
         jar = {}
-        for cookie in self._cookies.values():
-            cookie_domain = (cookie["domain"] or "").lstrip(".").lower()
-            cookie_path = cookie["path"] or "/"
-            if cookie_domain and host != cookie_domain and not host.endswith(f".{cookie_domain}"):
-                continue
-            if not path.startswith(cookie_path):
+        auth_keys = set()
+        if not include_auth:
+            auth_keys = {
+                (
+                    cookie["domain"].lstrip(".").lower(),
+                    cookie.get("path") or "/",
+                    cookie["name"],
+                )
+                for cookie in cookies_for_url(self._auth_cookies, url)
+            }
+        for cookie in cookies_for_url(self._cookies.values(), url):
+            cookie_key = (
+                cookie["domain"].lstrip(".").lower(),
+                cookie.get("path") or "/",
+                cookie["name"],
+            )
+            if not include_auth and cookie_key in auth_keys:
                 continue
             jar[cookie["name"]] = cookie["value"]
         return jar
@@ -1227,7 +1358,7 @@ class UniversalDownloader(QWebEngineView):
                     "path": save_target,
                     "url": download_url,
                     "headers": {"User-Agent": "Mozilla/5.0"},
-                    "cookies": self.cookies_for_url(download_url),
+                    "cookies": self.cookies_for_url(download_url, include_auth=False),
                 })
                 self._gdrive_waiting_download = False
                 download.cancel()
@@ -1243,7 +1374,28 @@ class UniversalDownloader(QWebEngineView):
                     "path": save_target,
                     "url": download_url,
                     "headers": {"User-Agent": "Mozilla/5.0", "Referer": current_url},
-                    "cookies": self.cookies_for_url(download_url),
+                    "cookies": self.cookies_for_url(download_url, include_auth=False),
+                })
+                download.cancel()
+                self.proceed_to_next()
+                return
+
+            if self.is_moodle_mod_view_url(current_url):
+                current_path = self.urls[self.current_index][1]
+                save_target = build_download_path(current_path, filename)
+                _cookies, auth_headers = self._current_auth_context()
+                headers = dict(auth_headers)
+                headers["Referer"] = current_url
+                print(f"✅ Descarga Moodle capturada: {download_url}")
+                self.results.append({
+                    "type": "direct",
+                    "path": save_target,
+                    "url": download_url,
+                    "headers": headers,
+                    "cookies": self.cookies_for_url(
+                        download_url,
+                        include_auth=False,
+                    ),
                 })
                 download.cancel()
                 self.proceed_to_next()
@@ -1315,7 +1467,7 @@ class UniversalDownloader(QWebEngineView):
                 print(f"📁 {len(all_links)} archivos encontrados en carpeta '{folder_name}'.")
                 insert_position = self.current_index + 1
                 for link in reversed(all_links + all_folders):
-                    self.urls.insert(insert_position, (link, subfolder_path))
+                    self._insert_url(insert_position, link, subfolder_path)
                 self.proceed_to_next()
             else:
                 print("❌ No se encontraron archivos en la carpeta (API). Probando HTML...")
@@ -1369,7 +1521,7 @@ class UniversalDownloader(QWebEngineView):
                 print(f"📁 {len(all_links)} archivos encontrados en carpeta '{folder_name}'.")
                 insert_position = self.current_index + 1
                 for link in reversed(all_links + all_folders):
-                    self.urls.insert(insert_position, (link, subfolder_path))
+                    self._insert_url(insert_position, link, subfolder_path)
                 self.proceed_to_next()
                 return
 
@@ -1472,7 +1624,7 @@ class UniversalDownloader(QWebEngineView):
             print(f"📁 {len(file_links)} archivos encontrados en carpeta '{folder_name}'.")
             insert_position = self.current_index + 1
             for link in reversed(file_links):
-                self.urls.insert(insert_position, (link, subfolder_path))
+                self._insert_url(insert_position, link, subfolder_path)
         else:
             print("❌ No se encontraron archivos en la carpeta.")
         self.proceed_to_next()
@@ -1632,7 +1784,15 @@ class UniversalDownloader(QWebEngineView):
     def handle_direct_file(self, url, current_path):
         request = (self.current_index, url, current_path)
         self._pending_direct_resolution = request
-        worker = DirectFileResolveWorker(*request)
+        auth_cookies, auth_headers = self._current_auth_context()
+        cookie_jar = request_cookie_jar(auth_cookies, url)
+        headers = {"User-Agent": "Mozilla/5.0"}
+        headers.update(auth_headers)
+        worker = DirectFileResolveWorker(
+            *request,
+            headers=headers,
+            cookies=cookie_jar,
+        )
         worker.signals.finished.connect(self.on_direct_file_resolved)
         self._active_direct_worker = worker
         DIRECT_RESOLVE_THREAD_POOL.start(worker)

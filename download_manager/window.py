@@ -20,6 +20,7 @@ from download_manager.torrent import Aria2Client, TorrentUpdater, ensure_aria2_r
 from download_manager.torrent_queue import TorrentProcessor
 from download_manager.workers import DownloadSignals, FileDownloader
 from download_manager.youtube import YtDlpDownloadWorker, detect_youtube_mode, is_youtube_url
+from web_common.downloads.browser_downloads import request_cookie_jar
 
 
 SESSION_PATH = os.path.join(str(DATA_DIR), "download_state.json")
@@ -295,6 +296,31 @@ class DownloadWindow(QWidget):
             "extract_error": raw_entry.get("extract_error", "") or "",
             "resolution_retry_count": int(raw_entry.get("resolution_retry_count", 0) or 0),
             "archive_retry_count": int(raw_entry.get("archive_retry_count", 0) or 0),
+            "auth_cookies": [] if from_session else [
+                {
+                    "name": str(cookie.get("name") or ""),
+                    "value": str(cookie.get("value") or ""),
+                    "domain": str(cookie.get("domain") or ""),
+                    "path": str(cookie.get("path") or "/"),
+                    "secure": bool(cookie.get("secure")),
+                    "http_only": bool(cookie.get("http_only")),
+                    "expires_at": cookie.get("expires_at"),
+                }
+                for cookie in raw_entry.get("auth_cookies", [])
+                if isinstance(cookie, dict)
+                and cookie.get("name")
+                and cookie.get("domain")
+            ],
+            "auth_headers": {} if from_session else {
+                str(key): str(value)
+                for key, value in (raw_entry.get("auth_headers") or {}).items()
+                if isinstance(key, str)
+                and isinstance(value, str)
+                and "\r" not in key
+                and "\n" not in key
+                and "\r" not in value
+                and "\n" not in value
+            },
         }
         if from_session and kind == "regular":
             self.recompute_regular_status(entry)
@@ -464,6 +490,8 @@ class DownloadWindow(QWidget):
             "path": entry["path"],
             "password": entry["password"],
             "title": entry["title"],
+            "auth_cookies": entry.get("auth_cookies", []),
+            "auth_headers": entry.get("auth_headers", {}),
         }])
         downloader.direct_links_ready.connect(
             lambda results, entry_id=entry["id"], instance=downloader: self.on_resolution_finished(entry_id, results, instance)
@@ -577,8 +605,15 @@ class DownloadWindow(QWidget):
             full_path,
             worker_index,
             signals,
-            headers=link.get("headers") or {},
-            cookies=link.get("cookies") or {},
+            headers={
+                **entry.get("auth_headers", {}),
+                **(link.get("headers") or {}),
+            },
+            cookies=request_cookie_jar(
+                entry.get("auth_cookies", []),
+                link["url"],
+                base_cookies=link.get("cookies") or {},
+            ),
         )
         self.active_file_downloads[worker_index] = thread
         self.worker_context[worker_index] = (entry["id"], link_index)
@@ -724,9 +759,14 @@ class DownloadWindow(QWidget):
             entry["error_text"] = ""
         else:
             link["status"] = "error"
-            entry["error_text"] = "La descarga no se pudo completar."
+            entry["error_text"] = (
+                thread.error_text or "La descarga no se pudo completar."
+            )
 
         self.recompute_regular_status(entry)
+        if entry["status"] == "finished":
+            entry.pop("auth_cookies", None)
+            entry.pop("auth_headers", None)
         self.update_entry_visual(entry)
         self.request_session_save()
         if success:

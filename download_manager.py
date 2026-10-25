@@ -194,8 +194,18 @@ def parse_input(args, base_dir=None):
         json_path = args[0]
         if base_dir and not os.path.isabs(json_path):
             json_path = os.path.join(base_dir, json_path)
-        with open(os.path.abspath(json_path), "r", encoding="utf-8-sig") as f:
-            data = json.load(f)
+        json_path = os.path.abspath(json_path)
+        try:
+            with open(json_path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+        finally:
+            if os.path.basename(json_path).startswith("iara-download-handoff-"):
+                try:
+                    os.unlink(json_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    print(f"No se pudo limpiar el archivo temporal de handoff: {exc}")
         return data if isinstance(data, list) else []
     else:
         return [{"url": a, "path": ""} for a in args]
